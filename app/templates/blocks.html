@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Blocks – Tempo Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-4">
+    <h1 class="text-2xl font-bold">Blocks</h1>
+    <p class="text-xs text-dim mt-1">{{ latest_num }} blocks</p>
+</div>
+
+<div class="card">
+    <div class="flex table-header">
+        <div class="w-20 px-3 py-2">Block</div>
+        <div class="flex-1 px-3 py-2">Hash</div>
+        <div class="w-24 px-3 py-2">Time</div>
+        <div class="w-16 px-3 py-2 text-right">Txns</div>
+        <div class="w-24 px-3 py-2 text-right hidden md:block">Gas Used</div>
+    </div>
+    {% for block in blocks %}
+    <div class="t-row flex text-xs">
+        <div class="w-20 px-3 py-3">
+            <a href="/block/{{ block.number }}" class="text-blue-400 font-mono">#{{ block.number }}</a>
+        </div>
+        <div class="flex-1 px-3 py-3 font-mono truncate">
+            {{ truncate_hash(block.hash, 10, 6) }}
+        </div>
+        <div class="w-24 px-3 py-3 text-dim">{{ format_time_ago(block.timestamp) }}</div>
+        <div class="w-16 px-3 py-3 text-right text-dim">{{ block.tx_count }}</div>
+        <div class="w-24 px-3 py-3 text-right text-dim hidden md:block">
+            {% if block.gas_limit > 0 %}
+            {{ "%.1f"|format(block.gas_used / block.gas_limit * 100) }}%
+            {% else %}0%{% endif %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Pagination -->
+<div class="flex items-center justify-between mt-4 text-xs">
+    <div class="text-dim">Showing blocks #{{ blocks[-1].number if blocks else 0 }} – #{{ blocks[0].number if blocks else 0 }}</div>
+    <div class="flex gap-2">
+        <a href="/blocks?from={% if blocks %}{{ blocks[-1].number - 1 }}{% else %}0{% endif %}" class="text-blue-400">Older →</a>
+    </div>
+</div>
+{% endblock %}

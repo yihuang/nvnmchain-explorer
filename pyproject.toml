@@ -1,7 +1,73 @@
 [project]
 name = "tempo-explorer"
 version = "0.1.0"
-description = "Add your description here"
+description = "Tempo blockchain explorer"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "fastapi[standard]>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "jinja2>=3.1.0",
+    "aiofiles>=24.0",
+    "web3>=7.0.0",
+    "eth_utils>=5.0.0",
+    "eth_contract>=0.1.0",
+    "rlp>=4.0.0",
+    "attrs>=24.0.0",
+    "httpx>=0.28.0",
+    "aiosqlite>=0.20.0",
+    "python-dateutil>=2.9.0",
+    "tempo-py",
+    "sqlmodel>=0.0.39",
+    "alembic>=1.18.5",
+]
+
+[project.scripts]
+tempo-explorer = "app.main:main"
+
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "N802",   # function names in snake_case (allow 3rd-party wrappers)
+    "N803",   # argument names in snake_case
+    "E501",   # line length handled by formatter
+    "B008",   # do not perform function calls in field defaults
+    "SIM105", # try-except-pass readability
+    "SIM108", # if-else -> ternary readability
+    "SIM103", # explicit bool return readability
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "N806",   # uppercase variable names in test helpers (e.g. A, B for addresses)
+    "I001",   # inline imports in test functions
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+[tool.uv.sources]
+tempo-py = { git = "https://github.com/yihuang/tempo-py.git" }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.20",
+]

@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Address {{ truncate_hash(address, 8, 4) }} ⋅ Tempo Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-4">
+    <div class="text-xs text-dim mb-1">
+        <a href="/" class="hover:text-blue-300">Home</a>
+        <span class="mx-1">/</span>
+        <span>Address</span>
+    </div>
+    <h1 class="text-2xl font-bold">Address</h1>
+</div>
+
+<div class="card mb-6">
+    <div class="card-body">
+        <div class="flex items-center gap-2 mb-4">
+            <span class="mono text-sm break-all">{{ address }}</span>
+            {% if addr_info.type == 'precompile' %}
+            <span class="badge label-precompile">{{ addr_info.label }}</span>
+            {% elif addr_info.type == 'token' %}
+            <span class="badge label-token">{{ addr_info.label or 'Token' }}</span>
+            {% endif %}
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+            <div>
+                <span class="text-dim">Type</span>
+                <div class="mt-1 font-medium">{{ addr_info.type|capitalize }}</div>
+            </div>
+            <div>
+                <span class="text-dim">Transactions</span>
+                <div class="mt-1 font-medium">{{ tx_count }}</div>
+            </div>
+            {% if holdings %}
+            <div>
+                <span class="text-dim">Holdings</span>
+                <div class="mt-1 font-medium">{{ holdings|length }} tokens</div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- Tabs -->
+<div class="flex border-b border-[#1e1e2a] mb-4 gap-1">
+    <a href="?tab=transactions" class="tab {{ 'active' if active_tab == 'transactions' }}">Transactions</a>
+    <a href="?tab=transfers" class="tab {{ 'active' if active_tab == 'transfers' }}">Transfers</a>
+    <a href="?tab=holdings" class="tab {{ 'active' if active_tab == 'holdings' }}">Holdings</a>
+</div>
+
+{% if active_tab == 'transactions' or active_tab == 'transfers' %}
+<div class="card">
+    <div class="card-header">Transactions</div>
+    {% if transactions %}
+    <div>
+        <div class="flex table-header">
+            <div class="flex-1 px-3 py-2">Tx Hash</div>
+            <div class="w-36 px-3 py-2 hidden md:block">From</div>
+            <div class="w-36 px-3 py-2 hidden md:block">To</div>
+            <div class="w-20 px-3 py-2 text-right">Time</div>
+        </div>
+        {% for tx in transactions %}
+        <div class="t-row flex text-xs">
+            <div class="flex-1 px-3 py-3">
+                <a href="/tx/{{ tx.tx_hash if tx.tx_hash else tx.hash }}" class="mono text-blue-400">
+                    {{ truncate_hash(tx.tx_hash if tx.tx_hash else tx.hash, 10, 6) }}
+                </a>
+            </div>
+            <div class="w-36 px-3 py-3 hidden md:block mono truncate">
+                <a href="{{ get_address_url(tx.tx_from if tx.tx_from else tx.from_addr) }}">
+                    {{ truncate_hash(tx.tx_from if tx.tx_from else tx.from_addr) }}
+                </a>
+            </div>
+            <div class="w-36 px-3 py-3 hidden md:block mono truncate">
+                <a href="{{ get_address_url(tx.tx_to if tx.tx_to else tx.to_addr) }}">
+                    {{ truncate_hash(tx.tx_to if tx.tx_to else tx.to_addr) }}
+                </a>
+            </div>
+            <div class="w-20 px-3 py-3 text-right text-dim">
+                {{ format_time_ago(tx.tx_timestamp if tx.tx_timestamp else tx.timestamp) }}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="card-body text-center text-dim text-sm py-6">No transactions found</div>
+    {% endif %}
+</div>
+
+{% if total_pages > 1 %}
+<div class="flex justify-center gap-2 mt-4 text-xs">
+    {% if page > 1 %}
+    <a href="?tab={{ active_tab }}&page={{ page - 1 }}" class="text-blue-400">← Previous</a>
+    {% endif %}
+    <span class="text-dim px-2">Page {{ page }} of {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <a href="?tab={{ active_tab }}&page={{ page + 1 }}" class="text-blue-400">Next →</a>
+    {% endif %}
+</div>
+{% endif %}
+{% endif %}
+
+{% if active_tab == 'holdings' %}
+<div class="card">
+    <div class="card-header">Holdings ({{ holdings|length }})</div>
+    {% if holdings %}
+    <div>
+        <div class="flex table-header">
+            <div class="flex-1 px-3 py-2">Token</div>
+            <div class="w-20 px-3 py-2">Symbol</div>
+            <div class="w-28 px-3 py-2 text-right">Balance</div>
+        </div>
+        {% for h in holdings %}
+        <div class="t-row flex text-xs">
+            <div class="flex-1 px-3 py-3">
+                <a href="{{ get_token_url(h.token) }}" class="text-blue-400">{{ h.name or h.symbol or truncate_hash(h.token) }}</a>
+            </div>
+            <div class="w-20 px-3 py-3">{{ h.symbol }}</div>
+            <div class="w-28 px-3 py-3 text-right">{{ h.formatted }}</div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="card-body text-center text-dim text-sm py-6">No holdings found</div>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}
