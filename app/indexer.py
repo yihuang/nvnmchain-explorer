@@ -65,6 +65,8 @@ async def index_block(block_num: int) -> None:
             tx_parsed["receipt_data"] = json.dumps(receipt)
             tx_parsed["status"] = int(receipt.get("status", "0x1"), 16)
             tx_parsed["gas_used"] = int(receipt.get("gasUsed", "0x0"), 16)
+            if "contractAddress" in receipt:
+                tx_parsed["contract_address"] = receipt["contractAddress"]
             if "feeToken" in receipt:
                 tx_parsed["fee_token"] = receipt["feeToken"]
                 await _fetch_token_if_needed(receipt["feeToken"])

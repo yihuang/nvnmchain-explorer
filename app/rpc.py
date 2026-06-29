@@ -266,6 +266,8 @@ async def fetch_transaction_with_receipt(tx_hash: str) -> dict | None:
     if receipt:
         parsed["status"] = int(receipt.get("status", "0x1"), 16)
         parsed["gas_used"] = int(receipt.get("gasUsed", "0x0"), 16)
+        if "contractAddress" in receipt:
+            parsed["contract_address"] = receipt["contractAddress"]
         # Parse Tempo-specific receipt fields
         if "feeToken" in receipt:
             parsed["fee_token"] = receipt["feeToken"]

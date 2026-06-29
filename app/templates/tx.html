@@ -43,7 +43,10 @@
                         {% if tx.to_addr %}
                         <a href="{{ get_address_url(tx.to_addr) }}" class="mono text-blue-400 break-all">{{ tx.to_addr }}</a>
                         {% else %}
-                        <span class="text-dim">Contract Creation</span>
+                        <span class="text-dim">Contract Creation
+                        {%- if tx.contract_address %}
+                        <a href="{{ get_address_url(tx.contract_address) }}" class="mono text-blue-400 break-all ml-1">→ {{ tx.contract_address }}</a>
+                        {%- endif %}</span>
                         {% endif %}
                     </div>
                     {% if fee_token %}
