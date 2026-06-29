@@ -10,7 +10,25 @@ uv run alembic upgrade head
 uv run fastapi run app/main.py
 ```
 
-Open http://localhost:8000. The indexer auto-starts and caches blocks from the Tempo RPC in the background.
+Open http://localhost:8000.
+
+## Background indexer
+
+The indexer (`app/indexer.py`) runs as an `asyncio.Task` inside the FastAPI
+process, started on app startup. It polls the chain head every 3 seconds and
+indexes up to 5 new blocks per cycle.
+
+For each block:
+1. **Block** — fetched via `eth_getBlockByNumber`, parsed, cached to SQLite.
+2. **Traces** — fetched in a single `debug_traceBlockByNumber` call, flattened
+   via `flatten_trace` (decodes function calls using eth-contract ABIs).
+3. **Receipts & events** — fetched per-tx, decoded via eth-contract event
+   parsers, stored with fee metadata. Token metadata is lazy-fetched when
+   `feeToken` is present.
+
+The indexer skips already-cached blocks and catches up from the last indexed
+height on restart. It logs a warning on RPC errors and retries on the next
+poll cycle — never crashes.
 
 ## Routes
 
@@ -29,11 +47,18 @@ All data endpoints accept `?format=json` or `Accept: application/json`.
 
 ## Stack
 
-- **FastAPI** + **Jinja2** (server-rendered HTML)
-- **SQLModel** / **SQLAlchemy** + **Alembic** (SQLite cache)
-- **tempo-py** + **web3.py** (RPC client)
+- **[FastAPI](https://fastapi.tiangolo.com/)** + **Jinja2** (server-rendered HTML)
+- **[SQLModel](https://sqlmodel.tiangolo.com/)** / **SQLAlchemy** + **Alembic** (SQLite cache)
+- **[tempo-py](https://github.com/yihuang/tempo-py)** — typed call builders, chain constants, and eth-contract ABIs
 - Tests: **pytest** + **httpx** (97 E2E tests)
 - Lint/format: **ruff**
+
+## References
+
+| Repo | Description |
+|------|-------------|
+| [tempo-py](https://github.com/yihuang/tempo-py) | Python SDK — transaction building, signing, ABI decoders, chain constants |
+| [Tempo](https://tempo.xyz) | EVM-compatible chain with gas-in-token economics |
 
 ## Tests
 
