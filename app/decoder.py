@@ -156,6 +156,7 @@ def _format_value(typ: str, value: Any) -> str:
         return str(value)
     return str(value)
 
+
 def _format_abi_value(typ: str, value: Any) -> str:
     """Format a decoded eth-contract ABI value for display.
 
@@ -264,7 +265,11 @@ def decode_event(log: dict) -> DecodedEvent | None:
     return DecodedEvent(
         topic0=topic0,
         contract=log.get("address", ""),
-        params=[DecodedParam(type="bytes", name="data", value=data[:200] + "..." if len(data) > 200 else data)],
+        params=[
+            DecodedParam(
+                type="bytes", name="data", value=data[:200] + "..." if len(data) > 200 else data
+            )
+        ],
     )
 
 

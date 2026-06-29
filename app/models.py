@@ -100,6 +100,7 @@ class TransferEvent(SQLModel, table=True):
     timestamp: int = Field(default=0)
     created_at: int = Field(default_factory=_utc_ts)
 
+
 # ── Structured return types for decoder ─────────────────────────────
 
 

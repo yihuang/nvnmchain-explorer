@@ -133,7 +133,9 @@ async def run_forever() -> None:
                 remaining = backfill_target - 1
                 logger.info(
                     "backfill: blocks %s-%s (%s behind tip)",
-                    start, backfill_target - 1, remaining,
+                    start,
+                    backfill_target - 1,
+                    remaining,
                 )
                 for num in range(backfill_target - 1, start - 1, -1):
                     await index_block(num)
@@ -157,7 +159,6 @@ async def run_forever() -> None:
             continue
 
         await asyncio.sleep(POLL_INTERVAL)
-
 
 
 def start() -> asyncio.Task | None:

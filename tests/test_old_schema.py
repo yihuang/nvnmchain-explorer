@@ -81,6 +81,7 @@ def _with_db(old_db: str, fn):
 def test_migrate_schema_adds_columns(old_db):
     def check():
         from app.main import _migrate_schema
+
         _migrate_schema()
 
         conn = sqlite3.connect(old_db)
@@ -96,12 +97,12 @@ def test_migrate_schema_adds_columns(old_db):
 def test_query_after_migration_succeeds(old_db):
     def check():
         from app.main import _migrate_schema
+
         _migrate_schema()
 
         from app.database import get_transaction
-        tx = get_transaction(
-            "0x7e639334bb324e53c4a9291e3edd2a48fba8598891c3ac368f0517134e96cc0c"
-        )
+
+        tx = get_transaction("0x7e639334bb324e53c4a9291e3edd2a48fba8598891c3ac368f0517134e96cc0c")
         assert tx is not None
         assert tx["trace_data"] is None
         assert tx["receipt_data"] is None
@@ -112,9 +113,11 @@ def test_query_after_migration_succeeds(old_db):
 def test_block_query_after_migration(old_db):
     def check():
         from app.main import _migrate_schema
+
         _migrate_schema()
 
         from app.database import get_block_by_number
+
         block = get_block_by_number(27183315)
         assert block is not None
         assert block["tx_count"] == 1
@@ -125,13 +128,13 @@ def test_block_query_after_migration(old_db):
 def test_extract_calls_with_null_raw(old_db):
     def check():
         from app.main import _migrate_schema
+
         _migrate_schema()
 
         from app.database import get_transaction
         from app.decoder import extract_calls
-        tx = get_transaction(
-            "0x7e639334bb324e53c4a9291e3edd2a48fba8598891c3ac368f0517134e96cc0c"
-        )
+
+        tx = get_transaction("0x7e639334bb324e53c4a9291e3edd2a48fba8598891c3ac368f0517134e96cc0c")
         assert tx is not None
         calls = extract_calls(tx, None)
         assert isinstance(calls, list)

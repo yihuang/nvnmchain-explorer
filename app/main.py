@@ -57,6 +57,7 @@ logging.basicConfig(
     force=True,
 )
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: migrate schema, init db, start indexer. Shutdown: stop indexer."""
@@ -98,6 +99,7 @@ async def not_found_handler(request: Request, exc: NotFound):
         status_code=404,
     )
 
+
 @app.exception_handler(Exception)
 async def log_exceptions(request: Request, exc: Exception):
     """Log all unhandled exceptions with full traceback and return 500."""
@@ -110,6 +112,7 @@ async def log_exceptions(request: Request, exc: Exception):
         {"request": request},
         status_code=500,
     )
+
 
 # Templates
 templates = Jinja2Templates(directory="app/templates")
@@ -192,8 +195,6 @@ def _truncate_hash(h: str | None, prefix: int = 8, suffix: int = 4) -> str:
     return h
 
 
-
-
 def _template_ctx(request: Request, **data) -> dict:
     """Build a template context dict with common helpers merged into *data*."""
     return {
@@ -213,6 +214,7 @@ def _template_ctx(request: Request, **data) -> dict:
 
 
 # ── Event handlers ──────────────────────────────────────────────────
+
 
 def _migrate_schema() -> None:
     """Run Alembic migrations.
@@ -259,6 +261,7 @@ def _migrate_schema() -> None:
         alembic_upgrade(cfg, "head")
     else:
         alembic_upgrade(cfg, "head")
+
 
 # ── Routes ──────────────────────────────────────────────────────────
 
@@ -482,6 +485,8 @@ async def address_page(
     return templates.TemplateResponse(
         request, "address.html", _template_ctx(request, active_tab=tab, **data)
     )
+
+
 @app.get("/token/{address}")
 async def token_page(
     request: Request,

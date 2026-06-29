@@ -39,6 +39,8 @@ def get_engine():
 def create_tables():
     """Create all tables from SQLModel metadata (dev/init only)."""
     SQLModel.metadata.create_all(get_engine())
+
+
 init_db = create_tables  # backward-compat alias
 
 
