@@ -638,10 +638,26 @@ def get_token_url(address: str) -> str:
 
 def main() -> None:
     """Entry point for direct uvicorn launch."""
+    import socket
+    import sys
+
     import uvicorn
 
+    # Check port availability before binding
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        try:
+            s.connect((settings.host, settings.port))
+            print(
+                f"ERROR: Port {settings.port} is already in use on {settings.host}.",
+                file=sys.stderr,
+            )
+            print(
+                f"       Stop the other process or change port in .env / settings.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except (ConnectionRefusedError, OSError):
+            pass  # port is free
+
     uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=True)
-
-
-if __name__ == "__main__":
-    main()

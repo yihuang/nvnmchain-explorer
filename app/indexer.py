@@ -81,42 +81,81 @@ async def index_block(block_num: int) -> None:
         save_transaction(tx_parsed)
 
 
-async def _catch_up_to(target: int, last_indexed: int) -> int:
-    """Index blocks from last_indexed+1 up to target."""
-    start = max(last_indexed + 1, target - MAX_BLOCKS_PER_POLL + 1)
-    for num in range(start, target + 1):
-        await index_block(num)
-    return target
-
-
 async def run_forever() -> None:
-    """Main loop: poll chain head and index new blocks."""
-    last_indexed = 0
+    """Main loop: index new blocks at the tip, backfill old blocks.
 
-    # Resume from the latest cached block
+    Each poll cycle:
+    1. Index up to ``MAX_BLOCKS_PER_POLL`` new blocks at the chain tip.
+    2. Backfill up to ``MAX_BLOCKS_PER_POLL`` older blocks going backwards.
+    """
+    highest = 0
     latest = get_latest_block()
     if latest:
-        last_indexed = latest["number"]
-        logger.info("resuming from block %s", last_indexed)
+        highest = latest["number"]
+        logger.info("resuming from block %s", highest)
+
+    # Backfill from the current chain head down to block 0.
+    backfill_target = 0
+
+    # Track totals for progress reporting
+    total_indexed = 0
+    last_log_ts = 0.0
 
     logger.info("indexer started, polling every %ss", POLL_INTERVAL)
 
     while True:
         try:
             head = await rpc.eth_block_number()
-            if head > last_indexed:
-                logger.info("new blocks: %s -> %s", last_indexed, head)
-                last_indexed = await _catch_up_to(head, last_indexed)
-            elif head < last_indexed:
-                # Chain reorg or reset — re-index from head
-                logger.warning("chain rolled back: %s -> %s, re-indexing", last_indexed, head)
-                last_indexed = await _catch_up_to(head, head - 1)
 
+            # Initial jump to tip on fresh DB — skip forward crawl
+            if highest == 0:
+                highest = head
+                backfill_target = head
+                logger.info("initialised: indexing from block %s down to 0", head)
+
+            # Phase 1 — index up to MAX_BLOCKS_PER_POLL new blocks at tip
+            if head > highest:
+                end = min(highest + MAX_BLOCKS_PER_POLL, head)
+                n = end - highest
+                logger.info("new blocks: %s -> %s (+%s)", highest, end, n)
+                for num in range(highest + 1, end + 1):
+                    await index_block(num)
+                highest = end
+                backfill_target = max(backfill_target, head)
+                total_indexed += n
+
+            # Phase 2 — backfill MAX_BLOCKS_PER_POLL older blocks from tip down
+            if backfill_target > 0:
+                start = max(1, backfill_target - MAX_BLOCKS_PER_POLL)
+                n = backfill_target - start
+                remaining = backfill_target - 1
+                logger.info(
+                    "backfill: blocks %s-%s (%s behind tip)",
+                    start, backfill_target - 1, remaining,
+                )
+                for num in range(backfill_target - 1, start - 1, -1):
+                    await index_block(num)
+                backfill_target = start - 1
+                total_indexed += n
+
+            # Periodic progress summary
+            now = asyncio.get_running_loop().time()
+            if now - last_log_ts >= 30 or total_indexed == 0:
+                tipped = highest >= head
+                logger.info(
+                    "progress: %s blocks indexed, tip=%s, backfill_remaining=%s%s",
+                    total_indexed,
+                    head,
+                    max(0, backfill_target),
+                    "" if tipped else " (catching up to tip)",
+                )
+                last_log_ts = now
         except Exception:
             await asyncio.sleep(POLL_INTERVAL)
             continue
 
         await asyncio.sleep(POLL_INTERVAL)
+
 
 
 def start() -> asyncio.Task | None:

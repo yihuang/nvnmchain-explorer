@@ -44,6 +44,7 @@ class Transaction(SQLModel, table=True):
     max_fee_per_gas: str = Field(default="0")
     max_priority_fee_per_gas: str = Field(default="0")
     base_fee: str = Field(default="0")
+    contract_address: str | None = Field(default=None)
     fee_token: str | None = Field(default=None)
     fee_amount: str = Field(default="0")
     nonce: int = Field(default=0)
