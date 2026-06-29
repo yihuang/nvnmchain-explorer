@@ -6,7 +6,6 @@ import json
 from typing import Any
 
 import httpx
-from tempo.types import as_bytes
 
 from .config import settings
 

@@ -75,7 +75,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Tempo Explorer", lifespan=lifespan)
 
 
-class NotFound(Exception):
+class NotFoundError(Exception):
     """Raised when a requested resource is not found.
 
     The exception handler renders the 404 page for HTML requests
@@ -88,8 +88,8 @@ class NotFound(Exception):
         self.message = message
 
 
-@app.exception_handler(NotFound)
-async def not_found_handler(request: Request, exc: NotFound):
+@app.exception_handler(NotFoundError)
+async def not_found_handler(request: Request, exc: NotFoundError):
     if _wants_json(request):
         return JSONResponse({"error": exc.message or f"{exc.type} not found"}, status_code=404)
     return templates.TemplateResponse(
@@ -295,7 +295,7 @@ async def block_page(request: Request, block_id: str):
                 pass
 
     if not block:
-        raise NotFound("Block", block_id)
+        raise NotFoundError("Block", block_id)
 
     data = {
         "block": block,
@@ -351,7 +351,7 @@ async def tx_page(
     """Transaction detail page with tabs (reads from cache)."""
     tx = get_transaction(tx_hash)
     if not tx:
-        raise NotFound("Transaction", tx_hash)
+        raise NotFoundError("Transaction", tx_hash)
 
     # Load cached receipt and trace
     receipt = json.loads(tx["receipt_data"]) if tx.get("receipt_data") else None
@@ -451,7 +451,7 @@ async def address_page(
     except (ValueError, TypeError):
         if _wants_json(request):
             return JSONResponse({"error": f"Invalid address: {address}"}, status_code=400)
-        raise NotFound("Address", address, "Invalid address")
+        raise NotFoundError("Address", address, "Invalid address") from None
 
     addr_info = identify_address(checksummed)
     per_page = 25
@@ -500,7 +500,7 @@ async def token_page(
     except (ValueError, TypeError):
         if _wants_json(request):
             return JSONResponse({"error": f"Invalid address: {address}"}, status_code=400)
-        raise NotFound("Token", address, "Invalid address")
+        raise NotFoundError("Token", address, "Invalid address") from None
 
     meta = get_token_metadata(checksummed)
     if not meta:
@@ -658,7 +658,7 @@ def main() -> None:
                 file=sys.stderr,
             )
             print(
-                f"       Stop the other process or change port in .env / settings.",
+                "       Stop the other process or change port in .env / settings.",
                 file=sys.stderr,
             )
             sys.exit(1)

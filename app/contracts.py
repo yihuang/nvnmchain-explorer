@@ -9,19 +9,19 @@ from __future__ import annotations
 from eth_utils import to_checksum_address
 from tempo.constants import (
     ACCOUNT_KEYCHAIN_ADDRESS,
+    ALPHA_USD,
+    BETA_USD,
     FEE_MANAGER_ADDRESS,
     NONCE_ADDRESS,
+    PATH_USD,
     RECEIVE_POLICY_GUARD_ADDRESS,
     SIGNATURE_VERIFIER_ADDRESS,
     STABLECOIN_DEX_ADDRESS,
+    THETA_USD,
     TIP20_FACTORY_ADDRESS,
     TIP20_REWARDS_REGISTRY_ADDRESS,
     TIP403_REGISTRY_ADDRESS,
     VALIDATOR_CONFIG_ADDRESS,
-    PATH_USD,
-    ALPHA_USD,
-    BETA_USD,
-    THETA_USD,
 )
 
 # ── Precompile address ranges ──────────────────────────────────────────

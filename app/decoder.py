@@ -7,13 +7,14 @@ TIP-20 contract ABI and known function signatures.
 from __future__ import annotations
 
 import json
-from .models import DecodedCall, DecodedEvent, DecodedParam
 from typing import Any
 
 from eth_abi import decode as abi_decode
 from eth_utils import keccak, to_bytes, to_checksum_address, to_hex
 from tempo.constants import FEE_MANAGER_ADDRESS
 from tempo.contracts import TIP20
+
+from .models import DecodedCall, DecodedEvent, DecodedParam
 
 # ── Known function selectors ─────────────────────────────────────────
 
