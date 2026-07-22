@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 
 from .database import get_latest_block, save_block, save_token_metadata, save_transaction
 from .decoder import flatten_trace
@@ -13,8 +14,10 @@ from .tokens import fetch_token_metadata
 
 logger = logging.getLogger("tempo.indexer")
 
-POLL_INTERVAL = 3  # seconds between block-number polls
-MAX_BLOCKS_PER_POLL = 5  # catch up at most this many per cycle
+# Tunable via env: a dense local dev chain (50ms blocks) needs a much larger
+# batch to backfill its history in reasonable time, e.g. INDEX_BATCH=2000.
+POLL_INTERVAL = float(os.environ.get("INDEX_POLL_SECONDS", "3"))  # seconds between polls
+MAX_BLOCKS_PER_POLL = int(os.environ.get("INDEX_BATCH", "5"))  # blocks per cycle, each direction
 
 
 async def _fetch_token_if_needed(address: str) -> None:
@@ -69,7 +72,11 @@ async def index_block(block_num: int) -> None:
                 tx_parsed["contract_address"] = receipt["contractAddress"]
             if "feeToken" in receipt:
                 tx_parsed["fee_token"] = receipt["feeToken"]
-                await _fetch_token_if_needed(receipt["feeToken"])
+                # Enrichment only — a token failure must not drop the tx.
+                try:
+                    await _fetch_token_if_needed(receipt["feeToken"])
+                except Exception:
+                    logger.exception("token metadata fetch failed for %s", receipt["feeToken"])
             if "feeAmount" in receipt:
                 raw_fee = receipt["feeAmount"]
                 tx_parsed["fee_amount"] = (
@@ -84,11 +91,11 @@ async def index_block(block_num: int) -> None:
 
 
 async def run_forever() -> None:
-    """Main loop: index new blocks at the tip, backfill old blocks.
+    """Index new blocks at the tip and backfill older ones down to block 1.
 
-    Each poll cycle:
-    1. Index up to ``MAX_BLOCKS_PER_POLL`` new blocks at the chain tip.
-    2. Backfill up to ``MAX_BLOCKS_PER_POLL`` older blocks going backwards.
+    The forward frontier (``highest``) and backfill frontier (``backfill_target``)
+    move independently: the backfill must never reset to the head, or on a live
+    node it never descends and old blocks stay unindexed.
     """
     highest = 0
     latest = get_latest_block()
@@ -96,26 +103,31 @@ async def run_forever() -> None:
         highest = latest["number"]
         logger.info("resuming from block %s", highest)
 
-    # Backfill from the current chain head down to block 0.
+    # Descending frontier (exclusive). 0 = nothing to backfill (a resumed DB
+    # already holds history below `highest`); a fresh DB seeds it to head+1.
     backfill_target = 0
+    initialised = highest != 0
 
     # Track totals for progress reporting
     total_indexed = 0
     last_log_ts = 0.0
 
-    logger.info("indexer started, polling every %ss", POLL_INTERVAL)
+    logger.info("indexer started, polling every %ss (batch %s)", POLL_INTERVAL, MAX_BLOCKS_PER_POLL)
 
     while True:
         try:
             head = await rpc.eth_block_number()
 
-            # Initial jump to tip on fresh DB — skip forward crawl
-            if highest == 0:
+            # Fresh DB: seed both frontiers at the current head, then backfill
+            # everything below it (head down to 1) while the forward phase keeps
+            # up with new blocks.
+            if not initialised:
                 highest = head
-                backfill_target = head
-                logger.info("initialised: indexing from block %s down to 0", head)
+                backfill_target = head + 1  # exclusive, so the head block is included
+                initialised = True
+                logger.info("initialised: tip=%s, backfilling down to block 1", head)
 
-            # Phase 1 — index up to MAX_BLOCKS_PER_POLL new blocks at tip
+            # Phase 1 — index up to MAX_BLOCKS_PER_POLL new blocks at the tip
             if head > highest:
                 end = min(highest + MAX_BLOCKS_PER_POLL, head)
                 n = end - highest
@@ -123,23 +135,19 @@ async def run_forever() -> None:
                 for num in range(highest + 1, end + 1):
                     await index_block(num)
                 highest = end
-                backfill_target = max(backfill_target, head)
                 total_indexed += n
 
-            # Phase 2 — backfill MAX_BLOCKS_PER_POLL older blocks from tip down
-            if backfill_target > 0:
+            # Phase 2 — backfill MAX_BLOCKS_PER_POLL older blocks, descending.
+            # Not reset to the head: it only moves down, so it reaches block 1.
+            if backfill_target > 1:
                 start = max(1, backfill_target - MAX_BLOCKS_PER_POLL)
                 n = backfill_target - start
-                remaining = backfill_target - 1
                 logger.info(
-                    "backfill: blocks %s-%s (%s behind tip)",
-                    start,
-                    backfill_target - 1,
-                    remaining,
+                    "backfill: blocks %s-%s (%s remaining)", start, backfill_target - 1, start - 1
                 )
                 for num in range(backfill_target - 1, start - 1, -1):
                     await index_block(num)
-                backfill_target = start - 1
+                backfill_target = start
                 total_indexed += n
 
             # Periodic progress summary
@@ -150,11 +158,13 @@ async def run_forever() -> None:
                     "progress: %s blocks indexed, tip=%s, backfill_remaining=%s%s",
                     total_indexed,
                     head,
-                    max(0, backfill_target),
+                    max(0, backfill_target - 1),
                     "" if tipped else " (catching up to tip)",
                 )
                 last_log_ts = now
         except Exception:
+            # Stay alive (a dead poller stops all indexing) but log loudly.
+            logger.exception("indexer poll cycle failed; retrying")
             await asyncio.sleep(POLL_INTERVAL)
             continue
 

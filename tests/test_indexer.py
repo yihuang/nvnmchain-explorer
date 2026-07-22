@@ -189,3 +189,33 @@ class TestBlockPageContent:
         assert data["receipt"] is not None, "Receipt should be loaded from cache"
         assert data["trace"] is not None, "Trace should be loaded from cache"
         assert len(data["calls"]) > 0, "Should have decoded calls"
+
+
+@pytest.mark.asyncio
+async def test_uint256_total_supply_is_stringified_and_persists(app, monkeypatch):
+    import app.tokens as tokens
+    from app.database import get_token_metadata, save_token_metadata
+
+    big = 1844690407370955161500  # > 2**63 - 1, so it overflows a 64-bit INTEGER
+
+    async def _big(_):
+        return big
+
+    async def _name(_):
+        return "ALPHA"
+
+    async def _dec(_):
+        return 6
+
+    monkeypatch.setattr(tokens, "_fetch_total_supply", _big)
+    monkeypatch.setattr(tokens, "_fetch_name", _name)
+    monkeypatch.setattr(tokens, "_fetch_symbol", _name)
+    monkeypatch.setattr(tokens, "_fetch_decimals", _dec)
+
+    meta = await tokens.fetch_token_metadata("0x00000000000000000000000000000000000000ff")
+    assert isinstance(meta["total_supply"], str), "total_supply must be a string, not int"
+
+    save_token_metadata(meta)  # must not raise OverflowError
+    stored = get_token_metadata(meta["address"])
+    assert stored is not None
+    assert stored["total_supply"] == str(big)
