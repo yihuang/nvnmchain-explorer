@@ -97,7 +97,8 @@ async def fetch_token_metadata(address: str) -> dict:
         "symbol": symbol,
         "decimals": decimals,
         "currency": currency,
-        "total_supply": total_supply,
+        # uint256 supply overflows SQLite's 64-bit INTEGER, column is VARCHAR.
+        "total_supply": str(total_supply),
     }
 
 
