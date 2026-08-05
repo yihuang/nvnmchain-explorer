@@ -13,4 +13,6 @@ wheels/
 .aider*
 
 # db
-explorer.db*
+*.db
+*.db-wal
+*.db-shm

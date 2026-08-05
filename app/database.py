@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
+from sqlalchemy import event
 from sqlalchemy import text as sa_text
 from sqlmodel import Session, SQLModel, create_engine, func, select
 
@@ -32,6 +33,12 @@ def get_engine():
             connect_args={"check_same_thread": False},
             echo=False,
         )
+
+        @event.listens_for(_engine, "connect")
+        def _wal(dbapi_conn, _record):
+            """Serve reads while the indexer writes; the default journal locks them out."""
+            dbapi_conn.execute("PRAGMA journal_mode=WAL")
+
         _engine_path = settings.db_path
     return _engine
 
