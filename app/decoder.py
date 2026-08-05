@@ -39,24 +39,16 @@ EVENT_PARSERS: dict[bytes, Any] = {
     APPROVAL_TOPIC: TIP20.events.Approval,
 }
 
-# Fee Manager selectors
-FEE_MANAGER_SELECTORS: dict[bytes, str] = {}
-
-# Additional known function signatures (4-byte selectors)
+# Fallback signatures for selectors not covered by TIP20_SELECTORS, which
+# decode_function_call consults first — entries duplicating a TIP-20 selector
+# would never be reached.
 ADDITIONAL_SIGS: dict[bytes, str] = {
-    keccak(b"transfer(address,uint256)")[:4]: "transfer(address to, uint256 amount)",
-    keccak(b"approve(address,uint256)")[:4]: "approve(address spender, uint256 amount)",
-    keccak(b"transferFrom(address,address,uint256)")[
-        :4
-    ]: "transferFrom(address sender, address to, uint256 amount)",
     keccak(b"balanceOf(address)")[:4]: "balanceOf(address account)",
     keccak(b"totalSupply()")[:4]: "totalSupply()",
     keccak(b"name()")[:4]: "name()",
     keccak(b"symbol()")[:4]: "symbol()",
     keccak(b"decimals()")[:4]: "decimals()",
     keccak(b"allowance(address,address)")[:4]: "allowance(address owner, address spender)",
-    keccak(b"mint(address,uint256)")[:4]: "mint(address to, uint256 amount)",
-    keccak(b"burn(uint256)")[:4]: "burn(uint256 amount)",
     # AccountKeychain
     keccak(
         b"authorizeKey(address,uint8,(uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]))"
@@ -68,7 +60,9 @@ ADDITIONAL_SIGS: dict[bytes, str] = {
 def decode_function_call(data: str) -> DecodedCall | None:
     """Decode a 0x-prefixed calldata into function name and parameters.
 
-    Returns dict with 'name', 'signature', 'params' or None if unknown.
+    Returns a :class:`DecodedCall` — with ``name``/``signature``/``params``
+    filled in for known selectors, or carrying just ``selector``/``raw_args``
+    for unknown ones. Returns ``None`` when there is no calldata to decode.
     """
     if not data or data in ("0x", "0x0"):
         return None
@@ -77,7 +71,7 @@ def decode_function_call(data: str) -> DecodedCall | None:
     if len(raw) < 4:
         return None
 
-    selector = raw[:4]
+    selector, args = raw[:4], raw[4:]
 
     # Check TIP-20 first
     fn_name = TIP20_SELECTORS.get(selector)
@@ -89,21 +83,10 @@ def decode_function_call(data: str) -> DecodedCall | None:
         return DecodedCall(
             name=sig.split("(")[0],
             signature=sig,
-            params=_decode_params(sig, raw[4:]),
-            raw_args=to_hex(raw[4:]),
+            params=_decode_params(sig, args),
+            raw_args=to_hex(args),
         )
-    return DecodedCall(
-        selector=to_hex(selector),
-        raw_args=to_hex(raw[4:]),
-    )
-
-    return {
-        "name": None,
-        "signature": None,
-        "selector": to_hex(selector),
-        "params": [],
-        "raw_args": to_hex(raw[4:]),
-    }
+    return DecodedCall(selector=to_hex(selector), raw_args=to_hex(args))
 
 
 def _decode_params(signature: str, data: bytes) -> list[DecodedParam]:
@@ -113,7 +96,8 @@ def _decode_params(signature: str, data: bytes) -> list[DecodedParam]:
         sig_types_str = signature[signature.index("(") + 1 : signature.rindex(")")]
         if not sig_types_str:
             return []
-        types = [t.strip() for t in sig_types_str.split(",")]
+        # Signatures here carry parameter names ("bytes32 key"); abi_decode wants the type alone.
+        types = [t.strip().split(" ")[0] for t in sig_types_str.split(",")]
         decoded = abi_decode(types, data)
         param_names = _extract_param_names(signature)
         params = []
