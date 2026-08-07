@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Token {{ token.symbol | fallback(value=truncate_hash(h=token.address, prefix=8, suffix=4)) }} ⋅ Tempo Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-4">
+    <div class="text-xs text-dim mb-1">
+        <a href="/" class="hover:text-blue-300">Home</a>
+        <span class="mx-1">/</span>
+        <a href="/tokens" class="hover:text-blue-300">Tokens</a>
+        <span class="mx-1">/</span>
+        <span>{{ token.name | fallback(value='Token') }}</span>
+    </div>
+    <h1 class="text-2xl font-bold">{{ token.name | fallback(value='Unnamed Token') }}</h1>
+</div>
+
+<div class="card mb-6">
+    <div class="card-body">
+        <div class="mb-4">
+            <span class="text-dim text-xs">Address</span>
+            <div class="mono text-sm mt-1">
+                <a href="{{ get_address_url(address=token.address) }}" class="text-blue-400">{{ token.address }}</a>
+            </div>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+            <div>
+                <span class="text-dim">Symbol</span>
+                <div class="mt-1 font-medium">{{ token.symbol | fallback(value='—') }}</div>
+            </div>
+            <div>
+                <span class="text-dim">Decimals</span>
+                <div class="mt-1 font-medium">{{ token.decimals }}</div>
+            </div>
+            <div>
+                <span class="text-dim">Currency</span>
+                <div class="mt-1 font-medium">{{ token.currency | fallback(value='—') }}</div>
+            </div>
+            <div>
+                <span class="text-dim">Total Supply</span>
+                <div class="mt-1 font-medium">{{ format_token_amount(amount=token.total_supply, decimals=token.decimals) }}</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Tabs -->
+<div class="flex border-b border-[#1e1e2a] mb-4 gap-1">
+    <a href="?tab=transactions" class="tab {% if active_tab == 'transactions' %}active{% endif %}">Transactions</a>
+    <a href="?tab=transfers" class="tab {% if active_tab == 'transfers' %}active{% endif %}">Transfers</a>
+</div>
+
+{% if active_tab == 'transactions' or active_tab == 'transfers' %}
+<div class="card">
+    <div class="card-header">
+        <span>{% if active_tab == 'transfers' %}Transfers{% else %}Transactions{% endif %}</span>
+    </div>
+    {% if transfers %}
+    <div>
+        <div class="flex table-header">
+            <div class="flex-1 px-3 py-2">Tx Hash</div>
+            <div class="w-36 px-3 py-2 hidden md:block">From</div>
+            <div class="w-36 px-3 py-2 hidden md:block">To</div>
+            <div class="w-28 px-3 py-2 text-right">Amount</div>
+        </div>
+        {% for t in transfers %}
+        <div class="t-row flex text-xs">
+            <div class="flex-1 px-3 py-3">
+                <a href="/tx/{{ t.tx_hash }}" class="mono text-blue-400">{{ truncate_hash(h=t.tx_hash, prefix=10, suffix=6) }}</a>
+            </div>
+            <div class="w-36 px-3 py-3 hidden md:block mono truncate">
+                <a href="{{ get_address_url(address=t.from_addr) }}">{{ truncate_hash(h=t.from_addr) }}</a>
+            </div>
+            <div class="w-36 px-3 py-3 hidden md:block mono truncate">
+                <a href="{{ get_address_url(address=t.to_addr) }}">{{ truncate_hash(h=t.to_addr) }}</a>
+            </div>
+            <div class="w-28 px-3 py-3 text-right {% if t.to_addr == address %}value-positive{% else %}value-negative{% endif %}">
+                {{ format_token_amount(amount=t.amount, decimals=token.decimals) }}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="card-body text-center text-dim text-sm py-6">No transfers found</div>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}

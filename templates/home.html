@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Explore - Tempo Explorer{% endblock %}
+{% block content %}
+
+<!-- Stats -->
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+    <div class="card card-body text-center">
+        <div class="stat-value accent">{% if recent_blocks %}{{ latest_num }}{% else %}—{% endif %}</div>
+        <div class="stat-label">Latest Block</div>
+    </div>
+    <div class="card card-body text-center">
+        <div class="stat-value">{{ recent_blocks | length }}</div>
+        <div class="stat-label">Recent Blocks</div>
+    </div>
+    <div class="card card-body text-center">
+        <div class="stat-value">{{ recent_txs | length }}</div>
+        <div class="stat-label">Recent Txns</div>
+    </div>
+    <div class="card card-body text-center">
+        <div class="stat-value">—</div>
+        <div class="stat-label">TPS</div>
+    </div>
+</div>
+
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <!-- Recent Blocks -->
+    <div class="card">
+        <div class="card-header flex items-center justify-between">
+            <span>Blocks</span>
+            <a href="/blocks" class="text-xs text-blue-400 font-normal">View all →</a>
+        </div>
+        <div>
+            {% if recent_blocks %}
+            {% for block in recent_blocks %}
+            <div class="t-row flex items-center px-4 py-3 text-sm">
+                <div class="w-20 font-mono text-xs">
+                    <a href="/block/{{ block.number }}" class="text-blue-400 hover:text-blue-300">
+                        #{{ block.number }}
+                    </a>
+                </div>
+                <div class="flex-1 font-mono text-xs text-dim truncate px-2">
+                    {{ truncate_hash(h=block.hash) }}
+                </div>
+                <div class="w-20 text-xs text-dim text-right">
+                    {{ format_time_ago(timestamp=block.timestamp) }}
+                </div>
+                <div class="w-16 text-xs text-dim text-right">
+                    {{ block.tx_count }} txns
+                </div>
+            </div>
+            {% endfor %}
+            {% else %}
+            <div class="px-4 py-6 text-center text-dim text-sm">No blocks cached yet</div>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Recent Transactions -->
+    <div class="card">
+        <div class="card-header">
+            <span>Transactions</span>
+        </div>
+        <div>
+            {% if recent_txs %}
+            {% for tx in recent_txs %}
+            <div class="t-row flex items-center px-4 py-3 text-sm">
+                <div class="flex-1 min-w-0">
+                    <a href="/tx/{{ tx.hash }}" class="font-mono text-xs text-blue-400 hover:text-blue-300">
+                        {{ truncate_hash(h=tx.hash, prefix=10, suffix=6) }}
+                    </a>
+                    <div class="text-xs text-dim truncate mt-0.5">
+                        {{ truncate_hash(h=tx.from_addr) }} → {{ truncate_hash(h=tx.to_addr) }}
+                    </div>
+                </div>
+                <div class="w-16 text-xs text-dim text-right ml-2">
+                    {{ format_time_ago(timestamp=tx.timestamp) }}
+                </div>
+            </div>
+            {% endfor %}
+            {% else %}
+            <div class="px-4 py-6 text-center text-dim text-sm">No transactions cached yet</div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

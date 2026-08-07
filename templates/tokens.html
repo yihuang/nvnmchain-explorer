@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Tokens – Tempo Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-4">
+    <h1 class="text-2xl font-bold">Tokens</h1>
+    <p class="text-xs text-dim mt-1">{{ total }} tokens</p>
+</div>
+
+<div class="card">
+    <div class="flex table-header">
+        <div class="w-8 px-3 py-2"></div>
+        <div class="flex-1 px-3 py-2">Token</div>
+        <div class="w-20 px-3 py-2 hidden md:block">Symbol</div>
+        <div class="w-16 px-3 py-2 hidden md:block">Currency</div>
+        <div class="w-20 px-3 py-2 text-right hidden md:block">Holders</div>
+        <div class="w-36 px-3 py-2 hidden md:block">Address</div>
+    </div>
+    {% for token in tokens %}
+    <div class="t-row flex text-xs">
+        <div class="w-8 px-3 py-3 text-dim">{{ loop.index + (page - 1) * 25 }}</div>
+        <div class="flex-1 px-3 py-3">
+            <a href="{{ get_token_url(address=token.address) }}" class="text-blue-400 font-medium">{{ token.name | fallback(value=truncate_hash(h=token.address)) }}</a>
+        </div>
+        <div class="w-20 px-3 py-3 hidden md:block text-dim">{{ token.symbol }}</div>
+        <div class="w-16 px-3 py-3 hidden md:block text-dim">{{ token.currency }}</div>
+        <div class="w-20 px-3 py-3 text-right hidden md:block text-dim">{{ token.holder_count }}</div>
+        <div class="w-36 px-3 py-3 hidden md:block mono truncate">
+            <a href="{{ get_address_url(address=token.address) }}" class="text-blue-400">{{ truncate_hash(h=token.address, prefix=8, suffix=4) }}</a>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{% if total_pages > 1 %}
+<div class="flex justify-center gap-2 mt-4 text-xs">
+    {% if page > 1 %}
+    <a href="/tokens?page={{ page - 1 }}" class="text-blue-400">← Previous</a>
+    {% endif %}
+    <span class="text-dim px-2">Page {{ page }} of {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <a href="/tokens?page={{ page + 1 }}" class="text-blue-400">Next →</a>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}

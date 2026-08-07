@@ -6,51 +6,44 @@ on:
   pull_request:
     branches: ["main"]
 
+env:
+  RUSTFLAGS: "-D warnings"
+
 jobs:
   lint:
-    name: Lint (ruff)
+    name: Lint + format (cargo)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
+          components: clippy, rustfmt
 
-      - name: Set up Python
-        run: uv python pin 3.13
-
-      - name: Install dependencies
-        run: uv sync --dev
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: uv run ruff format --check app/ tests/ alembic/
+        run: cargo fmt --check
 
-      - name: Lint
-        run: uv run ruff check app/ tests/ alembic/
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: Test (pytest)
+    name: Test (cargo)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up Python
-        run: uv python pin 3.13
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install dependencies
-        run: uv sync --dev
+      - name: Run unit tests
+        run: cargo test --test decoder
 
-      - name: Run tests
-        run: uv run pytest tests/ -v --no-header -q
+      - name: Run live RPC integration tests
+        run: cargo test --test live_rpc
         env:
-          # Use a temp path for the test database
-          EXPLORER_DB_PATH: /tmp/tempo_test.db
+          TEMPO_RPC: https://rpc.nvnm.canary.mantrachain.dev

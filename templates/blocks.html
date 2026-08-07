@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Blocks – Tempo Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-4">
+    <h1 class="text-2xl font-bold">Blocks</h1>
+    <p class="text-xs text-dim mt-1">{{ latest_num }} blocks</p>
+</div>
+
+<div class="card">
+    <div class="flex table-header">
+        <div class="w-20 px-3 py-2">Block</div>
+        <div class="flex-1 px-3 py-2">Hash</div>
+        <div class="w-24 px-3 py-2">Time</div>
+        <div class="w-16 px-3 py-2 text-right">Txns</div>
+        <div class="w-24 px-3 py-2 text-right hidden md:block">Gas Used</div>
+    </div>
+    {% for block in blocks %}
+    <div class="t-row flex text-xs">
+        <div class="w-20 px-3 py-3">
+            <a href="/block/{{ block.number }}" class="text-blue-400 font-mono">#{{ block.number }}</a>
+        </div>
+        <div class="flex-1 px-3 py-3 font-mono truncate">
+            {{ truncate_hash(h=block.hash, prefix=10, suffix=6) }}
+        </div>
+        <div class="w-24 px-3 py-3 text-dim">{{ format_time_ago(timestamp=block.timestamp) }}</div>
+        <div class="w-16 px-3 py-3 text-right text-dim">{{ block.tx_count }}</div>
+        <div class="w-24 px-3 py-3 text-right text-dim hidden md:block">{{ block.gas_pct }}%</div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Pagination -->
+<div class="flex items-center justify-between mt-4 text-xs">
+    <div class="text-dim">
+        Showing blocks
+        {% if blocks %}#{{ last_num }} – #{{ first_num }}{% else %}0{% endif %}
+    </div>
+    <div class="flex gap-2">
+        <a href="/blocks?from={% if blocks %}{{ last_num - 1 }}{% else %}0{% endif %}" class="text-blue-400">Older →</a>
+    </div>
+</div>
+{% endblock %}

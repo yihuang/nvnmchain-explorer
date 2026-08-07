@@ -14,3 +14,7 @@ wheels/
 
 # db
 explorer.db*
+
+# Rust
+/target/
+Cargo.lock.orig

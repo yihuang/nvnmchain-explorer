@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Block {{ block.number }} ⋅ Tempo Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-4">
+    <div class="text-xs text-dim mb-1">
+        <a href="/" class="hover:text-blue-300">Home</a>
+        <span class="mx-1">/</span>
+        <span>Block</span>
+    </div>
+    <h1 class="text-2xl font-bold">Block #{{ block.number }}</h1>
+</div>
+
+<div class="card mb-6">
+    <div class="card-body space-y-3">
+        <div class="flex items-start gap-4">
+            <div class="w-24 text-xs text-dim shrink-0">Hash</div>
+            <div class="mono text-xs break-all">{{ block.hash }}</div>
+        </div>
+        <div class="flex items-start gap-4">
+            <div class="w-24 text-xs text-dim shrink-0">Timestamp</div>
+            <div class="text-xs">
+                {{ block.timestamp | timestamp_to_date }} ({{ format_time_ago(timestamp=block.timestamp) }})
+            </div>
+        </div>
+        <div class="flex items-start gap-4">
+            <div class="w-24 text-xs text-dim shrink-0">Parent Hash</div>
+            <div class="mono text-xs break-all">
+                <a href="{{ get_block_url(block_id=block.parent_hash) }}" class="text-blue-400">{{ block.parent_hash }}</a>
+            </div>
+        </div>
+        <div class="flex items-start gap-4">
+            <div class="w-24 text-xs text-dim shrink-0">Miner</div>
+            <div class="mono text-xs">
+                <a href="{{ get_address_url(address=block.miner) }}">{{ block.miner }}</a>
+            </div>
+        </div>
+        <hr class="divider">
+        <div class="flex items-start gap-4">
+            <div class="w-24 text-xs text-dim shrink-0">Gas Used</div>
+            <div class="text-xs">{{ block.gas_used }} / {{ block.gas_limit }}
+                {% if block.gas_limit > 0 %}
+                ({{ gas_pct }}%)
+                {% endif %}
+            </div>
+        </div>
+        <div class="flex items-start gap-4">
+            <div class="w-24 text-xs text-dim shrink-0">Transactions</div>
+            <div class="text-xs">{{ block.tx_count }}</div>
+        </div>
+    </div>
+</div>
+
+<!-- Transactions in block -->
+<div class="card">
+    <div class="card-header">
+        <span>Transactions ({{ transactions | length }})</span>
+    </div>
+    {% if transactions %}
+    <div>
+        <div class="flex table-header">
+            <div class="w-12 px-3 py-2">#</div>
+            <div class="flex-1 px-3 py-2">Hash</div>
+            <div class="w-44 px-3 py-2 hidden md:block">From</div>
+            <div class="w-44 px-3 py-2 hidden md:block">To</div>
+            <div class="w-24 px-3 py-2 text-right">Fee</div>
+        </div>
+        {% for tx in transactions %}
+        <div class="t-row flex text-xs">
+            <div class="w-12 px-3 py-3 text-dim">{{ tx.position }}</div>
+            <div class="flex-1 px-3 py-3">
+                <a href="/tx/{{ tx.hash }}" class="mono text-blue-400">{{ truncate_hash(h=tx.hash, prefix=10, suffix=6) }}</a>
+            </div>
+            <div class="w-44 px-3 py-3 hidden md:block mono truncate">
+                <a href="{{ get_address_url(address=tx.from_addr) }}">{{ truncate_hash(h=tx.from_addr) }}</a>
+            </div>
+            <div class="w-44 px-3 py-3 hidden md:block mono truncate">
+                {% if tx.to_addr %}
+                <a href="{{ get_address_url(address=tx.to_addr) }}">{{ truncate_hash(h=tx.to_addr) }}</a>
+                {% else %}
+                <span class="text-dim">Create</span>
+                {% endif %}
+            </div>
+            <div class="w-24 px-3 py-3 text-right text-dim">
+                {% if tx.fee_token and tx.fee_amount and tx.fee_amount != '0' %}
+                {{ format_token_amount(amount=tx.fee_amount, decimals=18) }}
+                {% else %}{{ tx.gas_used }} gas{% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="card-body text-center text-dim text-sm py-6">No transactions</div>
+    {% endif %}
+</div>
+{% endblock %}

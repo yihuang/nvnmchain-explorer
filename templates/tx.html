@@ -1,0 +1,277 @@
+{% extends "base.html" %}
+{% block title %}Transaction {{ truncate_hash(h=tx.hash, prefix=8, suffix=4) }} ⋅ Tempo Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-4">
+    <div class="text-xs text-dim mb-1">
+        <a href="/" class="hover:text-blue-300">Home</a>
+        <span class="mx-1">/</span>
+        <span>Tx</span>
+    </div>
+    <h1 class="text-2xl font-bold">Transaction</h1>
+</div>
+
+<!-- Status banner -->
+<div class="card mb-6">
+    <div class="card-body">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+                <div class="flex items-center gap-2 mb-4">
+                    <span class="badge {% if tx.status == 1 %}badge-success{% else %}badge-error{% endif %}">
+                        {% if tx.status == 1 %}Success{% else %}Failed{% endif %}
+                    </span>
+                </div>
+                <div class="space-y-2 text-xs">
+                    <div class="flex items-start gap-4">
+                        <span class="text-dim w-20 shrink-0">Hash</span>
+                        <span class="mono break-all">{{ tx.hash }}</span>
+                    </div>
+                    <div class="flex items-start gap-4">
+                        <span class="text-dim w-20 shrink-0">Block</span>
+                        <a href="/block/{{ tx.block_number }}" class="text-blue-400 mono">{{ tx.block_number }}</a>
+                    </div>
+                    <div class="flex items-start gap-4">
+                        <span class="text-dim w-20 shrink-0">Time</span>
+                        <span>{{ format_time_ago(timestamp=tx.timestamp) }}</span>
+                    </div>
+                    <div class="flex items-start gap-4">
+                        <span class="text-dim w-20 shrink-0">From</span>
+                        <a href="{{ get_address_url(address=tx.from_addr) }}" class="mono text-blue-400 break-all">{{ tx.from_addr }}</a>
+                    </div>
+                    <div class="flex items-start gap-4">
+                        <span class="text-dim w-20 shrink-0">To</span>
+                        {% if tx.to_addr %}
+                        <a href="{{ get_address_url(address=tx.to_addr) }}" class="mono text-blue-400 break-all">{{ tx.to_addr }}</a>
+                        {% else %}
+                        <span class="text-dim">Contract Creation
+                        {%- if tx.contract_address %}
+                        <a href="{{ get_address_url(address=tx.contract_address) }}" class="mono text-blue-400 break-all ml-1">→ {{ tx.contract_address }}</a>
+                        {%- endif %}</span>
+                        {% endif %}
+                    </div>
+                    {% if fee_token %}
+                    <div class="flex items-start gap-4">
+                        <span class="text-dim w-20 shrink-0">Fee Token</span>
+                        {% if fee_token_meta %}
+                        <a href="{{ get_token_url(address=fee_token) }}" class="text-blue-400">{{ fee_token_meta.name }}</a>
+                        {% else %}
+                        <span class="mono"><a href="{{ get_token_url(address=fee_token) }}" class="text-blue-400">{{ fee_token }}</a></span>
+                        {% endif %}
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            <div class="space-y-2 text-xs">
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Transaction Fee</span>
+                    {% if fee_token and fee_amount and fee_amount != '0' %}
+                    <span>{{ format_token_amount_with_symbol(amount=fee_amount, decimals=fee_token_meta.decimals, symbol=fee_token_meta.symbol) }}</span>
+                    {% else %}
+                    <span>—</span>
+                    {% endif %}
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Gas Used</span>
+                    <span>{{ gas_used }} / {{ gas_limit }}
+                        {% if gas_limit > 0 %}
+                        ({{ gas_pct }}%)
+                        {% endif %}
+                    </span>
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Gas Price</span>
+                    <span class="mono">{{ gas_price }}</span>
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Base Fee</span>
+                    <span class="mono">{{ base_fee }}</span>
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Max Fee</span>
+                    <span class="mono">{{ max_fee }}</span>
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Max Priority Fee</span>
+                    <span class="mono">{{ max_priority }}</span>
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Transaction Type</span>
+                    <span class="mono">0x{{ tx_type_hex }}</span>
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Nonce</span>
+                    <span>{{ tx.nonce }}</span>
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Nonce Key</span>
+                    <span class="mono">{{ tx.nonce_key }}</span>
+                </div>
+                <div class="flex items-start gap-4">
+                    <span class="text-dim w-28 shrink-0">Position</span>
+                    <span>{{ tx.position }}</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Tabs -->
+<div class="flex border-b border-[#1e1e2a] mb-4 gap-1">
+    <a href="?tab=overview" class="tab {% if active_tab == 'overview' %}active{% endif %}">Overview</a>
+    <a href="?tab=balances" class="tab {% if active_tab == 'balances' %}active{% endif %}">Balances</a>
+    <a href="?tab=calls" class="tab {% if active_tab == 'calls' %}active{% endif %}">Calls</a>
+    <a href="?tab=events" class="tab {% if active_tab == 'events' %}active{% endif %}">Events</a>
+    <a href="?tab=raw" class="tab {% if active_tab == 'raw' %}active{% endif %}">Raw</a>
+</div>
+
+{% if active_tab == 'overview' or active_tab == 'balances' %}
+<!-- Balance Changes -->
+{% if balance_changes %}
+<div class="card mb-6">
+    <div class="card-header">Balance Updates</div>
+    <div>
+        <div class="flex table-header">
+            <div class="flex-1 px-3 py-2">Address</div>
+            <div class="w-32 px-3 py-2">Token</div>
+            <div class="w-28 px-3 py-2 text-right">Change</div>
+        </div>
+        {% for bc in balance_changes %}
+        <div class="t-row flex text-xs">
+            <div class="flex-1 px-3 py-3 mono truncate">
+                <a href="{{ get_address_url(address=bc.address) }}">{{ bc.address }}</a>
+            </div>
+            <div class="w-32 px-3 py-3 truncate">
+                <a href="{{ get_token_url(address=bc.token) }}" class="text-blue-400">{{ truncate_hash(h=bc.token, prefix=8, suffix=4) }}</a>
+            </div>
+            <div class="w-28 px-3 py-3 text-right {% if bc.positive %}value-positive{% else %}value-negative{% endif %}">
+                {{ bc.change }}
+                {% if bc.is_fee %}<span class="badge badge-warn ml-1">fee</span>{% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+{% endif %}
+
+{% if active_tab == 'overview' or active_tab == 'calls' %}
+<!-- Calls / Execution Trace -->
+{% if calls %}
+<div class="card mb-6">
+    <div class="card-header">Execution Trace{% if calls[0].type %} ({{ calls | length }} internal calls){% endif %}</div>
+    {% for call in calls %}
+    <div class="t-row" style="padding-left: {{ call.indent }}px">
+        <div class="px-4 py-3">
+            <div class="flex items-start gap-2 text-xs mb-1">
+                {% if call.type %}
+                <span class="badge {% if call.type == 'CALL' %}badge-info{% else %}badge-warn{% endif %}">{{ call.type }}</span>
+                {% endif %}
+                {% if call.depth %}
+                <span class="text-dim">depth {{ call.depth }}</span>
+                {% endif %}
+                <span class="mono break-all">
+                    {% if call.from and call.to %}
+                    <a href="{{ get_address_url(address=call.from) }}" class="text-dim">{{ truncate_hash(h=call.from) }}</a>
+                    →
+                    <a href="{{ get_address_url(address=call.to) }}" class="text-blue-400">{{ truncate_hash(h=call.to) }}</a>
+                    {% else %}
+                    <a href="{{ get_address_url(address=call.to) }}" class="text-blue-400">{{ call.to }}</a>
+                    {% endif %}
+                </span>
+                {% if call.gas and call.gas != '0' %}
+                <span class="text-dim ml-2">gas: {{ call.gas_used }}/{{ call.gas }}</span>
+                {% endif %}
+                {% if call.value and call.value != '0' %}
+                <span class="text-dim ml-2">value: {{ call.value }}</span>
+                {% endif %}
+            </div>
+            {% if call.decoded %}
+            <div class="text-sm ml-4 mb-1">
+                <span class="text-blue-300">{{ call.decoded.signature | fallback(value=call.decoded.name) | fallback(value='Unknown') }}</span>
+            </div>
+            {% if call.decoded.params %}
+            <div class="space-y-1 text-xs ml-6">
+                {% for param in call.decoded.params %}
+                <div>
+                    <span class="text-dim">{{ param.type }} {{ param.name }}:</span>
+                    <span class="mono ml-1 break-all">{{ param.value }}</span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% else %}
+            <div class="text-xs text-dim ml-4 mono">data: {{ call.data | truncate(length=80) }}</div>
+            {% endif %}
+            {% if call.output and call.output != '0x' %}
+            <div class="text-xs text-dim ml-4 mono">→ output: {{ call.output | truncate(length=80) }}</div>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+{% endif %}
+
+{% if active_tab == 'overview' or active_tab == 'events' %}
+<!-- Events -->
+{% if events %}
+<div class="card mb-6">
+    <div class="card-header">Events ({{ events | length }})</div>
+    {% for event in events %}
+    <div class="t-row px-4 py-3">
+        <div class="flex items-start gap-2 text-xs mb-1">
+            <span class="badge badge-info">#{{ loop.index0 }}</span>
+            {% if event.log_index %}
+            <span class="text-dim">Log {{ event.log_index }}</span>
+            {% endif %}
+        </div>
+        <div class="text-sm mb-2">
+            {% if event.name %}
+            <span class="text-green-400">{{ event.name }}</span>
+            <span class="text-dim text-xs ml-2">{{ event.signature }}</span>
+            {% else %}
+            <span class="text-dim">Unknown Event</span>
+            <span class="mono text-xs ml-2">{{ event.topic0 | truncate(length=50) }}</span>
+            {% endif %}
+        </div>
+        <div class="text-xs">
+            <span class="text-dim">Contract: </span>
+            <a href="{{ get_address_url(address=event.contract) }}" class="text-blue-400 mono">{{ event.contract }}</a>
+        </div>
+        {% if event.params %}
+        <div class="space-y-1 text-xs mt-1 ml-2">
+            {% for param in event.params %}
+            <div>
+                <span class="text-dim">{{ param.type }} {{ param.name }}{% if param.indexed %} (indexed){% endif %}:</span>
+                <span class="mono ml-1 break-all">{{ param.value }}</span>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card mb-6">
+    <div class="card-body text-center text-dim text-sm py-6">No events</div>
+</div>
+{% endif %}
+{% endif %}
+
+{% if active_tab == 'raw' %}
+<div class="card mb-6">
+    <div class="card-header">Raw Transaction</div>
+    <div class="card-body">
+        <pre class="text-xs mono pre-wrap">{{ tx.raw }}</pre>
+    </div>
+</div>
+{% if receipt %}
+<div class="card mb-6">
+    <div class="card-header">Raw Receipt</div>
+    <div class="card-body">
+        <pre class="text-xs mono pre-wrap">{{ receipt | json_encode(pretty=true) }}</pre>
+    </div>
+</div>
+{% endif %}
+{% endif %}
+{% endblock %}
