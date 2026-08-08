@@ -147,38 +147,55 @@ pub fn tx_extras(
     (fee_payer, signature_type, fail_reason)
 }
 
-/// Recover a failure reason for a reverted transaction by re-executing its
-/// calls via `eth_call` at the transaction's block. The node records no
-/// reason in the receipt and tracing is unsupported, so this replay is the
-/// only source. Returns the first call whose replay reverts.
-pub async fn fetch_fail_reason(rpc: &ChainRpc, tx: &crate::models::Transaction) -> Option<String> {
-    let raw: Value = serde_json::from_str(tx.raw.as_deref()?).ok()?;
-    let calls = raw.get("calls").and_then(Value::as_array)?;
+/// Replay every replayable top-level call of a transaction via `eth_call` at
+/// its block, as one batched request. Returns the node's error message per
+/// call (`None` = succeeded). This is the only per-call outcome source on
+/// chains whose receipts record no reason and whose tracing is unsupported.
+/// Entries are in `raw.calls` order, skipping calls without a destination.
+pub async fn replay_tx_calls(
+    rpc: &ChainRpc,
+    tx: &crate::models::Transaction,
+) -> Vec<Option<String>> {
+    let raw: Value = match serde_json::from_str(tx.raw.as_deref().unwrap_or("{}")) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(calls) = raw.get("calls").and_then(Value::as_array) else {
+        return Vec::new();
+    };
     let from = tx.from_addr.clone();
     let gas = format!("0x{:x}", tx.gas_limit.max(0));
-    for call in calls {
-        let to = call.get("to").and_then(Value::as_str).unwrap_or("");
-        if to.is_empty() {
-            continue;
-        }
-        let data = call
-            .get("data")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .or_else(|| call.get("input").and_then(Value::as_str))
-            .unwrap_or("0x")
-            .to_string();
-        let call_obj = json!({
-            "from": from,
-            "to": to,
-            "data": data,
-            "gas": gas,
-        });
-        if let Err(reason) = rpc.eth_call_full(call_obj, tx.block_number as u64).await {
-            return Some(reason);
-        }
-    }
-    None
+    let block = format!("0x{:x}", tx.block_number.max(0));
+    let batch: Vec<(String, Value)> = calls
+        .iter()
+        .filter_map(|call| {
+            let to = call.get("to").and_then(Value::as_str)?;
+            if to.is_empty() {
+                return None;
+            }
+            let data = call
+                .get("data")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| call.get("input").and_then(Value::as_str))
+                .unwrap_or("0x")
+                .to_string();
+            Some((
+                "eth_call".to_string(),
+                json!([{"from": from, "to": to, "data": data, "gas": gas}, block]),
+            ))
+        })
+        .collect();
+    let Ok(results) = rpc.batch_call(batch).await else {
+        return Vec::new();
+    };
+    results
+        .into_iter()
+        .map(|r| match r {
+            Ok(_) => None,
+            Err(e) => Some(e.message.clone()),
+        })
+        .collect()
 }
 
 /// Burnt fees for a block: base fee × gas used, as a wei decimal string.
@@ -595,11 +612,84 @@ pub async fn tx_page(
     }
 
     let (fee_payer, signature_type, mut fail_reason) = tx_extras(&tx, receipt.as_ref());
-    if tx.status == 0 && fail_reason.is_none() {
-        // The node doesn't record revert reasons; replay the calls to recover
-        // one (best-effort: falls back to the generic Failed badge).
-        fail_reason = fetch_fail_reason(&state.rpc, &tx).await;
+
+    // Per-call status. Trace-based chains carry the error on the failed trace
+    // node; tempo-style chains record nothing, so replay the calls with one
+    // batched eth_call to find which one reverted. Best-effort: any RPC
+    // hiccup degrades to the generic Failed badge.
+    if tx.status == 0 {
+        if fail_reason.is_none() {
+            if let Some(err) = calls
+                .iter()
+                .find_map(|c| c.get("error").and_then(Value::as_str))
+            {
+                fail_reason = Some(err.to_string());
+            }
+        }
+        if fail_reason.is_none() {
+            let outcomes = replay_tx_calls(&state.rpc, &tx).await;
+            fail_reason = outcomes.iter().find_map(|o| o.clone());
+            if !outcomes.is_empty() {
+                let mut k = 0;
+                let mut seen_failure = false;
+                for call in calls.iter_mut() {
+                    if call.get("depth").and_then(Value::as_i64) != Some(0) {
+                        continue;
+                    }
+                    if call
+                        .get("to")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .is_empty()
+                    {
+                        continue;
+                    }
+                    if k >= outcomes.len() {
+                        break;
+                    }
+                    // Calls after the reverting one never executed.
+                    if seen_failure {
+                        break;
+                    }
+                    match &outcomes[k] {
+                        Some(err) => {
+                            call["status"] = json!("failed");
+                            call["error"] = json!(err);
+                            seen_failure = true;
+                        }
+                        None => {
+                            call["status"] = json!("success");
+                        }
+                    }
+                    k += 1;
+                }
+            }
+        }
+    } else {
+        // Successful tx on an atomic chain: a lone top-level call executed.
+        let top_level: Vec<&Value> = calls
+            .iter()
+            .filter(|c| c.get("depth").and_then(Value::as_i64) == Some(0))
+            .collect();
+        if top_level.len() == 1 {
+            calls[0]["status"] = json!("success");
+        }
     }
+    // Synthetic fallback call (no data at all) mirrors the tx result.
+    if let Some(first) = calls.first_mut() {
+        if first.get("status").is_none() {
+            first["status"] = json!(if tx.status == 1 { "success" } else { "failed" });
+            if tx.status == 0 {
+                if let Some(r) = &fail_reason {
+                    first["error"] = json!(r);
+                }
+            }
+        }
+    }
+    let failed_calls = calls
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("failed"))
+        .count() as i64;
 
     let ctx = page_ctx(
         &state,
@@ -614,6 +704,7 @@ pub async fn tx_page(
             "fee_payer": fee_payer,
             "signature_type": signature_type,
             "fail_reason": fail_reason,
+            "failed_calls": failed_calls,
             "gas_price": gas_price,
             "gas_used": gas_used,
             "gas_limit": gas_limit,

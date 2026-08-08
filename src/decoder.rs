@@ -832,7 +832,12 @@ fn hex_to_dec(value: &Value, default: &str) -> String {
 fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
     let input = node.get("input").and_then(Value::as_str).unwrap_or("0x");
     let decoded = decode_function_call(input).map(|d| d.to_json());
-    let flat = json!({
+    let error = node
+        .get("error")
+        .or_else(|| node.get("revertReason"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let mut flat = json!({
         "depth": depth,
         "type": node.get("type").and_then(Value::as_str).unwrap_or("CALL"),
         "from": node.get("from").and_then(Value::as_str).unwrap_or(""),
@@ -845,6 +850,12 @@ fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
         "decoded": decoded.unwrap_or(Value::Null),
         "children": [],
     });
+    if let Some(err) = error {
+        flat["status"] = json!("failed");
+        flat["error"] = json!(err);
+    } else {
+        flat["status"] = json!("success");
+    }
     let idx = result.len();
     result.push(flat);
     let children = node

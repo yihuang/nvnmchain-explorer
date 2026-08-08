@@ -10,7 +10,7 @@
     </div>
     <div class="flex items-center gap-3 flex-wrap">
         <h1 class="text-2xl font-extrabold tracking-tight">Transaction</h1>
-        <span class="badge {% if tx.status == 1 %}badge-success{% else %}badge-error{% endif %}"{% if fail_reason %} title="{{ fail_reason | escape }}"{% endif %}>
+        <span class="badge {% if tx.status == 1 %}badge-success{% else %}badge-error{% endif %}">
             {% if tx.status == 1 %}Success{% else %}Failed{% endif %}
         </span>
         {% if method %}
@@ -57,10 +57,12 @@
             <div class="kv-row">
                 <div class="kv-label">Status</div>
                 <div class="kv-value">
-                    <span class="badge {% if tx.status == 1 %}badge-success{% else %}badge-error{% endif %}"{% if fail_reason %} title="{{ fail_reason | escape }}"{% endif %}>
+                    <span class="badge {% if tx.status == 1 %}badge-success{% else %}badge-error{% endif %}">
                         {% if tx.status == 1 %}Success{% else %}Failed{% endif %}
                     </span>
-                    {% if fail_reason %}<span class="text-faint text-xs" title="{{ fail_reason | escape }}">ⓘ hover for reason</span>{% endif %}
+                    {% if fail_reason %}
+                    <div class="mono text-xs text-dim break-all mt-1">{{ fail_reason }}</div>
+                    {% endif %}
                 </div>
             </div>
             <div class="kv-row">
@@ -179,13 +181,18 @@
 <!-- Calls / Execution Trace -->
 {% if calls %}
 <div class="card mb-6">
-    <div class="card-header">Execution Trace{% if calls[0].type %} ({{ calls | length }} internal calls){% endif %}</div>
+    <div class="card-header">Execution Trace{% if calls[0].type %} ({{ calls | length }} internal call{% if calls | length != 1 %}s{% endif %}{% if failed_calls > 0 %}, {{ failed_calls }} failed{% endif %}){% endif %}</div>
     {% for call in calls %}
     <div class="t-row" style="padding-left: {{ call.indent }}px">
         <div class="px-4 py-3">
             <div class="flex items-start gap-2 text-xs mb-1 flex-wrap">
                 {% if call.type %}
                 <span class="badge {% if call.type == 'CALL' %}badge-info{% else %}badge-warn{% endif %}">{{ call.type }}</span>
+                {% endif %}
+                {% if call.status == 'failed' %}
+                <span class="badge badge-error">failed</span>
+                {% elif call.status == 'success' %}
+                <span class="badge badge-success">ok</span>
                 {% endif %}
                 {% if call.depth %}
                 <span class="text-faint">depth {{ call.depth }}</span>
@@ -222,6 +229,9 @@
             {% endif %}
             {% if call.output and call.output != '0x' %}
             <div class="text-xs text-faint ml-4 mono">→ output: {{ call.output | truncate(length=80) }}</div>
+            {% endif %}
+            {% if call.error %}
+            <div class="text-xs text-red-400 ml-4 mono break-all">revert: {{ call.error }}</div>
             {% endif %}
         </div>
     </div>
