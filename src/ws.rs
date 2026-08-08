@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::rpc::ChainRpc;
 
@@ -48,6 +48,7 @@ pub async fn head_watcher(
     }
 
     let mut retry = Duration::from_millis(500);
+    let mut consecutive_failures = 0u32;
     loop {
         // Try the socket in the background while polling keeps the feed warm:
         let url = ws_url.clone();
@@ -67,6 +68,7 @@ pub async fn head_watcher(
         };
         match outcome {
             Ok(()) => {
+                consecutive_failures = 0;
                 warn!("websocket subscription ended; reconnecting");
                 // Keep polling during the brief reconnect pause.
                 let until = tokio::time::Instant::now() + Duration::from_millis(250);
@@ -78,7 +80,17 @@ pub async fn head_watcher(
                 }
             }
             Err(e) => {
-                warn!("websocket head feed failed ({e:#}); polling fallback for {retry:?}");
+                consecutive_failures += 1;
+                if consecutive_failures <= 3 {
+                    warn!(
+                        "websocket head feed failed ({e:#}); continuing with polling \
+                         (retry #{consecutive_failures}, then retries become silent)"
+                    );
+                } else {
+                    debug!(
+                        "websocket head feed still unreachable ({e:#}); next retry in {retry:?}"
+                    );
+                }
                 // Poll continuously during the backoff so head detection never
                 // stalls while the socket is unreachable.
                 let until = tokio::time::Instant::now() + retry;
@@ -88,7 +100,7 @@ pub async fn head_watcher(
                     }
                     tokio::time::sleep(poll).await;
                 }
-                retry = (retry * 2).min(Duration::from_secs(30));
+                retry = (retry * 2).min(Duration::from_secs(300));
             }
         }
     }

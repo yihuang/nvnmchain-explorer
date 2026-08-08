@@ -27,7 +27,9 @@ The indexer is built for a sub-second chain:
 - **Instant heads** — subscribes to `eth_subscribe("newHeads")` over WebSocket
   (`wss://ws.nvnm.canary.mantrachain.dev`); polling (`INDEX_POLL_SECONDS`)
   keeps the feed alive while the socket reconnects, so head detection never
-  stalls.
+  stalls. If the socket is unreachable (it currently does not answer from
+  most networks), the indexer warns a few times, then retries silently on a
+  long backoff while polling continues uninterrupted.
 - **One RPC call per block** — receipts via `eth_getBlockReceipts` (with a
   per-transaction batch fallback), traces via `debug_traceBlockByNumber`, and
   blocks fetched concurrently (`INDEX_CONCURRENCY` in flight).
