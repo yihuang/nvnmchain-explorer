@@ -7,12 +7,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use nvnmchain_explorer::config::{DEFAULT_CHAIN_ID, DEFAULT_RPC_URL, DEFAULT_WS_URL};
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::indexer::{fetch_block_bundle, index_block};
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::web::{self, AppState};
 use serde_json::{json, Value};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 fn temp_db() -> (tempfile::TempDir, Db) {
@@ -251,11 +253,13 @@ async fn web_api_serves_indexed_data() {
         stats_interval_seconds: 5.0,
     };
     let tera = web::build_tera(db.clone()).expect("tera");
+    let (block_tx, _) = broadcast::channel::<Value>(64);
     let state = AppState {
         db: db.clone(),
         rpc,
         cfg,
         tera,
+        block_events: block_tx,
     };
     let app = web::app(state);
 
@@ -342,4 +346,24 @@ async fn web_api_serves_indexed_data() {
         .await
         .expect("missing");
     assert_eq!(missing.status(), 404);
+
+    // The live feed sends the current tip immediately on connect.
+    let sse = client
+        .get(format!("{base}/api/events"))
+        .send()
+        .await
+        .expect("sse");
+    assert_eq!(sse.status(), 200);
+    let mut chunks = sse.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(5), chunks.next())
+        .await
+        .expect("sse first chunk within timeout")
+        .expect("sse stream open")
+        .expect("sse bytes");
+    let text = String::from_utf8_lossy(&first);
+    assert!(
+        text.contains("event: block"),
+        "SSE should send a block event: {text}"
+    );
+    assert!(text.contains("data:"), "SSE should carry JSON data: {text}");
 }

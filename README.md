@@ -27,6 +27,76 @@ cargo run --release
 Open http://localhost:8080. On first boot the indexer seeds from the chain
 head, tracks new blocks continuously, and backfills history downward.
 
+## Deploying to the cloud
+
+The explorer is a single long-running process (web server + indexer) with a
+SQLite database, so a good home is an always-on small VM or container with a
+persistent disk. Platforms whose free tier sleeps (e.g. Render Free) would
+pause the indexer and are unsuitable.
+
+All of the options below give you a platform subdomain with TLS — no domain
+registration needed. If you already own a domain you can point a subdomain at
+any of them instead.
+
+| Provider | Cost (approx.) | Subdomain | Notes |
+|----------|----------------|-----------|-------|
+| **Fly.io** (recommended) | ~$2/mo, free tier often covers it | `<app>.fly.dev` | Managed PaaS, 1 GB persistent volume, `fly.toml` included |
+| **Railway** | $5/mo base (includes $5 usage) | `<app>.up.railway.app` | Same Dockerfile, volumes supported |
+| **Render** | $7/mo Starter + ~$0.25/GB disk | `<app>.onrender.com` | `render.yaml` included; must be paid (always-on) |
+| **Hetzner Cloud** | ~€4–5/mo VPS | your own or IP only | Full VM, real disk, `deploy/install.sh` + systemd included |
+| **Oracle Cloud Always Free** | $0 | public IP only | 4-OCPU ARM VM; free forever but more setup + capacity limits |
+
+### Managed PaaS (Fly.io)
+
+```bash
+fly auth login
+fly launch --dockerfile Dockerfile --no-deploy   # creates the app
+fly volumes create nvnm_data --size 5            # persistent disk for SQLite
+fly deploy
+```
+
+The app listens on port 8080 and is served at `https://nvnmchain-explorer.fly.dev`
+(TLS automatic). Keep the machine always-on — `auto_stop_machines = false` is
+already set in `fly.toml` because the indexer runs inside the web process.
+Upgrades are a `git push` + `fly deploy`; SQLite data lives on the volume and
+survives redeploys.
+
+Railway: create a service from this repo (Dockerfile), add a volume mounted at
+`/data`, set `DB_PATH=/data/explorer.db`. Render: import `render.yaml`, pick
+Starter, deploy.
+
+### Persistence & schema migrations
+
+- **Data survives redeploys** — SQLite lives on a persistent volume mounted at
+  `/data` (`DB_PATH=/data/explorer.db`). Restarts and redeploys keep the
+  database; the container entrypoint (`deploy/entrypoint.sh`) fixes volume
+  ownership on boot so the app user can write to it regardless of how the
+  provider mounts empty volumes.
+- **Migrations run automatically** — on every boot `init_db` applies pending
+  schema migrations tracked by SQLite's `PRAGMA user_version`. Deploying a new
+  binary over an old database upgrades it in place (additive `ALTER TABLE`
+  steps, logged at startup); legacy databases also get a one-time rebuild of
+  the incremental token-balance table.
+- **Volume sizing** — a full backfill of this chain is ~1.2 GB of raw block
+  JSON before indexes and transactions. Use at least 2 GB; the examples use
+  5 GB (~$0.75/mo on Fly), which leaves comfortable headroom.
+
+### VPS (Hetzner, DigitalOcean, …)
+
+```bash
+sudo ./deploy/install.sh    # builds release binary + systemd service
+```
+
+Installs the binary to `/opt/nvnmchain-explorer`, creates a dedicated
+`nvnmchain` user, and registers a hardened systemd unit
+(`deploy/nvnmchain-explorer.service`) that restarts the process and keeps
+SQLite under `/var/lib/nvnmchain-explorer`. Overrides live in
+`/etc/nvnmchain-explorer.env` (see `deploy/nvnmchain-explorer.env.example`).
+
+For the truly free option, Oracle's Always Free ARM VM (4 OCPU / 24 GB) runs
+the same systemd setup — just remember the free public IP is the access point
+unless you attach a domain.
+
 The indexer is built for a sub-second chain:
 
 - **Instant heads** — subscribes to `eth_subscribe("newHeads")` over WebSocket
@@ -75,8 +145,15 @@ The indexer is built for a sub-second chain:
 | `/token/{addr}` | Token metadata + transfers |
 | `/tokens` | Token list |
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
+| `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 
 All data endpoints accept `?format=json` or `Accept: application/json`.
+
+The home page subscribes to `/api/events` with `EventSource` and updates the
+latest-blocks panel, the latest-block stat, and the block-time stat in real
+time as blocks land — no client polling. The feed is in-process: run a single
+instance (as the deploy configs do) so the indexer and the web server share
+the same broadcast channel.
 
 ## Indexer
 

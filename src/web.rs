@@ -2,18 +2,22 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::Json;
 use axum::Router;
 use chrono::{Local, TimeZone};
+use futures_util::stream::unfold;
 use num_bigint::BigInt;
 use serde_json::{json, Value};
 use tera::Tera;
+use tokio::sync::broadcast;
 
 use crate::config::Settings;
 use crate::contracts::{identify_address, is_contract};
@@ -30,6 +34,8 @@ pub struct AppState {
     pub rpc: ChainRpc,
     pub cfg: Settings,
     pub tera: Arc<Tera>,
+    /// Live stream of indexed blocks, fed by the indexer writer task.
+    pub block_events: broadcast::Sender<Value>,
 }
 
 fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
@@ -196,6 +202,65 @@ pub async fn home(
         }),
     );
     html_or_json(&state, &headers, &query, "home.html", &ctx)
+}
+
+/// Server-Sent Events endpoint: pushes each newly indexed block to browsers
+/// so the home page updates live without polling. Sends the current tip
+/// immediately on connect, then every block as the indexer writes it.
+pub async fn events(State(state): State<AppState>) -> Response {
+    let rx = state.block_events.subscribe();
+    let latest = db::get_latest_block(&state.db).map(block_event_json);
+    let stream = unfold((rx, latest, false), sse_step);
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
+}
+
+type SseState = (broadcast::Receiver<Value>, Option<Value>, bool);
+
+async fn sse_step(
+    (mut rx, latest, sent_initial): SseState,
+) -> Option<(Result<Event, std::convert::Infallible>, SseState)> {
+    if !sent_initial {
+        let payload = latest
+            .clone()
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "null".into());
+        return Some((
+            Ok(Event::default().event("block").data(payload)),
+            (rx, latest, true),
+        ));
+    }
+    loop {
+        match rx.recv().await {
+            Ok(block) => {
+                return Some((
+                    Ok(Event::default().event("block").data(block.to_string())),
+                    (rx, latest, true),
+                ));
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
+fn block_event_json(block: crate::models::Block) -> Value {
+    json!({
+        "type": "block",
+        "block": {
+            "number": block.number,
+            "hash": block.hash,
+            "timestamp": block.timestamp,
+            "tx_count": block.tx_count,
+            "gas_used": block.gas_used,
+            "gas_limit": block.gas_limit,
+        }
+    })
 }
 
 pub async fn block_page(
@@ -1017,6 +1082,7 @@ pub fn format_time_ago(ts: i64) -> String {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/", get(home))
+        .route("/api/events", get(events))
         .route("/block/{block_id}", get(block_page))
         .route("/blocks", get(blocks_page))
         .route("/tx/{tx_hash}", get(tx_page))

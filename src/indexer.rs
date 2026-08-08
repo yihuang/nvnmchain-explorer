@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rusqlite::params;
-use serde_json::Value;
-use tokio::sync::mpsc;
+use serde_json::{json, Value};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::config::Settings;
@@ -480,7 +480,13 @@ async fn backfill_loop(
 }
 
 /// Run the indexer: one serialized DB writer plus forward and backfill loops.
-pub async fn run_forever(rpc: ChainRpc, db: Db, cfg: IndexerConfig) {
+/// Newly written blocks are broadcast on `block_events` for live viewers.
+pub async fn run_forever(
+    rpc: ChainRpc,
+    db: Db,
+    cfg: IndexerConfig,
+    block_events: broadcast::Sender<Value>,
+) {
     let stats_interval = cfg.stats_interval;
     let stats_db = db.clone();
     tokio::spawn(async move { stats_loop(stats_db, stats_interval).await });
@@ -522,6 +528,9 @@ pub async fn run_forever(rpc: ChainRpc, db: Db, cfg: IndexerConfig) {
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
     let writer_db = db.clone();
     let writer = tokio::spawn(async move {
+        // Live feed = new tip blocks only; backfill writes are older numbers
+        // and would just duplicate/reorder the home page, so track the max.
+        let mut max_block = -1i64;
         while let Some(bundle) = bundle_rx.recv().await {
             if let Err(e) = db::save_block_bundle(
                 &writer_db,
@@ -531,6 +540,22 @@ pub async fn run_forever(rpc: ChainRpc, db: Db, cfg: IndexerConfig) {
                 &bundle.tokens,
             ) {
                 warn!("db write failed for block {}: {e:#}", bundle.block.number);
+                continue;
+            }
+            // Notify live viewers as soon as the block is durably written.
+            if bundle.block.number > max_block {
+                max_block = bundle.block.number;
+                let _ = block_events.send(json!({
+                    "type": "block",
+                    "block": {
+                        "number": bundle.block.number,
+                        "hash": bundle.block.hash,
+                        "timestamp": bundle.block.timestamp,
+                        "tx_count": bundle.block.tx_count,
+                        "gas_used": bundle.block.gas_used,
+                        "gas_limit": bundle.block.gas_limit,
+                    }
+                }));
             }
         }
     });

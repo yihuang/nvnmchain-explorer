@@ -246,7 +246,7 @@
                     <span class="pill hidden sm:inline-flex">
                         <span class="pulse-dot"></span>
                         {% if latest_block %}
-                        <a href="/block/{{ latest_block.number }}" class="mono text-blue-400 hover:text-blue-300 hover:no-underline" title="View latest block">
+                        <a id="nav-latest-block" href="/block/{{ latest_block.number }}" class="mono text-blue-400 hover:text-blue-300 hover:no-underline" title="View latest block">
                             #{{ latest_block.number }}
                         </a>
                         {% else %}syncing{% endif %}

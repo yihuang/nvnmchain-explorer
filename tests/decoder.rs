@@ -5,6 +5,7 @@ use nvnmchain_explorer::decoder::{
 use nvnmchain_explorer::models::Transaction;
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::format_token_amount;
+use rusqlite::Connection;
 use serde_json::json;
 
 fn transfer_calldata(to: &str, amount: u128) -> String {
@@ -212,4 +213,105 @@ fn balance_changes_from_receipt() {
 
     let calls = extract_calls(&tx, &[]);
     assert!(calls.is_empty());
+}
+
+#[test]
+fn init_db_migrates_legacy_schema_in_place() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("legacy.db");
+
+    // Simulate a database created by an older binary: v1 tables without the
+    // richer indexed columns and without the stats/balance tables.
+    let conn = Connection::open(&path).expect("open legacy db");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE blocks (
+            number INTEGER PRIMARY KEY,
+            hash TEXT NOT NULL UNIQUE,
+            parent_hash TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            gas_used INTEGER NOT NULL DEFAULT 0,
+            gas_limit INTEGER NOT NULL DEFAULT 0,
+            miner TEXT NOT NULL DEFAULT '',
+            tx_count INTEGER NOT NULL DEFAULT 0,
+            raw TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE transactions (
+            hash TEXT PRIMARY KEY,
+            block_number INTEGER NOT NULL,
+            block_hash TEXT NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            from_addr TEXT NOT NULL,
+            to_addr TEXT,
+            status INTEGER NOT NULL DEFAULT 1,
+            gas_limit INTEGER NOT NULL DEFAULT 0,
+            gas_used INTEGER NOT NULL DEFAULT 0,
+            gas_price TEXT NOT NULL DEFAULT '0',
+            max_fee_per_gas TEXT NOT NULL DEFAULT '0',
+            max_priority_fee_per_gas TEXT NOT NULL DEFAULT '0',
+            base_fee TEXT NOT NULL DEFAULT '0',
+            contract_address TEXT,
+            fee_token TEXT,
+            fee_amount TEXT NOT NULL DEFAULT '0',
+            nonce INTEGER NOT NULL DEFAULT 0,
+            nonce_key TEXT,
+            value TEXT NOT NULL DEFAULT '0',
+            chain_id INTEGER NOT NULL DEFAULT 787222,
+            tx_type INTEGER NOT NULL DEFAULT 118,
+            input TEXT NOT NULL DEFAULT '0x',
+            raw TEXT,
+            trace_data TEXT,
+            receipt_data TEXT,
+            timestamp INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .expect("create legacy schema");
+    drop(conn);
+
+    let upgraded = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
+
+    let version: i64 = upgraded
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version");
+    assert_eq!(
+        version, 3,
+        "migrations should run up to the current version"
+    );
+
+    for (table, column) in [
+        ("blocks", "base_fee"),
+        ("blocks", "size"),
+        ("blocks", "extra_data"),
+        ("blocks", "epoch"),
+        ("blocks", "view"),
+        ("blocks", "proposer"),
+        ("transactions", "method_id"),
+    ] {
+        let cols: Vec<String> = {
+            let mut stmt = upgraded
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("pragma");
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.filter_map(|c| c.ok()).collect()
+        };
+        assert!(
+            cols.iter().any(|c| c == column),
+            "column {table}.{column} should exist after migration"
+        );
+    }
+
+    // The new tables must exist too.
+    for table in ["kv", "token_balances"] {
+        let count: i64 = upgraded
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .expect("table lookup");
+        assert_eq!(count, 1, "table {table} should exist after migration");
+    }
 }

@@ -5,11 +5,11 @@
 <!-- Network stats -->
 <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-8">
     <div class="card card-body">
-        <div class="stat-value accent">{% if stats %}{{ stats.latest_block | fallback(value=latest_num) }}{% else %}{{ latest_num }}{% endif %}</div>
+        <div id="stat-latest-block" class="stat-value accent">{% if stats %}{{ stats.latest_block | fallback(value=latest_num) }}{% else %}{{ latest_num }}{% endif %}</div>
         <div class="stat-label">Latest Block</div>
     </div>
     <div class="card card-body">
-        <div class="stat-value">{% if stats %}{{ stats.avg_block_time_display }}{% else %}—{% endif %}</div>
+        <div id="stat-block-time" class="stat-value">{% if stats %}{{ stats.avg_block_time_display }}{% else %}—{% endif %}</div>
         <div class="stat-label">Block Time</div>
     </div>
     <div class="card card-body">
@@ -74,11 +74,11 @@
     <!-- Recent Blocks -->
     <div class="card">
         <div class="card-header flex items-center justify-between">
-            <span>Latest Blocks</span>
+            <span>Latest Blocks <span id="live-indicator" class="text-faint font-normal text-[11px]">· idle</span></span>
             <a href="/blocks" class="text-xs text-blue-400 font-normal hover:text-blue-300">View all →</a>
         </div>
         {% if recent_blocks %}
-        <div>
+        <div id="latest-blocks-body">
             {% for block in recent_blocks %}
             <div class="t-row flex items-center px-4 py-3 gap-3">
                 <div class="w-24 shrink-0">
@@ -104,7 +104,7 @@
             {% endfor %}
         </div>
         {% else %}
-        <div class="card-body text-center text-dim text-sm py-10">
+        <div id="blocks-empty" class="card-body text-center text-dim text-sm py-10">
             No blocks cached yet — the indexer is syncing.
         </div>
         {% endif %}
@@ -152,4 +152,100 @@
         {% endif %}
     </div>
 </div>
+
+<script>
+// Live block feed: the indexer broadcasts each newly written block over
+// /api/events (SSE), and we stream rows into the Latest Blocks panel without
+// polling.
+(function () {
+    var panel = document.getElementById('latest-blocks-body');
+    var empty = document.getElementById('blocks-empty');
+    var nav = document.getElementById('nav-latest-block');
+    var stat = document.getElementById('stat-latest-block');
+    var blockTime = document.getElementById('stat-block-time');
+    var live = document.getElementById('live-indicator');
+    var prevTs = null;
+    if (!window.EventSource || !panel) return;
+
+    function rowFor(b) {
+        var row = document.createElement('div');
+        row.className = 't-row flex items-center px-4 py-3 gap-3';
+
+        var num = document.createElement('div');
+        num.className = 'w-24 shrink-0';
+        var numA = document.createElement('a');
+        numA.href = '/block/' + b.number;
+        numA.className = 'mono text-sm text-blue-400 hover:text-blue-300';
+        numA.textContent = '#' + b.number;
+        num.appendChild(numA);
+
+        var mid = document.createElement('div');
+        mid.className = 'flex-1 min-w-0';
+        var hashA = document.createElement('a');
+        hashA.href = '/block/' + b.number;
+        hashA.className = 'mono text-xs text-dim hover:text-blue-300 block truncate';
+        hashA.textContent = b.hash;
+        mid.appendChild(hashA);
+
+        var badges = document.createElement('div');
+        badges.className = 'flex items-center gap-2 mt-1';
+        if (b.tx_count > 0) {
+            var badge = document.createElement('span');
+            badge.className = 'badge badge-info';
+            badge.textContent = b.tx_count + ' txns';
+            badges.appendChild(badge);
+        } else {
+            var badge = document.createElement('span');
+            badge.className = 'badge';
+            badge.style.background = 'rgba(255,255,255,0.04)';
+            badge.style.color = 'var(--faint)';
+            badge.textContent = 'empty';
+            badges.appendChild(badge);
+        }
+        if (b.gas_limit > 0) {
+            var bar = document.createElement('div');
+            bar.className = 'gas-bar flex-1 max-w-[120px]';
+            var fill = document.createElement('div');
+            fill.style.width = Math.min(100, Math.round(b.gas_used * 100 / b.gas_limit)) + '%';
+            bar.appendChild(fill);
+            badges.appendChild(bar);
+        }
+        mid.appendChild(badges);
+
+        var time = document.createElement('div');
+        time.className = 'text-xs text-dim shrink-0';
+        time.textContent = 'just now';
+
+        row.appendChild(num);
+        row.appendChild(mid);
+        row.appendChild(time);
+        return row;
+    }
+
+    var es = new EventSource('/api/events');
+    es.addEventListener('block', function (e) {
+        var ev;
+        try { ev = JSON.parse(e.data); } catch (_) { return; }
+        var b = ev && ev.block;
+        if (!b || typeof b.number !== 'number') return;
+
+        if (nav) nav.textContent = '#' + b.number;
+        if (stat) stat.textContent = b.number;
+        if (blockTime && prevTs !== null && b.timestamp > prevTs) {
+            var ms = (b.timestamp - prevTs) * 1000;
+            blockTime.textContent = ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + ' ms';
+        }
+        prevTs = b.timestamp;
+
+        // Skip insertion if the tip row is already rendered (initial event).
+        var firstA = panel.firstChild && panel.firstChild.querySelector('a');
+        if (firstA && firstA.textContent === '#' + b.number) return;
+        if (empty && empty.parentNode) empty.remove();
+        panel.insertBefore(rowFor(b), panel.firstChild);
+        while (panel.children.length > 30) panel.removeChild(panel.lastChild);
+    });
+    es.onopen = function () { if (live) live.textContent = '· live'; };
+    es.onerror = function () { if (live) live.textContent = '· reconnecting'; };
+})();
+</script>
 {% endblock %}

@@ -11,6 +11,9 @@ use crate::models::{Block, TokenMetadata, Transaction, TransferEvent};
 
 pub type Db = Arc<Mutex<Connection>>;
 
+/// Current schema version. Bump when adding a new migration below.
+const SCHEMA_VERSION: i64 = 3;
+
 /// Add a column to an existing table when the schema predates it.
 fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
     let cols: Vec<String> = {
@@ -21,6 +24,65 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str
     if !cols.iter().any(|c| c == column) {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl};"))?;
     }
+    Ok(())
+}
+
+/// Run pending schema migrations, tracked via SQLite's `PRAGMA user_version`.
+/// Runs automatically on every boot (from `init_db`), so deployments never
+/// need a manual migration step: an old database on the persistent volume is
+/// upgraded in place when the new binary starts.
+fn migrate(conn: &Connection) -> Result<()> {
+    let mut version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    if version < 1 {
+        // v1: original schema (blocks, transactions, token_metadata,
+        // contract_labels, transfer_events). Tables are created by the
+        // idempotent `CREATE TABLE IF NOT EXISTS` batch above.
+        conn.pragma_update(None, "user_version", 1)?;
+        version = 1;
+    }
+    if version < 2 {
+        // v2: indexed block fields, transaction method ids, the key/value
+        // stats table, and incremental token balances.
+        add_column_if_missing(
+            conn,
+            "blocks",
+            "base_fee",
+            "base_fee TEXT NOT NULL DEFAULT '0'",
+        )?;
+        add_column_if_missing(conn, "blocks", "size", "size INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(
+            conn,
+            "blocks",
+            "extra_data",
+            "extra_data TEXT NOT NULL DEFAULT ''",
+        )?;
+        add_column_if_missing(conn, "blocks", "epoch", "epoch INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(conn, "blocks", "view", "view INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(
+            conn,
+            "blocks",
+            "proposer",
+            "proposer TEXT NOT NULL DEFAULT ''",
+        )?;
+        add_column_if_missing(
+            conn,
+            "transactions",
+            "method_id",
+            "method_id TEXT NOT NULL DEFAULT ''",
+        )?;
+        conn.pragma_update(None, "user_version", 2)?;
+        version = 2;
+    }
+    if version < 3 {
+        // v3: reserved (schema-compatible change space).
+        conn.pragma_update(None, "user_version", 3)?;
+        version = 3;
+    }
+
+    tracing::info!("database schema at version {version}/{SCHEMA_VERSION}");
     Ok(())
 }
 
@@ -145,34 +207,9 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances(holder_addr);
         "#,
     )?;
-    // Schema migrations for databases created before these columns existed.
-    add_column_if_missing(
-        &conn,
-        "blocks",
-        "base_fee",
-        "base_fee TEXT NOT NULL DEFAULT '0'",
-    )?;
-    add_column_if_missing(&conn, "blocks", "size", "size INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(
-        &conn,
-        "blocks",
-        "extra_data",
-        "extra_data TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(&conn, "blocks", "epoch", "epoch INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(&conn, "blocks", "view", "view INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(
-        &conn,
-        "blocks",
-        "proposer",
-        "proposer TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        &conn,
-        "transactions",
-        "method_id",
-        "method_id TEXT NOT NULL DEFAULT ''",
-    )?;
+    // Versioned migrations run on every boot; an existing database on the
+    // persistent volume is upgraded in place before the server starts.
+    migrate(&conn)?;
     Ok(conn)
 }
 
