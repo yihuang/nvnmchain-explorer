@@ -356,6 +356,23 @@ impl ChainRpc {
         .ok()
         .filter(|v| !v.is_null())
     }
+
+    /// Re-execute a full call object against the state at a historical block.
+    /// Returns `Ok(result)` when the call succeeds, or `Err(message)` with the
+    /// node's error message — for a reverting call that message is the revert
+    /// reason, which is the only way this chain exposes one.
+    pub async fn eth_call_full(&self, call: Value, block: u64) -> Result<Value, String> {
+        match self
+            .call("eth_call", json!([call, format!("0x{block:x}")]))
+            .await
+        {
+            Ok(v) => Ok(v),
+            Err(e) => Err(e
+                .downcast_ref::<RpcError>()
+                .map(|r| r.message.clone())
+                .unwrap_or_else(|| e.to_string())),
+        }
+    }
 }
 
 /// Parse a `0x`-prefixed hex JSON value into a u64.

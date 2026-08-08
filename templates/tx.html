@@ -10,7 +10,7 @@
     </div>
     <div class="flex items-center gap-3 flex-wrap">
         <h1 class="text-2xl font-extrabold tracking-tight">Transaction</h1>
-        <span class="badge {% if tx.status == 1 %}badge-success{% else %}badge-error{% endif %}">
+        <span class="badge {% if tx.status == 1 %}badge-success{% else %}badge-error{% endif %}"{% if fail_reason %} title="{{ fail_reason | escape }}"{% endif %}>
             {% if tx.status == 1 %}Success{% else %}Failed{% endif %}
         </span>
         {% if method %}
@@ -55,11 +55,19 @@
                 </div>
             </div>
             <div class="kv-row">
-                <div class="kv-label">Value</div>
+                <div class="kv-label">Status</div>
                 <div class="kv-value">
-                    {% if tx.value and tx.value != '0' %}
-                    <span class="mono">{{ format_token_amount(amount=tx.value, decimals=18) }}</span>
-                    <span class="text-dim">{{ native_symbol }}</span>
+                    <span class="badge {% if tx.status == 1 %}badge-success{% else %}badge-error{% endif %}"{% if fail_reason %} title="{{ fail_reason | escape }}"{% endif %}>
+                        {% if tx.status == 1 %}Success{% else %}Failed{% endif %}
+                    </span>
+                    {% if fail_reason %}<span class="text-faint text-xs" title="{{ fail_reason | escape }}">ⓘ hover for reason</span>{% endif %}
+                </div>
+            </div>
+            <div class="kv-row">
+                <div class="kv-label">Fee Payer</div>
+                <div class="kv-value mono text-xs">
+                    {% if fee_payer %}
+                    <a href="{{ get_address_url(address=fee_payer) }}" class="text-blue-400 break-all">{{ fee_payer }}</a>
                     {% else %}—{% endif %}
                 </div>
             </div>
@@ -97,6 +105,14 @@
             <div class="kv-row">
                 <div class="kv-label">Max Fee / Priority</div>
                 <div class="kv-value mono">{{ max_fee }} / {{ max_priority }}</div>
+            </div>
+            <div class="kv-row">
+                <div class="kv-label">Nonce Key</div>
+                <div class="kv-value mono">{{ tx.nonce_key | fallback(value='—') }}</div>
+            </div>
+            <div class="kv-row">
+                <div class="kv-label">Signature Type</div>
+                <div class="kv-value"><span class="pill mono">{{ signature_type | fallback(value='—') }}</span></div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Type</div>
@@ -185,9 +201,6 @@
                 </span>
                 {% if call.gas and call.gas != '0' %}
                 <span class="text-faint ml-2">gas: {{ call.gas_used }}/{{ call.gas }}</span>
-                {% endif %}
-                {% if call.value and call.value != '0' %}
-                <span class="text-faint ml-2">value: {{ call.value }}</span>
                 {% endif %}
             </div>
             {% if call.decoded %}

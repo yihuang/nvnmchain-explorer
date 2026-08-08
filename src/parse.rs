@@ -56,8 +56,25 @@ pub fn parse_block(raw: &Value) -> Block {
     }
 }
 
+/// Destination for a transaction. Tempo-style chains put every transfer in a
+/// `calls` array instead of a top-level `to` (a true contract creation has
+/// neither).
+pub fn tx_to_addr(tx: &Value) -> Option<String> {
+    tx.get("to")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| {
+            tx.get("calls")
+                .and_then(Value::as_array)
+                .and_then(|c| c.first())
+                .and_then(|c| c.get("to"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+}
+
 pub fn parse_transaction(tx: &Value, block: &Block) -> Transaction {
-    let to_addr = tx.get("to").and_then(Value::as_str).map(String::from);
+    let to_addr = tx_to_addr(tx);
     let gas_price = tx
         .get("gasPrice")
         .cloned()
@@ -153,7 +170,7 @@ pub fn parse_transaction(tx: &Value, block: &Block) -> Transaction {
         tx_type: tx.get("type").map(parse_int_any).unwrap_or(0x76),
         method_id,
         input,
-        raw: None,
+        raw: serde_json::to_string(tx).ok(),
         trace_data: None,
         receipt_data: None,
         timestamp: block.timestamp,

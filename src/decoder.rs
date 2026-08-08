@@ -989,8 +989,9 @@ pub fn extract_calls(tx: &Transaction, trace: &[Value]) -> Vec<Value> {
                 .unwrap_or_else(|| "0".into());
             let data = call
                 .get("data")
-                .or_else(|| call.get("input"))
                 .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| call.get("input").and_then(Value::as_str))
                 .unwrap_or("0x")
                 .to_string();
             let decoded = decode_function_call(&data).map(|d| d.to_json());

@@ -190,6 +190,13 @@ fn apply_receipt(
         .get("status")
         .map(crate::rpc::parse_int_any)
         .unwrap_or(1);
+    // Some nodes fill receipt `to` with the first call's destination even when
+    // the tx itself has no top-level `to` (tempo-style `calls` transactions).
+    if tx.to_addr.is_none() {
+        if let Some(to) = receipt.get("to").and_then(Value::as_str) {
+            tx.to_addr = Some(to.to_string());
+        }
+    }
     tx.gas_used = receipt
         .get("gasUsed")
         .map(crate::rpc::parse_int_any)

@@ -112,6 +112,75 @@ fn tx_method_badge(input: &str) -> Option<String> {
     decode_function_call(input).map(|d| d.name.or(d.signature).unwrap_or(d.selector))
 }
 
+/// Extra descriptors for the tx detail page, derived from the stored receipt
+/// and the raw RPC object: (fee payer, signature type, failure reason).
+pub fn tx_extras(
+    tx: &crate::models::Transaction,
+    receipt: Option<&Value>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let fee_payer = receipt
+        .and_then(|r| r.get("feePayer").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let signature_type = tx
+        .raw
+        .as_deref()
+        .and_then(|r| serde_json::from_str::<Value>(r).ok())
+        .and_then(|v| {
+            v.get("signature")
+                .and_then(|s| s.get("type"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        });
+    let fail_reason = if tx.status == 0 {
+        receipt
+            .and_then(|r| {
+                r.get("error")
+                    .and_then(Value::as_str)
+                    .or_else(|| r.get("revertReason").and_then(Value::as_str))
+                    .or_else(|| r.get("outcome").and_then(Value::as_str))
+            })
+            .map(String::from)
+    } else {
+        None
+    };
+    (fee_payer, signature_type, fail_reason)
+}
+
+/// Recover a failure reason for a reverted transaction by re-executing its
+/// calls via `eth_call` at the transaction's block. The node records no
+/// reason in the receipt and tracing is unsupported, so this replay is the
+/// only source. Returns the first call whose replay reverts.
+pub async fn fetch_fail_reason(rpc: &ChainRpc, tx: &crate::models::Transaction) -> Option<String> {
+    let raw: Value = serde_json::from_str(tx.raw.as_deref()?).ok()?;
+    let calls = raw.get("calls").and_then(Value::as_array)?;
+    let from = tx.from_addr.clone();
+    let gas = format!("0x{:x}", tx.gas_limit.max(0));
+    for call in calls {
+        let to = call.get("to").and_then(Value::as_str).unwrap_or("");
+        if to.is_empty() {
+            continue;
+        }
+        let data = call
+            .get("data")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| call.get("input").and_then(Value::as_str))
+            .unwrap_or("0x")
+            .to_string();
+        let call_obj = json!({
+            "from": from,
+            "to": to,
+            "data": data,
+            "gas": gas,
+        });
+        if let Err(reason) = rpc.eth_call_full(call_obj, tx.block_number as u64).await {
+            return Some(reason);
+        }
+    }
+    None
+}
+
 /// Burnt fees for a block: base fee × gas used, as a wei decimal string.
 fn burnt_fees_wei(base_fee: &str, gas_used: i64) -> String {
     let base = BigInt::parse_bytes(base_fee.as_bytes(), 10).unwrap_or_else(|| BigInt::from(0));
@@ -361,7 +430,7 @@ pub async fn tx_page(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(tx) = db::get_transaction(&state.db, &tx_hash) else {
+    let Some(mut tx) = db::get_transaction(&state.db, &tx_hash) else {
         return not_found(&state, &headers, &query, "Transaction", &tx_hash);
     };
     let receipt: Option<Value> = tx
@@ -374,6 +443,44 @@ pub async fn tx_page(
         .and_then(|s| serde_json::from_str(s).ok());
     let block = db::get_block_by_number(&state.db, tx.block_number);
 
+    // Rows indexed before `raw` was stored: recover the original RPC object
+    // from the block blob, which embeds the full transactions array.
+    if tx.raw.is_none() {
+        if let Some(b) = &block {
+            if let Ok(v) = serde_json::from_str::<Value>(&b.raw) {
+                if let Some(raw_tx) =
+                    v.get("transactions")
+                        .and_then(Value::as_array)
+                        .and_then(|a| {
+                            a.iter().find(|t| {
+                                t.get("hash").and_then(Value::as_str) == Some(tx.hash.as_str())
+                            })
+                        })
+                {
+                    tx.raw = Some(raw_tx.to_string());
+                }
+            }
+        }
+    }
+    // Tempo-style txs carry their destination in `calls[0].to`; fall back to
+    // the receipt's `to` (nodes fill it with the first call's destination).
+    if tx.to_addr.is_none() {
+        if let Some(raw) = tx.raw.as_deref() {
+            if let Ok(v) = serde_json::from_str::<Value>(raw) {
+                tx.to_addr = crate::parse::tx_to_addr(&v);
+            }
+        }
+        if tx.to_addr.is_none() {
+            if let Some(to) = receipt
+                .as_ref()
+                .and_then(|r| r.get("to"))
+                .and_then(Value::as_str)
+            {
+                tx.to_addr = Some(to.to_string());
+            }
+        }
+    }
+
     let mut calls = extract_calls(&tx, trace.as_deref().unwrap_or(&[]));
     if calls.is_empty() {
         calls.push(json!({
@@ -381,7 +488,6 @@ pub async fn tx_page(
             "type": "CALL",
             "to": tx.to_addr.clone(),
             "from": tx.from_addr.clone(),
-            "value": tx.value.clone(),
             "data": tx.input.clone(),
             "decoded": decode_function_call(&tx.input).map(|d| d.to_json()).unwrap_or(Value::Null),
             "gas": "0",
@@ -404,31 +510,6 @@ pub async fn tx_page(
         .as_ref()
         .map(|r| extract_balance_changes(r, &tx))
         .unwrap_or_default();
-    // Native value transfer: show it alongside token balance changes.
-    if tx.value != "0" {
-        if let Some(to) = tx.to_addr.as_deref() {
-            let symbol = &state.cfg.native_symbol;
-            let out = format_token_amount(&tx.value, 18);
-            balance_changes.push(json!({
-                "address": tx.from_addr.clone(),
-                "token": "",
-                "change": format!("-{}", tx.value),
-                "is_fee": false,
-                "native": true,
-                "symbol": symbol,
-                "formatted": format!("-{out} {symbol}"),
-            }));
-            balance_changes.push(json!({
-                "address": to,
-                "token": "",
-                "change": format!("+{}", tx.value),
-                "is_fee": false,
-                "native": true,
-                "symbol": symbol,
-                "formatted": format!("+{out} {symbol}"),
-            }));
-        }
-    }
     // Attach symbol + formatted amount to token balance changes.
     {
         let mut token_addrs: Vec<String> = balance_changes
@@ -504,7 +585,21 @@ pub async fn tx_page(
         String::new()
     };
     let tx_type_hex = format!("{tx_type:02x}");
-    let method = tx_method_badge(&tx.input);
+    let mut method = tx_method_badge(&tx.input);
+    if method.is_none() {
+        // Tempo-style txs have no top-level input; badge from the first call.
+        method = calls
+            .first()
+            .and_then(|c| c.get("data").and_then(Value::as_str))
+            .and_then(tx_method_badge);
+    }
+
+    let (fee_payer, signature_type, mut fail_reason) = tx_extras(&tx, receipt.as_ref());
+    if tx.status == 0 && fail_reason.is_none() {
+        // The node doesn't record revert reasons; replay the calls to recover
+        // one (best-effort: falls back to the generic Failed badge).
+        fail_reason = fetch_fail_reason(&state.rpc, &tx).await;
+    }
 
     let ctx = page_ctx(
         &state,
@@ -516,6 +611,9 @@ pub async fn tx_page(
             "calls": calls,
             "events": events,
             "balance_changes": balance_changes,
+            "fee_payer": fee_payer,
+            "signature_type": signature_type,
+            "fail_reason": fail_reason,
             "gas_price": gas_price,
             "gas_used": gas_used,
             "gas_limit": gas_limit,
