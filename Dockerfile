@@ -19,11 +19,11 @@ RUN cargo build --release --locked
 # regardless of which Debian release the builder image is based on.
 FROM debian:stable-slim
 RUN useradd --system --no-create-home --uid 10001 app
+WORKDIR /app
 COPY --from=builder /build/target/release/nvnmchain-explorer /usr/local/bin/nvnmchain-explorer
 COPY templates ./templates
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
-WORKDIR /app
 
 ENV DB_PATH=/data/explorer.db \
     RUST_LOG=nvnmchain_explorer=info \
