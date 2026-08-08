@@ -23,6 +23,7 @@ pub fn block_event_json(block: &Block, txs: &[Transaction], tx_cap: usize) -> Js
             "number": block.number,
             "hash": block.hash,
             "timestamp": block.timestamp,
+            "timestamp_ms": block.timestamp_ms,
             "tx_count": block.tx_count,
             "gas_used": block.gas_used,
             "gas_limit": block.gas_limit,
@@ -48,6 +49,9 @@ pub struct Block {
     pub hash: String,
     pub parent_hash: String,
     pub timestamp: i64,
+    /// Millisecond-precision timestamp (the chain reports `timestampMillis`);
+    /// second-granularity `timestamp` can't resolve subsecond block times.
+    pub timestamp_ms: i64,
     pub gas_used: i64,
     pub gas_limit: i64,
     /// Base fee per gas in wei (decimal string, `0` when unavailable).
@@ -62,7 +66,6 @@ pub struct Block {
     pub proposer: String,
     pub miner: String,
     pub tx_count: i64,
-    pub raw: String,
     pub created_at: i64,
 }
 
@@ -70,28 +73,20 @@ pub struct Block {
 pub struct Transaction {
     pub hash: String,
     pub block_number: i64,
-    pub block_hash: String,
     pub position: i64,
     pub from_addr: String,
     pub to_addr: Option<String>,
     pub status: i64,
-    pub gas_limit: i64,
     pub gas_used: i64,
-    pub gas_price: String,
-    pub max_fee_per_gas: String,
-    pub max_priority_fee_per_gas: String,
     pub base_fee: String,
     pub contract_address: Option<String>,
     pub fee_token: Option<String>,
     pub fee_amount: String,
-    pub nonce: i64,
-    pub nonce_key: Option<String>,
-    pub value: String,
-    pub chain_id: i64,
-    pub tx_type: i64,
-    /// First four bytes of the call data (e.g. `0xa9059cbb`).
-    pub method_id: String,
+    /// Full calldata (`0x…`); kept so list pages can show method badges.
     pub input: String,
+    /// The node's raw transaction object (decoded JSON). Everything else the
+    /// tx page shows — gas/fee fields, nonce, calls, signature type — is
+    /// parsed from this at runtime instead of being stored redundantly.
     pub raw: Option<String>,
     pub trace_data: Option<String>,
     pub receipt_data: Option<String>,

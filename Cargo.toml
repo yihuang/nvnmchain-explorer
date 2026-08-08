@@ -23,6 +23,13 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Tempo tx types: RLP-decode the typed 0x76 transaction
+# (https://tempo.xyz/developers/docs/sdk/rust)
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", tag = "tempo-alloy@1.10.1" }
+alloy-eips = "2"
+alloy-primitives = "1"
+alloy-consensus = "2"
+
 [dev-dependencies]
 tempfile = "3"
 

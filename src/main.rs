@@ -38,7 +38,9 @@ async fn main() -> anyhow::Result<()> {
     let indexer_db = db.clone();
     let indexer_cfg = IndexerConfig::from_settings(&cfg);
     let ws_url = cfg.ws_url.clone();
-    let (block_tx, _) = broadcast::channel::<serde_json::Value>(256);
+    // Sized for ~an hour of sub-second blocks; combined with the writer's
+    // in-order emission and the SSE lag-replay, live viewers never see gaps.
+    let (block_tx, _) = broadcast::channel::<serde_json::Value>(8192);
     let indexer_block_tx = block_tx.clone();
     // Ctrl+C (or SIGTERM via the graceful-shutdown future) flips this watch;
     // every indexer loop checks it so the process stops promptly instead of

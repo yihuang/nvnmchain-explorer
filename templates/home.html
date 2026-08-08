@@ -2,6 +2,21 @@
 {% block title %}Explore - nvnmchain Explorer{% endblock %}
 {% block content %}
 
+<!-- Index progress -->
+{% if chain_head > 0 %}
+<div class="card mb-6">
+    <div class="card-body">
+        <div class="flex items-center justify-between gap-3 mb-2">
+            <span class="text-xs text-dim">Index progress — <span class="mono">{{ indexed_display }}</span> / <span class="mono">{{ head_display }}</span> blocks indexed</span>
+            <span class="mono text-xs text-blue-400">{{ index_pct_display }}%</span>
+        </div>
+        <div class="h-1.5 rounded-full" style="background: rgba(255,255,255,0.06); overflow: hidden;">
+            <div style="width: {{ index_pct_display }}%; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2));"></div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 <!-- Network stats -->
 <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-8">
     <div class="card card-body">
@@ -164,20 +179,23 @@
     var stat = document.getElementById('stat-latest-block');
     var blockTime = document.getElementById('stat-block-time');
     var live = document.getElementById('live-indicator');
-    var prevTs = null;
+    var prevMs = null;
     if (!window.EventSource || !panel) return;
 
-    // Transactions may not have been cached at render time; materialize the
-    // panel container so live blocks still stream into it.
+    // Transactions may not have been cached at render time; keep the
+    // "No transactions cached yet" placeholder until the first transaction
+    // actually streams in (materialize the panel container on demand).
     var txPanel = document.getElementById('latest-txs-body');
-    if (!txPanel) {
-        var txEmpty = document.getElementById('tx-empty');
-        if (txEmpty) {
-            txPanel = document.createElement('div');
-            txPanel.id = 'latest-txs-body';
-            txEmpty.parentNode.insertBefore(txPanel, txEmpty);
-            txEmpty.parentNode.removeChild(txEmpty);
-        }
+    var txEmpty = document.getElementById('tx-empty');
+    function ensureTxPanel() {
+        if (txPanel) return txPanel;
+        if (!txEmpty) return null;
+        txPanel = document.createElement('div');
+        txPanel.id = 'latest-txs-body';
+        txEmpty.parentNode.insertBefore(txPanel, txEmpty);
+        txEmpty.parentNode.removeChild(txEmpty);
+        txEmpty = null;
+        return txPanel;
     }
 
     function rowFor(b) {
@@ -325,14 +343,16 @@
     // data-tx-hash. Only a capped subset arrives per event, so older rows are
     // trimmed from the bottom like the blocks panel.
     function streamTxs(txs) {
-        if (!txs || !txs.length || !txPanel) return;
+        if (!txs || !txs.length) return;
+        var panel = ensureTxPanel();
+        if (!panel) return;
         for (var i = txs.length - 1; i >= 0; i--) {
             var t = txs[i];
             if (!t || !t.hash) continue;
-            if (txPanel.querySelector('[data-tx-hash="' + t.hash + '"]')) continue;
-            txPanel.insertBefore(txRowFor(t), txPanel.firstChild);
+            if (panel.querySelector('[data-tx-hash="' + t.hash + '"]')) continue;
+            panel.insertBefore(txRowFor(t), panel.firstChild);
         }
-        while (txPanel.children.length > 30) txPanel.removeChild(txPanel.lastChild);
+        while (panel.children.length > 30) panel.removeChild(panel.lastChild);
     }
 
     var es = new EventSource('/api/events');
@@ -344,11 +364,12 @@
 
         if (nav) nav.textContent = '#' + b.number;
         if (stat) stat.textContent = b.number;
-        if (blockTime && prevTs !== null && b.timestamp > prevTs) {
-            var ms = (b.timestamp - prevTs) * 1000;
+        if (blockTime && prevMs !== null && typeof b.timestamp_ms === 'number' && b.timestamp_ms > prevMs) {
+            var ms = b.timestamp_ms - prevMs;
             blockTime.textContent = ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + ' ms';
         }
-        prevTs = b.timestamp;
+        if (typeof b.timestamp_ms === 'number') prevMs = b.timestamp_ms;
+        else if (typeof b.timestamp === 'number') prevMs = b.timestamp * 1000;
 
         // Stream this block's transactions into the Latest Transactions panel
         // (before the block dedup below, which returns early on the initial

@@ -11,6 +11,97 @@ use sha3::{Digest, Keccak256};
 use crate::models::Transaction;
 
 // ---------------------------------------------------------------------------
+// Raw RLP transaction parsing (tempo primitives / alloy fork)
+// ---------------------------------------------------------------------------
+
+/// Fields parsed from the canonical RLP encoding of a transaction at runtime
+/// (nothing redundant is stored per column). `None`/empty when the raw bytes
+/// are missing or undecodable, so callers degrade gracefully.
+#[derive(Debug, Default)]
+pub struct ParsedTx {
+    pub gas_limit: Option<i64>,
+    pub max_fee_per_gas: Option<i64>,
+    pub max_priority_fee_per_gas: Option<i64>,
+    pub nonce: Option<i64>,
+    pub nonce_key: Option<String>,
+    pub chain_id: Option<i64>,
+    pub tx_type: Option<i64>,
+    pub sig_type: Option<String>,
+    /// The tx's top-level calls in the Execution Trace shape (without `from`
+    /// /`decoded`, which the caller fills in).
+    pub calls: Vec<Value>,
+}
+
+/// Decode a raw RLP transaction (`0x…` hex) with the official tempo
+/// primitives (the alloy fork that knows the typed 0x76 transaction).
+pub fn parse_raw_tx(raw: &str) -> ParsedTx {
+    use crate::tempo::TempoTxEnvelope;
+    use alloy_eips::Decodable2718;
+    use alloy_primitives::TxKind;
+
+    let Ok(bytes) = hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) else {
+        return ParsedTx::default();
+    };
+    let Ok(envelope) = TempoTxEnvelope::decode_2718(&mut &bytes[..]) else {
+        return ParsedTx::default();
+    };
+
+    let mut out = ParsedTx::default();
+    let tx: &dyn alloy_consensus::Transaction = match &envelope {
+        TempoTxEnvelope::AA(signed) => {
+            let t = signed.tx();
+            out.tx_type = Some(0x76);
+            out.nonce_key = Some(t.nonce_key.to_string());
+            out.sig_type = Some(format!("{:?}", signed.signature().signature_type()));
+            out.calls = t
+                .calls
+                .iter()
+                .map(|c| {
+                    let to = match &c.to {
+                        TxKind::Call(a) => a.to_string(),
+                        TxKind::Create => String::new(),
+                    };
+                    json!({
+                        "depth": 0,
+                        "type": "CALL",
+                        "to": to,
+                        "value": c.value.to_string(),
+                        "data": format!("0x{}", hex::encode(c.input.as_ref())),
+                        "decoded": Value::Null,
+                        "gas": "0",
+                        "gas_used": "0",
+                        "children": [],
+                    })
+                })
+                .collect();
+            t
+        }
+        TempoTxEnvelope::Legacy(s) => {
+            out.tx_type = Some(0);
+            s.tx()
+        }
+        TempoTxEnvelope::Eip2930(s) => {
+            out.tx_type = Some(1);
+            s.tx()
+        }
+        TempoTxEnvelope::Eip1559(s) => {
+            out.tx_type = Some(2);
+            s.tx()
+        }
+        TempoTxEnvelope::Eip7702(s) => {
+            out.tx_type = Some(4);
+            s.tx()
+        }
+    };
+    out.gas_limit = Some(tx.gas_limit() as i64);
+    out.max_fee_per_gas = Some(tx.max_fee_per_gas() as i64);
+    out.max_priority_fee_per_gas = tx.max_priority_fee_per_gas().map(|v| v as i64);
+    out.nonce = Some(tx.nonce() as i64);
+    out.chain_id = tx.chain_id().map(|c| c as i64);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Keccak / checksum helpers
 // ---------------------------------------------------------------------------
 
@@ -975,51 +1066,22 @@ pub fn extract_calls(tx: &Transaction, trace: &[Value]) -> Vec<Value> {
         return out;
     }
 
-    let raw: Value = tx
+    // Tempo-style txs carry their calls in the raw RLP object; parse it with
+    // the official tempo primitives.
+    let mut calls = tx
         .raw
         .as_deref()
-        .and_then(|r| serde_json::from_str(r).ok())
-        .unwrap_or_else(|| json!({}));
-    let calls = raw
-        .get("calls")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(parse_raw_tx)
+        .unwrap_or_default()
+        .calls;
+    for call in calls.iter_mut() {
+        call["from"] = json!(tx.from_addr);
+        let data = call.get("data").and_then(Value::as_str).unwrap_or("0x");
+        call["decoded"] = decode_function_call(data)
+            .map(|d| d.to_json())
+            .unwrap_or(Value::Null);
+    }
     calls
-        .into_iter()
-        .map(|call| {
-            let to = call
-                .get("to")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let value = call
-                .get("value")
-                .and_then(Value::as_str)
-                .map(|s| parse_decimal_or_hex(s).to_string())
-                .unwrap_or_else(|| "0".into());
-            let data = call
-                .get("data")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .or_else(|| call.get("input").and_then(Value::as_str))
-                .unwrap_or("0x")
-                .to_string();
-            let decoded = decode_function_call(&data).map(|d| d.to_json());
-            json!({
-                "depth": 0,
-                "type": "CALL",
-                "to": to,
-                "from": tx.from_addr,
-                "value": value,
-                "data": data,
-                "decoded": decoded.unwrap_or(Value::Null),
-                "gas": "0",
-                "gas_used": "0",
-                "children": [],
-            })
-        })
-        .collect()
 }
 
 pub fn parse_decimal_or_hex(s: &str) -> i128 {

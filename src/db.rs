@@ -11,79 +11,22 @@ use crate::models::{Block, TokenMetadata, Transaction, TransferEvent};
 
 pub type Db = Arc<Mutex<Connection>>;
 
-/// Current schema version. Bump when adding a new migration below.
-const SCHEMA_VERSION: i64 = 3;
-
-/// Add a column to an existing table when the schema predates it.
-fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
-    let cols: Vec<String> = {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-        rows.filter_map(|c| c.ok()).collect()
-    };
-    if !cols.iter().any(|c| c == column) {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl};"))?;
+/// Decode a `0x`-prefixed hex string into raw bytes for BLOB storage (hashes
+/// and addresses are stored binary — half the TEXT size, and the hash/address
+/// indexes get the same reduction). Falls back to the raw string bytes for
+/// non-hex values (these columns always hold hashes/addresses, so this is
+/// purely defensive).
+fn hex_blob(s: &str) -> Vec<u8> {
+    let hexed = s.strip_prefix("0x").unwrap_or(s);
+    match hex::decode(hexed) {
+        Ok(b) => b,
+        Err(_) => s.as_bytes().to_vec(),
     }
-    Ok(())
 }
 
-/// Run pending schema migrations, tracked via SQLite's `PRAGMA user_version`.
-/// Runs automatically on every boot (from `init_db`), so deployments never
-/// need a manual migration step: an old database on the persistent volume is
-/// upgraded in place when the new binary starts.
-fn migrate(conn: &Connection) -> Result<()> {
-    let mut version: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .unwrap_or(0);
-
-    if version < 1 {
-        // v1: original schema (blocks, transactions, token_metadata,
-        // contract_labels, transfer_events). Tables are created by the
-        // idempotent `CREATE TABLE IF NOT EXISTS` batch above.
-        conn.pragma_update(None, "user_version", 1)?;
-        version = 1;
-    }
-    if version < 2 {
-        // v2: indexed block fields, transaction method ids, the key/value
-        // stats table, and incremental token balances.
-        add_column_if_missing(
-            conn,
-            "blocks",
-            "base_fee",
-            "base_fee TEXT NOT NULL DEFAULT '0'",
-        )?;
-        add_column_if_missing(conn, "blocks", "size", "size INTEGER NOT NULL DEFAULT 0")?;
-        add_column_if_missing(
-            conn,
-            "blocks",
-            "extra_data",
-            "extra_data TEXT NOT NULL DEFAULT ''",
-        )?;
-        add_column_if_missing(conn, "blocks", "epoch", "epoch INTEGER NOT NULL DEFAULT 0")?;
-        add_column_if_missing(conn, "blocks", "view", "view INTEGER NOT NULL DEFAULT 0")?;
-        add_column_if_missing(
-            conn,
-            "blocks",
-            "proposer",
-            "proposer TEXT NOT NULL DEFAULT ''",
-        )?;
-        add_column_if_missing(
-            conn,
-            "transactions",
-            "method_id",
-            "method_id TEXT NOT NULL DEFAULT ''",
-        )?;
-        conn.pragma_update(None, "user_version", 2)?;
-        version = 2;
-    }
-    if version < 3 {
-        // v3: reserved (schema-compatible change space).
-        conn.pragma_update(None, "user_version", 3)?;
-        version = 3;
-    }
-
-    tracing::info!("database schema at version {version}/{SCHEMA_VERSION}");
-    Ok(())
+/// Encode stored blob bytes back into a `0x`-prefixed hex string.
+fn blob_hex(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
 }
 
 pub fn now_ts() -> i64 {
@@ -102,56 +45,50 @@ pub fn init_db(path: &str) -> Result<Connection> {
         r#"
         CREATE TABLE IF NOT EXISTS blocks (
             number INTEGER PRIMARY KEY,
-            hash TEXT NOT NULL UNIQUE,
-            parent_hash TEXT NOT NULL,
+            hash BLOB NOT NULL UNIQUE,
+            parent_hash BLOB NOT NULL,
             timestamp INTEGER NOT NULL,
+            timestamp_ms INTEGER NOT NULL DEFAULT 0,
             gas_used INTEGER NOT NULL DEFAULT 0,
             gas_limit INTEGER NOT NULL DEFAULT 0,
-            miner TEXT NOT NULL DEFAULT '',
+            miner BLOB NOT NULL DEFAULT X'',
             tx_count INTEGER NOT NULL DEFAULT 0,
-            raw TEXT NOT NULL DEFAULT '{}',
+            base_fee TEXT NOT NULL DEFAULT '0',
+            size INTEGER NOT NULL DEFAULT 0,
+            extra_data TEXT NOT NULL DEFAULT '',
+            epoch INTEGER NOT NULL DEFAULT 0,
+            view INTEGER NOT NULL DEFAULT 0,
+            proposer BLOB NOT NULL DEFAULT X'',
             created_at INTEGER NOT NULL DEFAULT 0
         );
-        CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
         CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks(timestamp);
 
         CREATE TABLE IF NOT EXISTS transactions (
-            hash TEXT PRIMARY KEY,
+            hash BLOB PRIMARY KEY,
             block_number INTEGER NOT NULL,
-            block_hash TEXT NOT NULL,
             position INTEGER NOT NULL DEFAULT 0,
-            from_addr TEXT NOT NULL,
-            to_addr TEXT,
+            from_addr BLOB NOT NULL,
+            to_addr BLOB,
             status INTEGER NOT NULL DEFAULT 1,
-            gas_limit INTEGER NOT NULL DEFAULT 0,
             gas_used INTEGER NOT NULL DEFAULT 0,
-            gas_price TEXT NOT NULL DEFAULT '0',
-            max_fee_per_gas TEXT NOT NULL DEFAULT '0',
-            max_priority_fee_per_gas TEXT NOT NULL DEFAULT '0',
             base_fee TEXT NOT NULL DEFAULT '0',
-            contract_address TEXT,
-            fee_token TEXT,
+            contract_address BLOB,
+            fee_token BLOB,
             fee_amount TEXT NOT NULL DEFAULT '0',
-            nonce INTEGER NOT NULL DEFAULT 0,
-            nonce_key TEXT,
-            value TEXT NOT NULL DEFAULT '0',
-            chain_id INTEGER NOT NULL DEFAULT 787222,
-            tx_type INTEGER NOT NULL DEFAULT 118,
             input TEXT NOT NULL DEFAULT '0x',
-            raw TEXT,
+            raw BLOB,
             trace_data TEXT,
             receipt_data TEXT,
             timestamp INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_tx_block_number ON transactions(block_number);
-        CREATE INDEX IF NOT EXISTS idx_tx_block_hash ON transactions(block_hash);
         CREATE INDEX IF NOT EXISTS idx_tx_from ON transactions(from_addr);
         CREATE INDEX IF NOT EXISTS idx_tx_to ON transactions(to_addr);
         CREATE INDEX IF NOT EXISTS idx_tx_timestamp ON transactions(timestamp);
 
         CREATE TABLE IF NOT EXISTS token_metadata (
-            address TEXT PRIMARY KEY,
+            address BLOB PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
             symbol TEXT NOT NULL DEFAULT '',
             decimals INTEGER NOT NULL DEFAULT 18,
@@ -165,7 +102,7 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_token_name ON token_metadata(name);
 
         CREATE TABLE IF NOT EXISTS contract_labels (
-            address TEXT PRIMARY KEY,
+            address BLOB PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
             abi TEXT NOT NULL DEFAULT '[]',
             is_token INTEGER NOT NULL DEFAULT 0,
@@ -175,12 +112,12 @@ pub fn init_db(path: &str) -> Result<Connection> {
 
         CREATE TABLE IF NOT EXISTS transfer_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tx_hash TEXT NOT NULL,
+            tx_hash BLOB NOT NULL,
             block_number INTEGER NOT NULL,
             log_index INTEGER NOT NULL DEFAULT 0,
-            token_addr TEXT NOT NULL,
-            from_addr TEXT NOT NULL,
-            to_addr TEXT NOT NULL,
+            token_addr BLOB NOT NULL,
+            from_addr BLOB NOT NULL,
+            to_addr BLOB NOT NULL,
             amount TEXT NOT NULL,
             timestamp INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0
@@ -198,8 +135,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
         );
 
         CREATE TABLE IF NOT EXISTS token_balances (
-            token_addr TEXT NOT NULL,
-            holder_addr TEXT NOT NULL,
+            token_addr BLOB NOT NULL,
+            holder_addr BLOB NOT NULL,
             balance TEXT NOT NULL DEFAULT '0',
             updated_at INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (token_addr, holder_addr)
@@ -207,9 +144,6 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances(holder_addr);
         "#,
     )?;
-    // Versioned migrations run on every boot; an existing database on the
-    // persistent volume is upgraded in place before the server starts.
-    migrate(&conn)?;
     Ok(conn)
 }
 
@@ -245,28 +179,30 @@ pub fn get_kv(db: &Db, key: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 const BLOCK_COLS: &str =
-    "number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee, size, extra_data, \
-     epoch, view, proposer, miner, tx_count, raw, created_at";
+    "number, hash, parent_hash, timestamp, timestamp_ms, gas_used, gas_limit, base_fee, size, \
+     extra_data, epoch, view, proposer, miner, tx_count, created_at";
 
 fn upsert_block(conn: &Connection, block: &Block) -> Result<()> {
     conn.execute(
         r#"
-        INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit,
+        INSERT INTO blocks (number, hash, parent_hash, timestamp, timestamp_ms, gas_used, gas_limit,
                             base_fee, size, extra_data, epoch, view, proposer,
-                            miner, tx_count, raw, created_at)
+                            miner, tx_count, created_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(number) DO UPDATE SET
             hash=excluded.hash, parent_hash=excluded.parent_hash, timestamp=excluded.timestamp,
+            timestamp_ms=excluded.timestamp_ms,
             gas_used=excluded.gas_used, gas_limit=excluded.gas_limit, base_fee=excluded.base_fee,
             size=excluded.size, extra_data=excluded.extra_data, epoch=excluded.epoch,
             view=excluded.view, proposer=excluded.proposer, miner=excluded.miner,
-            tx_count=excluded.tx_count, raw=excluded.raw
+            tx_count=excluded.tx_count
         "#,
         params![
             block.number,
-            block.hash,
-            block.parent_hash,
+            hex_blob(&block.hash),
+            hex_blob(&block.parent_hash),
             block.timestamp,
+            block.timestamp_ms,
             block.gas_used,
             block.gas_limit,
             block.base_fee,
@@ -274,10 +210,9 @@ fn upsert_block(conn: &Connection, block: &Block) -> Result<()> {
             block.extra_data,
             block.epoch,
             block.view,
-            block.proposer,
-            block.miner,
+            hex_blob(&block.proposer),
+            hex_blob(&block.miner),
             block.tx_count,
-            block.raw,
             block.created_at,
         ],
     )?;
@@ -328,20 +263,20 @@ pub fn save_block_bundle(
 fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
     Ok(Block {
         number: row.get(0)?,
-        hash: row.get(1)?,
-        parent_hash: row.get(2)?,
+        hash: blob_hex(&row.get::<_, Vec<u8>>(1)?),
+        parent_hash: blob_hex(&row.get::<_, Vec<u8>>(2)?),
         timestamp: row.get(3)?,
-        gas_used: row.get(4)?,
-        gas_limit: row.get(5)?,
-        base_fee: row.get(6)?,
-        size: row.get(7)?,
-        extra_data: row.get(8)?,
-        epoch: row.get(9)?,
-        view: row.get(10)?,
-        proposer: row.get(11)?,
-        miner: row.get(12)?,
-        tx_count: row.get(13)?,
-        raw: row.get(14)?,
+        timestamp_ms: row.get(4)?,
+        gas_used: row.get(5)?,
+        gas_limit: row.get(6)?,
+        base_fee: row.get(7)?,
+        size: row.get(8)?,
+        extra_data: row.get(9)?,
+        epoch: row.get(10)?,
+        view: row.get(11)?,
+        proposer: blob_hex(&row.get::<_, Vec<u8>>(12)?),
+        miner: blob_hex(&row.get::<_, Vec<u8>>(13)?),
+        tx_count: row.get(14)?,
         created_at: row.get(15)?,
     })
 }
@@ -362,7 +297,7 @@ pub fn get_block_by_hash(db: &Db, hash: &str) -> Option<Block> {
     let conn = lock(db);
     conn.query_row(
         &format!("SELECT {BLOCK_COLS} FROM blocks WHERE hash=?1"),
-        params![hash],
+        params![hex_blob(hash)],
         row_to_block,
     )
     .optional()
@@ -380,6 +315,26 @@ pub fn get_latest_block(db: &Db) -> Option<Block> {
     .optional()
     .ok()
     .flatten()
+}
+
+/// Number of indexed block rows (the history-completion metric).
+pub fn get_block_count(db: &Db) -> i64 {
+    let conn = lock(db);
+    conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+}
+
+/// Record the chain head observed by the indexer (for index-progress display).
+pub fn set_chain_head(db: &Db, head: i64) {
+    let conn = lock(db);
+    let _ = set_kv(&conn, "chain_head", &head.to_string());
+}
+
+/// The last chain head observed by the indexer; `0` when unknown.
+pub fn get_chain_head(db: &Db) -> i64 {
+    get_kv(db, "chain_head")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Lowest stored block height; `None` when the table is empty.
@@ -411,47 +366,34 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
     conn.execute(
         r#"
         INSERT INTO transactions (
-            hash, block_number, block_hash, position, from_addr, to_addr, status,
-            gas_limit, gas_used, gas_price, max_fee_per_gas, max_priority_fee_per_gas,
-            base_fee, contract_address, fee_token, fee_amount, nonce, nonce_key,
-            value, chain_id, tx_type, method_id, input, raw, trace_data, receipt_data, timestamp, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+            hash, block_number, position, from_addr, to_addr, status,
+            gas_used, base_fee, contract_address, fee_token, fee_amount,
+            input, raw, trace_data, receipt_data, timestamp, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         ON CONFLICT(hash) DO UPDATE SET
-            block_number=excluded.block_number, block_hash=excluded.block_hash, position=excluded.position,
+            block_number=excluded.block_number, position=excluded.position,
             from_addr=excluded.from_addr, to_addr=excluded.to_addr, status=excluded.status,
-            gas_limit=excluded.gas_limit, gas_used=excluded.gas_used, gas_price=excluded.gas_price,
-            max_fee_per_gas=excluded.max_fee_per_gas, max_priority_fee_per_gas=excluded.max_priority_fee_per_gas,
-            base_fee=excluded.base_fee, contract_address=excluded.contract_address, fee_token=excluded.fee_token,
-            fee_amount=excluded.fee_amount, nonce=excluded.nonce, nonce_key=excluded.nonce_key,
-            value=excluded.value, chain_id=excluded.chain_id, tx_type=excluded.tx_type, method_id=excluded.method_id,
-            input=excluded.input, raw=excluded.raw, trace_data=excluded.trace_data,
+            gas_used=excluded.gas_used, base_fee=excluded.base_fee,
+            contract_address=excluded.contract_address, fee_token=excluded.fee_token,
+            fee_amount=excluded.fee_amount,
+            input=excluded.input, raw=excluded.raw,
+            trace_data=excluded.trace_data,
             receipt_data=excluded.receipt_data, timestamp=excluded.timestamp
         "#,
         params![
-            tx.hash,
+            hex_blob(&tx.hash),
             tx.block_number,
-            tx.block_hash,
             tx.position,
-            tx.from_addr,
-            tx.to_addr,
+            hex_blob(&tx.from_addr),
+            tx.to_addr.as_deref().map(hex_blob),
             tx.status,
-            tx.gas_limit,
             tx.gas_used,
-            tx.gas_price,
-            tx.max_fee_per_gas,
-            tx.max_priority_fee_per_gas,
             tx.base_fee,
-            tx.contract_address,
-            tx.fee_token,
+            tx.contract_address.as_deref().map(hex_blob),
+            tx.fee_token.as_deref().map(hex_blob),
             tx.fee_amount,
-            tx.nonce,
-            tx.nonce_key,
-            tx.value,
-            tx.chain_id,
-            tx.tx_type,
-            tx.method_id,
             tx.input,
-            tx.raw,
+            tx.raw.as_deref().map(hex_blob),
             tx.trace_data,
             tx.receipt_data,
             tx.timestamp,
@@ -466,38 +408,29 @@ pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
     upsert_transaction(&conn, tx)
 }
 
-const TX_COLS: &str = "hash, block_number, block_hash, position, from_addr, to_addr, status, gas_limit, gas_used, gas_price, max_fee_per_gas, max_priority_fee_per_gas, base_fee, contract_address, fee_token, fee_amount, nonce, nonce_key, value, chain_id, tx_type, method_id, input, raw, trace_data, receipt_data, timestamp, created_at";
+const TX_COLS: &str = "hash, block_number, position, from_addr, to_addr, status, gas_used, base_fee, contract_address, fee_token, fee_amount, input, raw, trace_data, receipt_data, timestamp, created_at";
 
 fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
     Ok(Transaction {
-        hash: row.get(0)?,
+        hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),
         block_number: row.get(1)?,
-        block_hash: row.get(2)?,
-        position: row.get(3)?,
-        from_addr: row.get(4)?,
-        to_addr: row.get(5)?,
-        status: row.get(6)?,
-        gas_limit: row.get(7)?,
-        gas_used: row.get(8)?,
-        gas_price: row.get(9)?,
-        max_fee_per_gas: row.get(10)?,
-        max_priority_fee_per_gas: row.get(11)?,
-        base_fee: row.get(12)?,
-        contract_address: row.get(13)?,
-        fee_token: row.get(14)?,
-        fee_amount: row.get(15)?,
-        nonce: row.get(16)?,
-        nonce_key: row.get(17)?,
-        value: row.get(18)?,
-        chain_id: row.get(19)?,
-        tx_type: row.get(20)?,
-        method_id: row.get(21)?,
-        input: row.get(22)?,
-        raw: row.get(23)?,
-        trace_data: row.get(24)?,
-        receipt_data: row.get(25)?,
-        timestamp: row.get(26)?,
-        created_at: row.get(27)?,
+        position: row.get(2)?,
+        from_addr: blob_hex(&row.get::<_, Vec<u8>>(3)?),
+        to_addr: row.get::<_, Option<Vec<u8>>>(4)?.map(|b| blob_hex(&b)),
+        status: row.get(5)?,
+        gas_used: row.get(6)?,
+        base_fee: row.get(7)?,
+        contract_address: row.get::<_, Option<Vec<u8>>>(8)?.map(|b| blob_hex(&b)),
+        fee_token: row.get::<_, Option<Vec<u8>>>(9)?.map(|b| blob_hex(&b)),
+        fee_amount: row.get(10)?,
+        input: row.get(11)?,
+        raw: row
+            .get::<_, Option<Vec<u8>>>(12)?
+            .map(|b| format!("0x{}", hex::encode(b))),
+        trace_data: row.get(13)?,
+        receipt_data: row.get(14)?,
+        timestamp: row.get(15)?,
+        created_at: row.get(16)?,
     })
 }
 
@@ -505,7 +438,7 @@ pub fn get_transaction(db: &Db, hash: &str) -> Option<Transaction> {
     let conn = lock(db);
     conn.query_row(
         &format!("SELECT {TX_COLS} FROM transactions WHERE hash=?1"),
-        params![hash],
+        params![hex_blob(hash)],
         row_to_tx,
     )
     .optional()
@@ -552,7 +485,10 @@ pub fn get_address_transactions(
     )) else {
         return Vec::new();
     };
-    let Ok(rows) = stmt.query_map(params![address, per_page as i64, offset], row_to_tx) else {
+    let Ok(rows) = stmt.query_map(
+        params![hex_blob(address), per_page as i64, offset],
+        row_to_tx,
+    ) else {
         return Vec::new();
     };
     rows.filter_map(|r| r.ok()).collect()
@@ -562,7 +498,7 @@ pub fn get_address_transaction_count(db: &Db, address: &str) -> i64 {
     let conn = lock(db);
     conn.query_row(
         "SELECT COUNT(*) FROM transactions WHERE from_addr=?1 OR to_addr=?1",
-        params![address],
+        params![hex_blob(address)],
         |r| r.get::<_, i64>(0),
     )
     .unwrap_or(0)
@@ -582,7 +518,15 @@ fn upsert_token_meta(conn: &Connection, meta: &crate::tokens::TokenMeta) -> Resu
             name=excluded.name, symbol=excluded.symbol, decimals=excluded.decimals,
             currency=excluded.currency, total_supply=excluded.total_supply, updated_at=excluded.updated_at
         "#,
-        params![meta.address, meta.name, meta.symbol, meta.decimals, meta.currency, meta.total_supply, ts],
+        params![
+            hex_blob(&meta.address),
+            meta.name,
+            meta.symbol,
+            meta.decimals,
+            meta.currency,
+            meta.total_supply,
+            ts,
+        ],
     )?;
     Ok(())
 }
@@ -594,7 +538,7 @@ pub fn save_token_metadata(db: &Db, meta: &crate::tokens::TokenMeta) -> Result<(
 
 fn row_to_token(row: &rusqlite::Row) -> rusqlite::Result<TokenMetadata> {
     Ok(TokenMetadata {
-        address: row.get(0)?,
+        address: blob_hex(&row.get::<_, Vec<u8>>(0)?),
         name: row.get(1)?,
         symbol: row.get(2)?,
         decimals: row.get(3)?,
@@ -611,7 +555,7 @@ pub fn get_token_metadata(db: &Db, address: &str) -> Option<TokenMetadata> {
     let conn = lock(db);
     conn.query_row(
         "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at FROM token_metadata WHERE address=?1",
-        params![address],
+        params![hex_blob(address)],
         row_to_token,
     )
     .optional()
@@ -644,8 +588,8 @@ pub fn get_token_count(db: &Db) -> i64 {
 pub fn get_token_transfer_count(db: &Db, token_addr: &str) -> i64 {
     let conn = lock(db);
     conn.query_row(
-        "SELECT COUNT(*) FROM transfer_events WHERE lower(token_addr)=lower(?1)",
-        params![token_addr],
+        "SELECT COUNT(*) FROM transfer_events WHERE token_addr=?1",
+        params![hex_blob(token_addr)],
         |r| r.get::<_, i64>(0),
     )
     .unwrap_or(0)
@@ -675,12 +619,12 @@ fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<()> {
         "INSERT INTO transfer_events (tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            transfer.tx_hash,
+            hex_blob(&transfer.tx_hash),
             transfer.block_number,
             transfer.log_index,
-            transfer.token_addr,
-            transfer.from_addr,
-            transfer.to_addr,
+            hex_blob(&transfer.token_addr),
+            hex_blob(&transfer.from_addr),
+            hex_blob(&transfer.to_addr),
             transfer.amount,
             transfer.timestamp,
             transfer.created_at,

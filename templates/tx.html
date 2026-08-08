@@ -110,7 +110,7 @@
             </div>
             <div class="kv-row">
                 <div class="kv-label">Nonce Key</div>
-                <div class="kv-value mono">{{ tx.nonce_key | fallback(value='—') }}</div>
+                <div class="kv-value mono">{{ nonce_key | fallback(value='—') }}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Signature Type</div>
@@ -118,11 +118,11 @@
             </div>
             <div class="kv-row">
                 <div class="kv-label">Type</div>
-                <div class="kv-value"><span class="pill mono">0x{{ tx_type_hex }}</span> <span class="pill">{{ tx.nonce }}</span> <span class="text-faint text-xs">nonce</span></div>
+                <div class="kv-value"><span class="pill mono">0x{{ tx_type_hex }}</span> <span class="pill">{{ nonce }}</span> <span class="text-faint text-xs">nonce</span></div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Method Id</div>
-                <div class="kv-value mono">{{ tx.method_id | fallback(value='—') }}</div>
+                <div class="kv-value mono">{{ method_id | fallback(value='—') }}</div>
             </div>
         </div>
     </div>
@@ -288,7 +288,7 @@
 
 {% if active_tab == 'raw' %}
 <div class="card mb-6">
-    <div class="card-header">Raw Transaction</div>
+    <div class="card-header">Raw Transaction (RLP)</div>
     <div class="card-body">
         <pre class="text-xs mono pre-wrap">{{ tx.raw }}</pre>
     </div>

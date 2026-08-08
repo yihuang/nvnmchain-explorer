@@ -125,13 +125,9 @@ pub fn tx_extras(
     let signature_type = tx
         .raw
         .as_deref()
-        .and_then(|r| serde_json::from_str::<Value>(r).ok())
-        .and_then(|v| {
-            v.get("signature")
-                .and_then(|s| s.get("type"))
-                .and_then(Value::as_str)
-                .map(String::from)
-        });
+        .map(crate::decoder::parse_raw_tx)
+        .unwrap_or_default()
+        .sig_type;
     let fail_reason = if tx.status == 0 {
         receipt
             .and_then(|r| {
@@ -151,20 +147,22 @@ pub fn tx_extras(
 /// its block, as one batched request. Returns the node's error message per
 /// call (`None` = succeeded). This is the only per-call outcome source on
 /// chains whose receipts record no reason and whose tracing is unsupported.
-/// Entries are in `raw.calls` order, skipping calls without a destination.
+/// Entries are in `calls` order, skipping calls without a destination.
 pub async fn replay_tx_calls(
     rpc: &ChainRpc,
     tx: &crate::models::Transaction,
 ) -> Vec<Option<String>> {
-    let raw: Value = match serde_json::from_str(tx.raw.as_deref().unwrap_or("{}")) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let Some(calls) = raw.get("calls").and_then(Value::as_array) else {
+    let parsed = tx
+        .raw
+        .as_deref()
+        .map(crate::decoder::parse_raw_tx)
+        .unwrap_or_default();
+    let calls = parsed.calls;
+    if calls.is_empty() {
         return Vec::new();
-    };
+    }
     let from = tx.from_addr.clone();
-    let gas = format!("0x{:x}", tx.gas_limit.max(0));
+    let gas = format!("0x{:x}", parsed.gas_limit.unwrap_or(0).max(0));
     let block = format!("0x{:x}", tx.block_number.max(0));
     let batch: Vec<(String, Value)> = calls
         .iter()
@@ -275,6 +273,15 @@ pub async fn home(
             })
             .collect::<Vec<_>>(),
     );
+
+    // Index progress: how much of the observed chain head is stored.
+    let indexed_count = db::get_block_count(&state.db);
+    let chain_head = db::get_chain_head(&state.db);
+    let index_pct = if chain_head > 0 {
+        ((indexed_count as f64 / chain_head as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
     let ctx = page_ctx(
         &state,
         json!({
@@ -282,6 +289,12 @@ pub async fn home(
             "recent_blocks": recent_blocks,
             "recent_txs": recent_txs,
             "latest_num": latest_num,
+            "indexed_count": indexed_count,
+            "chain_head": chain_head,
+            "index_pct": index_pct,
+            "indexed_display": comma_num(indexed_count),
+            "head_display": comma_num(chain_head),
+            "index_pct_display": format!("{:.1}", index_pct),
             "spark_tx": spark_tx,
             "spark_gas": spark_gas,
             "query": "",
@@ -292,14 +305,21 @@ pub async fn home(
 
 /// Server-Sent Events endpoint: pushes each newly indexed block to browsers
 /// so the home page updates live without polling. Sends the current tip
-/// immediately on connect, then every block as the indexer writes it.
+/// immediately on connect, then every block as the indexer writes it (the
+/// writer emits in number order, so the stream is gapless; if this subscriber
+/// ever falls behind the broadcast, missed blocks are replayed from the DB).
 pub async fn events(State(state): State<AppState>) -> Response {
     let rx = state.block_events.subscribe();
-    let latest = db::get_latest_block(&state.db).map(|b| {
-        let txs = db::get_block_transactions(&state.db, b.number);
-        crate::models::block_event_json(&b, &txs, crate::models::STREAM_TX_CAP)
-    });
-    let stream = unfold((rx, latest, false), sse_step);
+    let stream = unfold(
+        SseState {
+            rx,
+            db: state.db.clone(),
+            pending: std::collections::VecDeque::new(),
+            last_num: -1,
+            sent_initial: false,
+        },
+        sse_step,
+    );
     Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
@@ -309,30 +329,76 @@ pub async fn events(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-type SseState = (broadcast::Receiver<Value>, Option<Value>, bool);
+struct SseState {
+    rx: broadcast::Receiver<Value>,
+    db: Db,
+    /// Catch-up events (blocks replayed after a broadcast lag).
+    pending: std::collections::VecDeque<Value>,
+    /// Highest block number already delivered to this client.
+    last_num: i64,
+    sent_initial: bool,
+}
+
+/// Upper bound on how many missed blocks a lagging client is replayed.
+const SSE_MAX_REPLAY: usize = 4096;
+
+fn sse_event(payload: &Value) -> Result<Event, std::convert::Infallible> {
+    Ok(Event::default().event("block").data(payload.to_string()))
+}
 
 async fn sse_step(
-    (mut rx, latest, sent_initial): SseState,
+    mut state: SseState,
 ) -> Option<(Result<Event, std::convert::Infallible>, SseState)> {
-    if !sent_initial {
-        let payload = latest
-            .clone()
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "null".into());
-        return Some((
-            Ok(Event::default().event("block").data(payload)),
-            (rx, latest, true),
-        ));
+    // Initial event: the current tip (with its transactions), so the panels
+    // are populated immediately on connect.
+    if !state.sent_initial {
+        state.sent_initial = true;
+        if let Some(b) = db::get_latest_block(&state.db) {
+            state.last_num = b.number;
+            let txs = db::get_block_transactions(&state.db, b.number);
+            let payload = crate::models::block_event_json(&b, &txs, crate::models::STREAM_TX_CAP);
+            return Some((sse_event(&payload), state));
+        }
+        return Some((Ok(Event::default().event("block").data("null")), state));
+    }
+    // Drain replayed catch-up events before reading new ones.
+    if let Some(v) = state.pending.pop_front() {
+        return Some((sse_event(&v), state));
     }
     loop {
-        match rx.recv().await {
+        match state.rx.recv().await {
             Ok(block) => {
-                return Some((
-                    Ok(Event::default().event("block").data(block.to_string())),
-                    (rx, latest, true),
-                ));
+                if let Some(n) = block.pointer("/block/number").and_then(Value::as_i64) {
+                    state.last_num = n;
+                }
+                return Some((sse_event(&block), state));
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                // This client fell behind (browser throttled / connection
+                // stalled). The writer emits in number order, so the missed
+                // blocks are exactly `last_num + 1 ..= tip`; replay them from
+                // the DB instead of skipping them.
+                let tip = db::get_latest_block(&state.db)
+                    .map(|b| b.number)
+                    .unwrap_or(state.last_num);
+                let start = state.last_num + 1;
+                let end = tip.min(start + (n.min(SSE_MAX_REPLAY as u64) as i64) - 1);
+                for num in start..=end.max(start - 1) {
+                    if let Some(b) = db::get_block_by_number(&state.db, num) {
+                        let txs = db::get_block_transactions(&state.db, num);
+                        state.pending.push_back(crate::models::block_event_json(
+                            &b,
+                            &txs,
+                            crate::models::STREAM_TX_CAP,
+                        ));
+                    }
+                }
+                state.last_num = state.last_num.max(end);
+                if let Some(v) = state.pending.pop_front() {
+                    return Some((sse_event(&v), state));
+                }
+                // Nothing replayed (blocks not indexed yet); keep reading.
+            }
             Err(broadcast::error::RecvError::Closed) => return None,
         }
     }
@@ -460,41 +526,15 @@ pub async fn tx_page(
         .and_then(|s| serde_json::from_str(s).ok());
     let block = db::get_block_by_number(&state.db, tx.block_number);
 
-    // Rows indexed before `raw` was stored: recover the original RPC object
-    // from the block blob, which embeds the full transactions array.
-    if tx.raw.is_none() {
-        if let Some(b) = &block {
-            if let Ok(v) = serde_json::from_str::<Value>(&b.raw) {
-                if let Some(raw_tx) =
-                    v.get("transactions")
-                        .and_then(Value::as_array)
-                        .and_then(|a| {
-                            a.iter().find(|t| {
-                                t.get("hash").and_then(Value::as_str) == Some(tx.hash.as_str())
-                            })
-                        })
-                {
-                    tx.raw = Some(raw_tx.to_string());
-                }
-            }
-        }
-    }
     // Tempo-style txs carry their destination in `calls[0].to`; fall back to
     // the receipt's `to` (nodes fill it with the first call's destination).
     if tx.to_addr.is_none() {
-        if let Some(raw) = tx.raw.as_deref() {
-            if let Ok(v) = serde_json::from_str::<Value>(raw) {
-                tx.to_addr = crate::parse::tx_to_addr(&v);
-            }
-        }
-        if tx.to_addr.is_none() {
-            if let Some(to) = receipt
-                .as_ref()
-                .and_then(|r| r.get("to"))
-                .and_then(Value::as_str)
-            {
-                tx.to_addr = Some(to.to_string());
-            }
+        if let Some(to) = receipt
+            .as_ref()
+            .and_then(|r| r.get("to"))
+            .and_then(Value::as_str)
+        {
+            tx.to_addr = Some(to.to_string());
         }
     }
 
@@ -583,13 +623,34 @@ pub async fn tx_page(
         call["indent"] = json!(depth * 20);
     }
 
-    let gas_price = parse_hex_i64(&tx.gas_price);
+    // Gas/fee/identity fields are parsed from the canonical RLP encoding at
+    // runtime rather than stored per column.
+    let parsed = tx
+        .raw
+        .as_deref()
+        .map(crate::decoder::parse_raw_tx)
+        .unwrap_or_default();
+    let gas_price = receipt
+        .as_ref()
+        .and_then(|r| r.get("effectiveGasPrice").and_then(Value::as_str))
+        .map(parse_hex_i64)
+        .unwrap_or(0);
     let gas_used = tx.gas_used;
-    let gas_limit = tx.gas_limit;
-    let max_fee = parse_hex_i64(&tx.max_fee_per_gas);
-    let max_priority = parse_hex_i64(&tx.max_priority_fee_per_gas);
+    let gas_limit = parsed.gas_limit.unwrap_or(0);
+    let max_fee = parsed.max_fee_per_gas.unwrap_or(0);
+    let max_priority = parsed.max_priority_fee_per_gas.unwrap_or(0);
     let base_fee = parse_hex_i64(&tx.base_fee);
-    let tx_type = tx.tx_type;
+    let tx_type = parsed.tx_type.unwrap_or(0x76);
+    let nonce = parsed.nonce.unwrap_or(0);
+    let nonce_key = parsed.nonce_key;
+    let method_id = parsed
+        .calls
+        .first()
+        .and_then(|c| c.get("data").and_then(Value::as_str))
+        .and_then(|d| d.strip_prefix("0x"))
+        .filter(|h| h.len() >= 8)
+        .map(|h| format!("0x{}", &h[..8]))
+        .unwrap_or_else(|| "0x".into());
     let fee_token = tx.fee_token.clone();
     let fee_amount = tx.fee_amount.clone();
     let fee_token_meta = fee_token
@@ -713,6 +774,9 @@ pub async fn tx_page(
             "base_fee": base_fee,
             "tx_type": tx_type,
             "tx_type_hex": tx_type_hex,
+            "nonce": nonce,
+            "nonce_key": nonce_key,
+            "method_id": method_id,
             "gas_pct": gas_pct,
             "fee_token": fee_token,
             "fee_amount": fee_amount,
@@ -779,7 +843,6 @@ pub async fn address_page(
                         "tx_timestamp": t.timestamp,
                         "tx_status": t.status,
                         "tx_block": t.block_number,
-                        "tx_value": t.value,
                         "tx_method": tx_method_badge(&t.input),
                     })
                 })
@@ -1089,6 +1152,19 @@ fn format_block_time(ms: f64) -> String {
     } else {
         format!("{ms:.0} ms")
     }
+}
+
+/// `1234567` → `1,234,567` for display.
+fn comma_num(n: i64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Attach token symbol/decimals + formatted amounts to transfer rows.

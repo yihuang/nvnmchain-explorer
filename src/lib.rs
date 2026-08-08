@@ -8,6 +8,7 @@ pub mod indexer;
 pub mod models;
 pub mod parse;
 pub mod rpc;
+pub mod tempo;
 pub mod tokens;
 pub mod web;
 pub mod ws;

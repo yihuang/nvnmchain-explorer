@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rusqlite::params;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
@@ -67,10 +67,35 @@ pub async fn fetch_block_bundle_with_cache(
     known_tokens: Arc<Mutex<HashSet<String>>>,
     block_num: u64,
 ) -> Result<Option<BlockBundle>> {
-    let Some(raw_block) = rpc.eth_get_block_by_number(block_num, true).await? else {
+    // Exactly three RPC calls for the whole block, sent as one batched
+    // request: block with tx bodies, receipts, trace. Each can fail
+    // independently (tracing is unsupported on some chains).
+    let num_hex = format!("0x{block_num:x}");
+    let results = rpc
+        .batch_call(vec![
+            (
+                "eth_getBlockByNumber".to_string(),
+                json!([num_hex.clone(), true]),
+            ),
+            ("eth_getBlockReceipts".to_string(), json!([num_hex.clone()])),
+            (
+                "debug_traceBlockByNumber".to_string(),
+                json!([num_hex, {"tracer": "callTracer"}]),
+            ),
+        ])
+        .await?;
+    let mut iter = results.into_iter();
+    let Some(Ok(raw_block)) = iter.next() else {
         warn!("block {block_num} not found");
         return Ok(None);
     };
+    if raw_block.is_null() {
+        warn!("block {block_num} not found");
+        return Ok(None);
+    }
+    let receipts = iter.next().and_then(|r| r.ok());
+    let trace_result = iter.next().and_then(|r| r.ok());
+
     let block = parse_block(&raw_block);
     let raw_txs = raw_block
         .get("transactions")
@@ -78,10 +103,10 @@ pub async fn fetch_block_bundle_with_cache(
         .cloned()
         .unwrap_or_default();
 
-    // Traces: one call for the whole block, skipped for empty blocks.
+    // Traces (unsupported on this chain — degrades to no trace data).
     let mut trace_map: HashMap<String, Vec<Value>> = HashMap::new();
     if !raw_txs.is_empty() {
-        if let Some(traces) = rpc.debug_trace_block(block_num).await {
+        if let Some(traces) = trace_result {
             if let Some(entries) = traces.as_array() {
                 for entry in entries {
                     let tx_hash = entry
@@ -99,23 +124,18 @@ pub async fn fetch_block_bundle_with_cache(
         }
     }
 
-    // Receipts: one `eth_getBlockReceipts` call (or one batched request).
-    let tx_hashes: Vec<String> = raw_txs
-        .iter()
-        .filter_map(|t| t.get("hash").and_then(Value::as_str).map(String::from))
-        .collect();
-    let receipt_by_hash: HashMap<String, Value> =
-        match rpc.fetch_block_receipts(block_num, &tx_hashes).await? {
-            Some(receipts) => receipts
-                .iter()
-                .filter_map(|r| {
-                    r.get("transactionHash")
-                        .and_then(Value::as_str)
-                        .map(|h| (h.to_string(), r.clone()))
-                })
-                .collect(),
-            None => HashMap::new(),
-        };
+    // Receipts by block, keyed by tx hash.
+    let receipt_by_hash: HashMap<String, Value> = match receipts {
+        Some(Value::Array(receipts)) => receipts
+            .iter()
+            .filter_map(|r| {
+                r.get("transactionHash")
+                    .and_then(Value::as_str)
+                    .map(|h| (h.to_string(), r.clone()))
+            })
+            .collect(),
+        _ => HashMap::new(),
+    };
 
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
@@ -128,6 +148,15 @@ pub async fn fetch_block_bundle_with_cache(
         }
         let mut tx = parse_transaction(tx_data, &block);
         tx.timestamp = block.timestamp;
+        // Canonical RLP: re-encode the RPC object with the official tempo
+        // primitives (the block response already carries the full signed tx,
+        // so no extra per-tx RPC is needed). Byte-identical to the node's
+        // `eth_getRawTransactionByHash` for the 0x76 type.
+        if let Ok(signed) = serde_json::from_value::<crate::tempo::AASigned>(tx_data.clone()) {
+            let mut buf = Vec::new();
+            signed.eip2718_encode(&mut buf);
+            tx.raw = Some(format!("0x{}", hex::encode(buf)));
+        }
         if let Some(flat) = trace_map.get(tx_hash) {
             tx.trace_data = Some(serde_json::to_string(flat).unwrap_or_else(|_| "[]".into()));
         }
@@ -314,22 +343,6 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
     Ok(())
 }
 
-/// Fetch a block and hand the bundle to the writer task.
-async fn index_block_send(
-    rpc: &ChainRpc,
-    tx: &mpsc::Sender<BlockBundle>,
-    known_tokens: Arc<Mutex<HashSet<String>>>,
-    block_num: u64,
-) -> Result<()> {
-    let Some(bundle) = fetch_block_bundle_with_cache(rpc, known_tokens, block_num).await? else {
-        return Ok(());
-    };
-    tx.send(bundle)
-        .await
-        .map_err(|_| anyhow::anyhow!("indexer writer task stopped"))?;
-    Ok(())
-}
-
 /// Sleep for `dur` unless shutdown was requested, in which case return
 /// immediately with `true`. Lets background loops stop promptly on Ctrl+C.
 async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, dur: Duration) -> bool {
@@ -339,38 +352,48 @@ async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, dur: Duration) 
     }
 }
 
-/// Index every block in `from..=to`, fetching up to `concurrency` in parallel.
-/// Blocks are spawned tip-first (`to` down to `from`) so the newest block is
-/// written as soon as possible.
+/// Index every block in `from..=to`, fetching up to `concurrency` in
+/// parallel, and return the bundles in number order (the caller decides how
+/// to persist/broadcast them — this lets the forward loop emit a gapless live
+/// feed regardless of fetch completion order or writer timing).
 async fn index_range_concurrent(
     rpc: &ChainRpc,
-    tx: &mpsc::Sender<BlockBundle>,
     from: u64,
     to: u64,
     concurrency: usize,
     known_tokens: Arc<Mutex<HashSet<String>>>,
     shutdown: &watch::Receiver<bool>,
-) {
+) -> Vec<BlockBundle> {
     if from > to {
-        return;
+        return Vec::new();
     }
     let mut set = tokio::task::JoinSet::new();
     let mut next = to;
     let mut remaining = to - from + 1;
+    // Cap the reservation: ranges can be huge after downtime (forward loop
+    // catch-up), and each bundle is a sizable struct.
+    let mut out = Vec::with_capacity((to - from + 1).min(16384) as usize);
     loop {
         // Abort in-flight fetches as soon as shutdown is requested.
         if *shutdown.borrow() {
             set.abort_all();
-            return;
+            break;
         }
         while remaining > 0 && set.len() < concurrency {
             let rpc = rpc.clone();
-            let tx = tx.clone();
             let known = known_tokens.clone();
             let num = next;
             set.spawn(async move {
-                if let Err(e) = index_block_send(&rpc, &tx, known, num).await {
-                    warn!("index_block({num}) failed: {e:#}");
+                match fetch_block_bundle_with_cache(&rpc, known, num).await {
+                    Ok(Some(bundle)) => Some(bundle),
+                    Ok(None) => {
+                        warn!("block {num} not found");
+                        None
+                    }
+                    Err(e) => {
+                        warn!("index_block({num}) failed: {e:#}");
+                        None
+                    }
                 }
             });
             next = next.wrapping_sub(1);
@@ -379,10 +402,12 @@ async fn index_range_concurrent(
         if set.is_empty() {
             break;
         }
-        if let Some(Err(e)) = set.join_next().await {
-            warn!("index task panicked: {e:#}");
+        if let Some(Ok(Some(bundle))) = set.join_next().await {
+            out.push(bundle);
         }
     }
+    out.sort_by_key(|b| b.block.number);
+    out
 }
 
 async fn forward_loop(
@@ -392,6 +417,7 @@ async fn forward_loop(
     bundle_tx: mpsc::Sender<BlockBundle>,
     known_tokens: Arc<Mutex<HashSet<String>>>,
     shutdown: watch::Receiver<bool>,
+    block_events: broadcast::Sender<Value>,
 ) {
     let (head_tx, mut head_rx) = mpsc::channel::<u64>(256);
     let watcher_rpc = rpc.clone();
@@ -420,27 +446,33 @@ async fn forward_loop(
         if *shutdown.borrow() {
             break;
         }
+        // Track the chain tip for the home page's index-progress display.
+        db::set_chain_head(&db, head as i64);
         if sent == 0 && head > 0 {
             // Fresh DB: the backfill loop seeds history (including the head).
-            // Wait a moment for its first write so the loops don't both fetch
-            // the same blocks.
+            // Wait for its first write so the loops don't both fetch the
+            // same blocks — and never try to index the whole history here.
             let mut waited = Duration::ZERO;
-            while db::get_latest_block(&db).is_none() && waited < Duration::from_secs(2) {
+            while db::get_latest_block(&db).is_none() && waited < Duration::from_secs(5) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 waited += Duration::from_millis(100);
             }
             sent = db::get_latest_block(&db)
                 .map(|b| b.number as u64)
                 .unwrap_or(0);
+            if sent == 0 {
+                // Backfill hasn't seeded anything yet; wait for the next head
+                // instead of attempting a full-history range.
+                continue;
+            }
             if sent >= head {
                 continue;
             }
         }
         if head > sent {
             info!("new blocks: {sent} -> {head} (+{})", head - sent);
-            index_range_concurrent(
+            let bundles = index_range_concurrent(
                 &rpc,
-                &bundle_tx,
                 sent + 1,
                 head,
                 cfg.concurrency,
@@ -448,6 +480,24 @@ async fn forward_loop(
                 &shutdown,
             )
             .await;
+            // Live feed, emitted strictly in number order from the fetched
+            // bundles: concurrent fetches complete out of order, and the
+            // writer persists asynchronously, so neither can be broadcast
+            // directly. Backfill history never reaches this loop, so the
+            // stream stays tip-only and gapless.
+            for b in &bundles {
+                let _ = block_events.send(crate::models::block_event_json(
+                    &b.block,
+                    &b.txs,
+                    crate::models::STREAM_TX_CAP,
+                ));
+            }
+            for b in bundles {
+                if bundle_tx.send(b).await.is_err() {
+                    warn!("writer stopped; forward loop exiting");
+                    return;
+                }
+            }
             sent = head;
         }
     }
@@ -498,9 +548,8 @@ async fn backfill_loop(
             }
         };
         let start = target.saturating_sub(cfg.batch).max(1);
-        index_range_concurrent(
+        let bundles = index_range_concurrent(
             &rpc,
-            &bundle_tx,
             start,
             target - 1,
             cfg.concurrency,
@@ -508,6 +557,26 @@ async fn backfill_loop(
             &shutdown,
         )
         .await;
+        // Send tip-first so the head lands in the DB as soon as possible
+        // (the forward loop waits for it on a fresh database).
+        for b in bundles.into_iter().rev() {
+            if bundle_tx.send(b).await.is_err() {
+                warn!("writer stopped; backfill loop exiting");
+                return;
+            }
+        }
+        // The writer persists asynchronously; wait until this batch is on
+        // disk so the progress check below isn't reading stale state.
+        // (`min == 0` means the table is still empty — keep waiting.)
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let min = db::get_min_block_number(&db).unwrap_or(0) as u64;
+            let persisted = min != 0 && min <= start;
+            if persisted || *shutdown.borrow() || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let new_min = db::get_min_block_number(&db).unwrap_or(0) as u64;
         if new_min >= target {
@@ -575,10 +644,11 @@ pub async fn run_forever(
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
     let writer_db = db.clone();
     let writer_shutdown = shutdown.clone();
+    // The writer only persists. Live streaming happens in the forward loop,
+    // which re-reads each freshly indexed range from the DB in number order
+    // (concurrent fetches complete out of order, so the writer cannot emit
+    // gaplessly, and backfill history must not reach the live feed at all).
     let writer = tokio::spawn(async move {
-        // Live feed = new tip blocks only; backfill writes are older numbers
-        // and would just duplicate/reorder the home page, so track the max.
-        let mut max_block = -1i64;
         while let Some(bundle) = bundle_rx.recv().await {
             // On shutdown, stop draining the queue: in-flight bundles are
             // dropped and re-fetched on the next start.
@@ -595,15 +665,6 @@ pub async fn run_forever(
                 warn!("db write failed for block {}: {e:#}", bundle.block.number);
                 continue;
             }
-            // Notify live viewers as soon as the block is durably written.
-            if bundle.block.number > max_block {
-                max_block = bundle.block.number;
-                let _ = block_events.send(crate::models::block_event_json(
-                    &bundle.block,
-                    &bundle.txs,
-                    crate::models::STREAM_TX_CAP,
-                ));
-            }
         }
     });
 
@@ -614,6 +675,7 @@ pub async fn run_forever(
         bundle_tx.clone(),
         known_tokens.clone(),
         shutdown.clone(),
+        block_events.clone(),
     ));
     let backfill = tokio::spawn(backfill_loop(
         rpc.clone(),
@@ -672,14 +734,17 @@ fn compute_and_store_stats(db: &Db) -> Result<()> {
     )?;
 
     // Rolling window over the newest blocks (cheap PK scan, no history sweep).
+    // Timestamps are ms-precision (`timestamp_ms`); the chain produces blocks
+    // faster than once per second, so second-granularity timestamps would
+    // quantize the block time to 1s.
     let window: i64 = 100;
-    let (min_ts, max_ts, tx_sum, gas_sum, gas_den, n): (i64, i64, i64, f64, f64, i64) = conn
+    let (min_ms, max_ms, tx_sum, gas_sum, gas_den, n): (i64, i64, i64, f64, f64, i64) = conn
         .query_row(
-            "SELECT MIN(timestamp), MAX(timestamp), SUM(tx_count),
+            "SELECT MIN(timestamp_ms), MAX(timestamp_ms), SUM(tx_count),
                     SUM(CASE WHEN gas_limit > 0 THEN gas_used * 1.0 / gas_limit ELSE 0 END),
                     SUM(CASE WHEN gas_limit > 0 THEN 1 ELSE 0 END),
                     COUNT(*)
-             FROM (SELECT timestamp, tx_count, gas_used, gas_limit
+             FROM (SELECT timestamp_ms, tx_count, gas_used, gas_limit
                    FROM blocks ORDER BY number DESC LIMIT ?1)",
             params![window],
             |r| {
@@ -695,14 +760,10 @@ fn compute_and_store_stats(db: &Db) -> Result<()> {
         )
         .unwrap_or((0, 0, 0, 0.0, 0.0, 0));
 
-    let span_secs = (max_ts - min_ts).max(1) as f64;
-    let avg_block_time_ms = if n > 1 {
-        span_secs / (n - 1) as f64 * 1000.0
-    } else {
-        0.0
-    };
-    let tps = if span_secs > 0.0 {
-        tx_sum as f64 / span_secs
+    let span_ms = (max_ms - min_ms).max(1) as f64;
+    let avg_block_time_ms = if n > 1 { span_ms / (n - 1) as f64 } else { 0.0 };
+    let tps = if span_ms > 0.0 {
+        tx_sum as f64 / span_ms * 1000.0
     } else {
         0.0
     };

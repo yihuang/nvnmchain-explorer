@@ -5,7 +5,6 @@ use nvnmchain_explorer::decoder::{
 use nvnmchain_explorer::models::Transaction;
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::format_token_amount;
-use rusqlite::Connection;
 use serde_json::json;
 
 fn transfer_calldata(to: &str, amount: u128) -> String {
@@ -153,10 +152,6 @@ fn parse_block_and_transaction() {
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
     assert_eq!(tx.hash, format!("0x{}", "ff".repeat(32)));
     assert_eq!(tx.block_number, 16);
-    assert_eq!(tx.value, "1000000000000000000");
-    assert_eq!(tx.nonce, 3);
-    assert_eq!(tx.gas_price, "0x4a817c800");
-    assert_eq!(tx.chain_id, 0x2b45);
     assert_eq!(tx.timestamp, 100);
 }
 
@@ -178,26 +173,15 @@ fn balance_changes_from_receipt() {
     let tx = Transaction {
         hash: "0x".into(),
         block_number: 0,
-        block_hash: "0x".into(),
         position: 0,
         from_addr: from.clone(),
         to_addr: None,
         status: 1,
-        gas_limit: 0,
         gas_used: 0,
-        gas_price: "0x0".into(),
-        max_fee_per_gas: "0x0".into(),
-        max_priority_fee_per_gas: "0x0".into(),
         base_fee: "0x0".into(),
         contract_address: None,
         fee_token: None,
         fee_amount: "0".into(),
-        nonce: 0,
-        nonce_key: None,
-        value: "0".into(),
-        chain_id: 0,
-        tx_type: 0,
-        method_id: "0x".into(),
         input: "0x".into(),
         raw: None,
         trace_data: None,
@@ -216,102 +200,168 @@ fn balance_changes_from_receipt() {
 }
 
 #[test]
-fn init_db_migrates_legacy_schema_in_place() {
+fn fresh_schema_has_all_columns() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("legacy.db");
+    let path = dir.path().join("fresh.db");
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
 
-    // Simulate a database created by an older binary: v1 tables without the
-    // richer indexed columns and without the stats/balance tables.
-    let conn = Connection::open(&path).expect("open legacy db");
-    conn.execute_batch(
-        r#"
-        CREATE TABLE blocks (
-            number INTEGER PRIMARY KEY,
-            hash TEXT NOT NULL UNIQUE,
-            parent_hash TEXT NOT NULL,
-            timestamp INTEGER NOT NULL,
-            gas_used INTEGER NOT NULL DEFAULT 0,
-            gas_limit INTEGER NOT NULL DEFAULT 0,
-            miner TEXT NOT NULL DEFAULT '',
-            tx_count INTEGER NOT NULL DEFAULT 0,
-            raw TEXT NOT NULL DEFAULT '{}',
-            created_at INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE transactions (
-            hash TEXT PRIMARY KEY,
-            block_number INTEGER NOT NULL,
-            block_hash TEXT NOT NULL,
-            position INTEGER NOT NULL DEFAULT 0,
-            from_addr TEXT NOT NULL,
-            to_addr TEXT,
-            status INTEGER NOT NULL DEFAULT 1,
-            gas_limit INTEGER NOT NULL DEFAULT 0,
-            gas_used INTEGER NOT NULL DEFAULT 0,
-            gas_price TEXT NOT NULL DEFAULT '0',
-            max_fee_per_gas TEXT NOT NULL DEFAULT '0',
-            max_priority_fee_per_gas TEXT NOT NULL DEFAULT '0',
-            base_fee TEXT NOT NULL DEFAULT '0',
-            contract_address TEXT,
-            fee_token TEXT,
-            fee_amount TEXT NOT NULL DEFAULT '0',
-            nonce INTEGER NOT NULL DEFAULT 0,
-            nonce_key TEXT,
-            value TEXT NOT NULL DEFAULT '0',
-            chain_id INTEGER NOT NULL DEFAULT 787222,
-            tx_type INTEGER NOT NULL DEFAULT 118,
-            input TEXT NOT NULL DEFAULT '0x',
-            raw TEXT,
-            trace_data TEXT,
-            receipt_data TEXT,
-            timestamp INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT 0
-        );
-        "#,
-    )
-    .expect("create legacy schema");
-    drop(conn);
-
-    let upgraded = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
-
-    let version: i64 = upgraded
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .expect("user_version");
-    assert_eq!(
-        version, 3,
-        "migrations should run up to the current version"
-    );
-
-    for (table, column) in [
-        ("blocks", "base_fee"),
-        ("blocks", "size"),
-        ("blocks", "extra_data"),
-        ("blocks", "epoch"),
-        ("blocks", "view"),
-        ("blocks", "proposer"),
-        ("transactions", "method_id"),
+    // The base is reset between schema iterations, so init_db creates the
+    // final shape directly — no migration ladder.
+    for (table, expected) in [
+        (
+            "blocks",
+            &[
+                "number",
+                "hash",
+                "parent_hash",
+                "timestamp",
+                "timestamp_ms",
+                "gas_used",
+                "gas_limit",
+                "miner",
+                "tx_count",
+                "base_fee",
+                "size",
+                "extra_data",
+                "epoch",
+                "view",
+                "proposer",
+                "created_at",
+            ][..],
+        ),
+        (
+            "transactions",
+            &[
+                "hash",
+                "block_number",
+                "position",
+                "from_addr",
+                "to_addr",
+                "status",
+                "gas_used",
+                "base_fee",
+                "contract_address",
+                "fee_token",
+                "fee_amount",
+                "input",
+                "raw",
+                "trace_data",
+                "receipt_data",
+                "timestamp",
+                "created_at",
+            ][..],
+        ),
     ] {
         let cols: Vec<String> = {
-            let mut stmt = upgraded
+            let mut stmt = conn
                 .prepare(&format!("PRAGMA table_info({table})"))
                 .expect("pragma");
             let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
             rows.filter_map(|c| c.ok()).collect()
         };
-        assert!(
-            cols.iter().any(|c| c == column),
-            "column {table}.{column} should exist after migration"
-        );
+        for column in expected {
+            assert!(
+                cols.iter().any(|c| c == column),
+                "column {table}.{column} should exist in the fresh schema"
+            );
+        }
     }
 
-    // The new tables must exist too.
-    for table in ["kv", "token_balances"] {
-        let count: i64 = upgraded
+    for table in [
+        "blocks",
+        "transactions",
+        "token_metadata",
+        "contract_labels",
+        "transfer_events",
+        "kv",
+        "token_balances",
+    ] {
+        let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
                 [table],
                 |r| r.get(0),
             )
             .expect("table lookup");
-        assert_eq!(count, 1, "table {table} should exist after migration");
+        assert_eq!(count, 1, "table {table} should exist");
     }
+}
+
+#[test]
+fn blob_hex_round_trip() {
+    use nvnmchain_explorer::db::{self, Db};
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("blob.db");
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    let db: Db = Arc::new(Mutex::new(conn));
+
+    // Block with one transaction (so the tx row is exercised too).
+    let hash = format!("0x{}", "ab".repeat(32));
+    let parent = format!("0x{}", "cd".repeat(32));
+    let proposer = format!("0x{}", "11".repeat(32));
+    let miner = format!("0x{}", "22".repeat(20));
+    let tx_hash = format!("0x{}", "ff".repeat(32));
+    let raw_block = json!({
+        "number": "0x10",
+        "hash": hash,
+        "parentHash": parent,
+        "timestamp": "0x64",
+        "gasUsed": "0x5208",
+        "gasLimit": "0x1c9c380",
+        "miner": miner,
+        "consensusContext": {"epoch": 1, "view": 2, "proposer": proposer},
+        "transactions": [{
+            "hash": tx_hash,
+            "blockNumber": "0x10",
+            "transactionIndex": "0x0",
+            "from": format!("0x{}", "33".repeat(20)),
+            "to": format!("0x{}", "44".repeat(20)),
+            "gas": "0x5208",
+            "gasPrice": "0x4a817c800",
+            "value": "0x1",
+            "nonce": "0x3",
+            "chainId": "0x2b45",
+            "type": "0x76",
+            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
+            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
+        }]
+    });
+    let block = parse_block(&raw_block);
+    // The indexer fills the canonical RLP encoding separately; embed the real
+    // bytes of a known tempo 0x76 transaction (block 664125).
+    let rlp = include_str!("../fixtures/tx_664125.rlp").trim();
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.raw = Some(rlp.to_string());
+    db::save_block_bundle(&db, &block, &[tx], &[], &[]).expect("save bundle");
+
+    // Block reads back with identical hex, and hash lookup is case-insensitive
+    // (binary storage normalizes hex case — a bonus over TEXT comparisons).
+    let got = db::get_block_by_number(&db, 16).expect("block by number");
+    assert_eq!(got.hash, hash);
+    assert_eq!(got.parent_hash, parent);
+    assert_eq!(got.proposer, proposer);
+    assert_eq!(got.miner, miner);
+    assert!(db::get_block_by_hash(&db, &hash).is_some());
+    let upper = format!("0x{}", hash[2..].to_uppercase());
+    assert!(
+        db::get_block_by_hash(&db, &upper).is_some(),
+        "hash lookup should be case-insensitive with BLOB storage"
+    );
+
+    // Transaction reads back: raw is the canonical RLP encoding, and the
+    // display fields (calls, signature type, gas) are decoded from it at
+    // runtime with the tempo primitives.
+    let got_tx = db::get_transaction(&db, &tx_hash).expect("tx");
+    assert_eq!(got_tx.raw.as_deref(), Some(rlp));
+    let parsed = nvnmchain_explorer::decoder::parse_raw_tx(got_tx.raw.as_deref().unwrap());
+    assert_eq!(parsed.sig_type.as_deref(), Some("WebAuthn"));
+    assert_eq!(parsed.nonce, Some(0));
+    assert_eq!(parsed.gas_limit, Some(319946));
+    assert_eq!(parsed.max_fee_per_gas, Some(1200000000));
+    assert_eq!(parsed.nonce_key.as_deref(), Some("0"));
+    assert_eq!(parsed.calls.len(), 1);
+    let call_to = parsed.calls[0]["to"].as_str().unwrap().to_lowercase();
+    assert_eq!(call_to, "0x20c0000000000000000000000000000000000000");
 }
