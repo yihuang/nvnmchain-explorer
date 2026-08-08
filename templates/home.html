@@ -238,7 +238,10 @@
         prevTs = b.timestamp;
 
         // Skip insertion if the tip row is already rendered (initial event).
-        var firstA = panel.firstChild && panel.firstChild.querySelector('a');
+        // Use firstElementChild: the panel's first DOM node may be a whitespace
+        // text node (Tera preserves indentation), which has no querySelector.
+        var firstRow = panel.firstElementChild;
+        var firstA = firstRow && firstRow.querySelector('a');
         if (firstA && firstA.textContent === '#' + b.number) return;
         if (empty && empty.parentNode) empty.remove();
         panel.insertBefore(rowFor(b), panel.firstChild);
