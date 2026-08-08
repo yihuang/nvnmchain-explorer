@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use rusqlite::params;
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
 use crate::config::Settings;
@@ -330,6 +330,15 @@ async fn index_block_send(
     Ok(())
 }
 
+/// Sleep for `dur` unless shutdown was requested, in which case return
+/// immediately with `true`. Lets background loops stop promptly on Ctrl+C.
+async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, dur: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => false,
+        r = shutdown.changed() => r.is_err() || *shutdown.borrow(),
+    }
+}
+
 /// Index every block in `from..=to`, fetching up to `concurrency` in parallel.
 /// Blocks are spawned tip-first (`to` down to `from`) so the newest block is
 /// written as soon as possible.
@@ -340,6 +349,7 @@ async fn index_range_concurrent(
     to: u64,
     concurrency: usize,
     known_tokens: Arc<Mutex<HashSet<String>>>,
+    shutdown: &watch::Receiver<bool>,
 ) {
     if from > to {
         return;
@@ -348,6 +358,11 @@ async fn index_range_concurrent(
     let mut next = to;
     let mut remaining = to - from + 1;
     loop {
+        // Abort in-flight fetches as soon as shutdown is requested.
+        if *shutdown.borrow() {
+            set.abort_all();
+            return;
+        }
         while remaining > 0 && set.len() < concurrency {
             let rpc = rpc.clone();
             let tx = tx.clone();
@@ -376,14 +391,24 @@ async fn forward_loop(
     cfg: IndexerConfig,
     bundle_tx: mpsc::Sender<BlockBundle>,
     known_tokens: Arc<Mutex<HashSet<String>>>,
+    shutdown: watch::Receiver<bool>,
 ) {
     let (head_tx, mut head_rx) = mpsc::channel::<u64>(256);
     let watcher_rpc = rpc.clone();
     let ws_url = cfg.ws_url.clone();
     let index_ws = cfg.index_ws;
     let poll = cfg.poll;
+    let watcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        crate::ws::head_watcher(watcher_rpc, ws_url, index_ws, poll, head_tx).await;
+        crate::ws::head_watcher(
+            watcher_rpc,
+            ws_url,
+            index_ws,
+            poll,
+            head_tx,
+            watcher_shutdown,
+        )
+        .await;
     });
 
     let mut sent = db::get_latest_block(&db)
@@ -392,6 +417,9 @@ async fn forward_loop(
     info!("forward loop started from block {sent}");
 
     while let Some(head) = head_rx.recv().await {
+        if *shutdown.borrow() {
+            break;
+        }
         if sent == 0 && head > 0 {
             // Fresh DB: the backfill loop seeds history (including the head).
             // Wait a moment for its first write so the loops don't both fetch
@@ -417,6 +445,7 @@ async fn forward_loop(
                 head,
                 cfg.concurrency,
                 known_tokens.clone(),
+                &shutdown,
             )
             .await;
             sent = head;
@@ -431,6 +460,7 @@ async fn backfill_loop(
     cfg: IndexerConfig,
     bundle_tx: mpsc::Sender<BlockBundle>,
     known_tokens: Arc<Mutex<HashSet<String>>>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     info!(
         "backfill loop started (batch {}, concurrency {})",
@@ -439,11 +469,16 @@ async fn backfill_loop(
 
     let mut consecutive_failures = 0u32;
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         let target = match db::get_min_block_number(&db) {
             Some(min) if min > 1 => min as u64,
             Some(_) => {
                 // Fully backfilled; nothing to do until history changes.
-                tokio::time::sleep(cfg.poll).await;
+                if sleep_or_shutdown(&mut shutdown, cfg.poll).await {
+                    break;
+                }
                 continue;
             }
             None => {
@@ -454,7 +489,9 @@ async fn backfill_loop(
                     Ok(head) => head + 1,
                     Err(e) => {
                         warn!("backfill head fetch failed: {e:#}");
-                        tokio::time::sleep(cfg.poll).await;
+                        if sleep_or_shutdown(&mut shutdown, cfg.poll).await {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -468,6 +505,7 @@ async fn backfill_loop(
             target - 1,
             cfg.concurrency,
             known_tokens.clone(),
+            &shutdown,
         )
         .await;
 
@@ -475,10 +513,10 @@ async fn backfill_loop(
         if new_min >= target {
             // Nothing was persisted; back off instead of spinning.
             consecutive_failures += 1;
-            tokio::time::sleep(Duration::from_millis(
-                200 * consecutive_failures.min(10) as u64,
-            ))
-            .await;
+            let backoff = Duration::from_millis(200 * consecutive_failures.min(10) as u64);
+            if sleep_or_shutdown(&mut shutdown, backoff).await {
+                break;
+            }
         } else {
             consecutive_failures = 0;
             info!("backfill: {} remaining", new_min.saturating_sub(1));
@@ -493,10 +531,12 @@ pub async fn run_forever(
     db: Db,
     cfg: IndexerConfig,
     block_events: broadcast::Sender<Value>,
+    shutdown: watch::Receiver<bool>,
 ) {
     let stats_interval = cfg.stats_interval;
     let stats_db = db.clone();
-    tokio::spawn(async move { stats_loop(stats_db, stats_interval).await });
+    let stats_shutdown = shutdown.clone();
+    tokio::spawn(async move { stats_loop(stats_db, stats_interval, stats_shutdown).await });
 
     // Seed the token-metadata cache and repair balances on legacy databases.
     let known_tokens = Arc::new(Mutex::new(
@@ -534,11 +574,17 @@ pub async fn run_forever(
 
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
     let writer_db = db.clone();
+    let writer_shutdown = shutdown.clone();
     let writer = tokio::spawn(async move {
         // Live feed = new tip blocks only; backfill writes are older numbers
         // and would just duplicate/reorder the home page, so track the max.
         let mut max_block = -1i64;
         while let Some(bundle) = bundle_rx.recv().await {
+            // On shutdown, stop draining the queue: in-flight bundles are
+            // dropped and re-fetched on the next start.
+            if *writer_shutdown.borrow() {
+                break;
+            }
             if let Err(e) = db::save_block_bundle(
                 &writer_db,
                 &bundle.block,
@@ -567,6 +613,7 @@ pub async fn run_forever(
         cfg.clone(),
         bundle_tx.clone(),
         known_tokens.clone(),
+        shutdown.clone(),
     ));
     let backfill = tokio::spawn(backfill_loop(
         rpc.clone(),
@@ -574,6 +621,7 @@ pub async fn run_forever(
         cfg.clone(),
         bundle_tx.clone(),
         known_tokens.clone(),
+        shutdown,
     ));
     drop(bundle_tx);
 
@@ -590,12 +638,17 @@ pub async fn run_forever(
 
 /// Recompute the home-page stats blob into the `kv` table every interval so
 /// the web layer never has to scan history at request time.
-async fn stats_loop(db: Db, interval: Duration) {
+async fn stats_loop(db: Db, interval: Duration, mut shutdown: watch::Receiver<bool>) {
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         if let Err(e) = compute_and_store_stats(&db) {
             warn!("stats recompute failed: {e:#}");
         }
-        tokio::time::sleep(interval).await;
+        if sleep_or_shutdown(&mut shutdown, interval).await {
+            break;
+        }
     }
 }
 

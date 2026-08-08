@@ -142,6 +142,7 @@ async fn backfill_throughput() {
 async fn head_feed_delivers_blocks() {
     let rpc = rpc();
     let (tx, mut rx) = mpsc::channel::<u64>(8);
+    let (_, shutdown) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(async move {
         nvnmchain_explorer::ws::head_watcher(
             rpc,
@@ -149,6 +150,7 @@ async fn head_feed_delivers_blocks() {
             true,
             Duration::from_secs(1),
             tx,
+            shutdown,
         )
         .await;
     });

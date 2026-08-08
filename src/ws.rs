@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
@@ -35,27 +35,46 @@ pub async fn head_watcher(
     index_ws: bool,
     poll: Duration,
     tx: mpsc::Sender<u64>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let poll = poll.max(Duration::from_millis(100));
     if !index_ws {
         // Pure polling mode.
         loop {
+            if *shutdown.borrow() {
+                return;
+            }
             if !poll_once(&rpc, &tx).await {
                 return;
             }
-            tokio::time::sleep(poll).await;
+            tokio::select! {
+                _ = tokio::time::sleep(poll) => {}
+                r = shutdown.changed() => {
+                    if r.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
         }
     }
 
     let mut retry = Duration::from_millis(500);
     let mut consecutive_failures = 0u32;
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         // Try the socket in the background while polling keeps the feed warm:
         let url = ws_url.clone();
         let tx2 = tx.clone();
         let ws_task = tokio::spawn(async move { subscribe_ws(&url, &tx2).await });
         let outcome = loop {
+            if *shutdown.borrow() {
+                ws_task.abort();
+                return;
+            }
             if !poll_once(&rpc, &tx).await {
+                ws_task.abort();
                 return;
             }
             if ws_task.is_finished() {
@@ -64,7 +83,15 @@ pub async fn head_watcher(
                     Err(e) => Err(anyhow::anyhow!("websocket task failed: {e}")),
                 };
             }
-            tokio::time::sleep(poll).await;
+            tokio::select! {
+                _ = tokio::time::sleep(poll) => {}
+                r = shutdown.changed() => {
+                    if r.is_err() || *shutdown.borrow() {
+                        ws_task.abort();
+                        return;
+                    }
+                }
+            }
         };
         match outcome {
             Ok(()) => {
@@ -73,6 +100,9 @@ pub async fn head_watcher(
                 // Keep polling during the brief reconnect pause.
                 let until = tokio::time::Instant::now() + Duration::from_millis(250);
                 while tokio::time::Instant::now() < until {
+                    if *shutdown.borrow() {
+                        return;
+                    }
                     if !poll_once(&rpc, &tx).await {
                         return;
                     }
@@ -95,6 +125,9 @@ pub async fn head_watcher(
                 // stalls while the socket is unreachable.
                 let until = tokio::time::Instant::now() + retry;
                 while tokio::time::Instant::now() < until {
+                    if *shutdown.borrow() {
+                        return;
+                    }
                     if !poll_once(&rpc, &tx).await {
                         return;
                     }
