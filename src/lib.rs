@@ -1,4 +1,4 @@
-//! Tempo Explorer — Rust rewrite of the Python explorer.
+//! Tempo Explorer — blockchain explorer for Tempo, an EVM-compatible chain.
 
 pub mod config;
 pub mod contracts;

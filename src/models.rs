@@ -1,7 +1,7 @@
 //! Row types shared between SQLite storage and the JSON API.
 //!
-//! Field names and shapes mirror the Python implementation so the API and
-//! templates keep working unchanged.
+//! Field names and shapes are the stable wire contract for the JSON API and
+//! templates.
 
 use serde::Serialize;
 

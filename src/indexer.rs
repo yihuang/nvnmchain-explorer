@@ -1,6 +1,5 @@
 //! Background indexer: polls the chain head, indexes blocks forward and
-//! backfills history, mirroring `app/indexer.py` (and filling the
-//! `transfer_events` table the Python app never populated).
+//! backfills history, and fills the `transfer_events` table.
 
 use std::time::Duration;
 
@@ -114,7 +113,7 @@ pub async fn index_block(rpc: &TempoRpc, db: &Db, block_num: u64) -> Result<()> 
 }
 
 /// Decode Transfer / TransferWithMemo logs and store them so the address and
-/// token transfer tabs have data (the Python app never wrote these rows).
+/// token transfer tabs have data.
 fn save_transfer_events(db: &Db, receipt: &Value, tx: &crate::models::Transaction) {
     let logs = receipt
         .get("logs")

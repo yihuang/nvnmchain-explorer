@@ -228,7 +228,7 @@ impl TempoRpc {
     }
 
     /// Trace a transaction with the callTracer; `None` when tracing is
-    /// unavailable (the Python client tolerated that too).
+    /// unavailable.
     pub async fn debug_trace_transaction(&self, tx_hash: &str) -> Option<Value> {
         self.call(
             "debug_traceTransaction",
@@ -261,8 +261,8 @@ pub fn hex_to_u64(value: &Value) -> Result<u64> {
     u64::from_str_radix(s, 16).with_context(|| format!("invalid hex number: {s}"))
 }
 
-/// Convert a `0x`-prefixed hex JSON value to a decimal string, with
-/// arbitrary precision (mirrors Python's `int(x, 16)`).
+/// Convert a `0x`-prefixed hex JSON value to a decimal string with arbitrary
+/// precision.
 pub fn hex_to_dec_str(value: &Value) -> String {
     let s = value.as_str().unwrap_or("0x0");
     let s = s.strip_prefix("0x").unwrap_or(s);
@@ -276,7 +276,7 @@ pub fn hex_to_dec_str(value: &Value) -> String {
 }
 
 /// Parse a value that may be a `0x` hex string or a decimal number into a
-/// signed 64-bit integer (0 on garbage), like the Python `_parse_int`.
+/// signed 64-bit integer (0 on garbage).
 pub fn parse_int_any(value: &Value) -> i64 {
     match value {
         Value::Number(n) => n.as_i64().unwrap_or(0),
@@ -294,8 +294,8 @@ pub fn parse_int_any(value: &Value) -> i64 {
     }
 }
 
-/// Format an integer-like JSON value as a hex string (used for gas price
-/// fields the Python code kept in their original string form).
+/// Format an integer-like JSON value as a hex string; `0x`-prefixed string
+/// values are returned unchanged.
 pub fn int_to_hex_str(value: &Value) -> String {
     match value {
         Value::String(s) if s.starts_with("0x") => s.clone(),

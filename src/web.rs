@@ -630,8 +630,8 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
             Ok(Value::String(formatted))
         },
     );
-    // Like Python's `or`: use the fallback when the value is null or an empty
-    // string (Tera's built-in `default` only handles null/undefined).
+    // Use the fallback when the value is null or an empty string (Tera's
+    // built-in `default` only handles null/undefined).
     tera.register_filter(
         "fallback",
         |value: &Value, args: &HashMap<String, Value>| {

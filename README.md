@@ -1,17 +1,12 @@
-# Tempo Explorer (Rust)
+# Tempo Explorer
 
 Blockchain explorer for [Tempo](https://tempo.xyz) — an EVM-compatible chain
 with no native token (gas paid in ERC-20/TIP-20 tokens).
 
-This is a full rewrite of the original Python/FastAPI explorer in Rust:
-
-| Layer | Python (original) | Rust (this repo) |
-|-------|-------------------|------------------|
-| Web framework | FastAPI + Jinja2 | [axum](https://github.com/tokio-rs/axum) + [Tera](https://tera.netlify.app/) |
-| Storage | SQLModel / SQLAlchemy + Alembic | rusqlite (schema created on boot) |
-| RPC client | httpx | reqwest (async JSON-RPC) |
-| ABI decoding | eth-abi / eth-contract | self-contained ABIv2 decoder + keccak |
-| Indexer | asyncio task | tokio task (forward tip + backfill) |
+Written in Rust with [axum](https://github.com/tokio-rs/axum) + [Tera](https://tera.netlify.app/),
+rusqlite (schema created on boot), an async reqwest JSON-RPC client, a
+self-contained ABIv2 decoder with keccak, and a tokio indexer (forward tip +
+backfill).
 
 The default RPC is `https://rpc.nvnm.canary.mantrachain.dev` (Mantra EVM,
 chain id `0xc0316`) — the chain this codebase is validated against. Point it

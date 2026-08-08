@@ -1,1 +1,0 @@
-"""Tempo Explorer application."""

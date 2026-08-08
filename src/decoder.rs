@@ -1,8 +1,7 @@
 //! ABI decoding for calls, events, traces, and balance changes.
 //!
-//! A self-contained ABIv2 decoder (no alloy dependency) plus the TIP-20 /
-//! ERC-20 knowledge the Python app hard-coded in `app/decoder.py`,
-//! `app/tokens.py` and `app/contracts.py`.
+//! A self-contained ABIv2 decoder (no alloy dependency) plus built-in TIP-20 /
+//! ERC-20 token metadata and labels.
 
 use num_bigint::{BigInt, Sign};
 use serde::Serialize;
@@ -47,7 +46,7 @@ pub fn checksum_address(addr: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Decoded models (serialize like the Python pydantic models)
+// Decoded models (serde-serialized for the JSON API)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,8 +244,8 @@ fn hex_bytes(value: &[u8]) -> String {
     format!("0x{}", hex::encode(value))
 }
 
-/// Format a decoded value the way the Python app did (addresses checksummed,
-/// ints decimal, bytes hex, bools lowercase).
+/// Format a decoded value: addresses checksummed, ints decimal, bytes hex,
+/// bools lowercase.
 fn format_value(ty: &AbiType, value: &[u8], _ty_str: &str) -> String {
     match ty {
         AbiType::Address => {
