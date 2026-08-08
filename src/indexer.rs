@@ -140,6 +140,11 @@ pub async fn fetch_block_bundle_with_cache(
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
     let mut transfer_tokens: HashSet<String> = HashSet::new();
+    // Running log index across the whole block. Receipts normally carry a
+    // unique `logIndex`; when one is missing or mangled the counter fills in
+    // a unique value so the DB's (block_number, log_index) key never
+    // collides within a block.
+    let mut next_log_index = 0u64;
 
     for tx_data in &raw_txs {
         let tx_hash = tx_data.get("hash").and_then(Value::as_str).unwrap_or("");
@@ -161,7 +166,13 @@ pub async fn fetch_block_bundle_with_cache(
             tx.trace_data = Some(serde_json::to_string(flat).unwrap_or_else(|_| "[]".into()));
         }
         if let Some(receipt) = receipt_by_hash.get(tx_hash) {
-            apply_receipt(&mut tx, receipt, &mut transfers, &mut transfer_tokens);
+            apply_receipt(
+                &mut tx,
+                receipt,
+                &mut transfers,
+                &mut transfer_tokens,
+                &mut next_log_index,
+            );
         }
         txs.push(tx);
     }
@@ -213,6 +224,7 @@ fn apply_receipt(
     receipt: &Value,
     transfers: &mut Vec<TransferEvent>,
     transfer_tokens: &mut HashSet<String>,
+    next_log_index: &mut u64,
 ) {
     tx.receipt_data = Some(serde_json::to_string(receipt).unwrap_or_else(|_| "{}".into()));
     tx.status = receipt
@@ -265,6 +277,17 @@ fn apply_receipt(
         .cloned()
         .unwrap_or_default();
     for log in &logs {
+        // `logIndex` is the per-block unique half of the transfer_events key.
+        // Prefer the node's value, but every log still advances the running
+        // counter (undecodable logs occupy index slots too), so a missing or
+        // unparsable index gets a unique fallback instead of colliding at 0.
+        let log_index = log
+            .get("logIndex")
+            .map(crate::rpc::parse_int_any)
+            .filter(|n| *n >= 0)
+            .unwrap_or(*next_log_index as i64);
+        *next_log_index = (*next_log_index).max(log_index as u64 + 1);
+
         let Some(decoded) = decode_event(log) else {
             continue;
         };
@@ -307,11 +330,6 @@ fn apply_receipt(
             continue;
         }
         let token = checksum_address(log.get("address").and_then(Value::as_str).unwrap_or(""));
-        let log_index = log
-            .get("logIndex")
-            .and_then(Value::as_str)
-            .and_then(|s| u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok())
-            .unwrap_or(0) as i64;
         transfers.push(TransferEvent {
             id: 0,
             tx_hash: tx.hash.clone(),

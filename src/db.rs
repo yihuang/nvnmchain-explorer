@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
@@ -120,7 +121,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
             to_addr BLOB NOT NULL,
             amount TEXT NOT NULL,
             timestamp INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT 0
+            created_at INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (block_number, log_index)
         );
         CREATE INDEX IF NOT EXISTS idx_transfer_tx_hash ON transfer_events(tx_hash);
         CREATE INDEX IF NOT EXISTS idx_transfer_block ON transfer_events(block_number);
@@ -239,11 +241,17 @@ pub fn save_block_bundle(
     for tx in txs {
         upsert_transaction(&txn, tx)?;
     }
+    // Transfers are keyed by (block_number, log_index): re-writing an
+    // already-indexed block inserts nothing the second time, and only
+    // freshly-inserted transfers move balances / holder counts.
+    let mut inserted: Vec<&TransferEvent> = Vec::with_capacity(transfers.len());
     for transfer in transfers {
-        insert_transfer(&txn, transfer)?;
+        if insert_transfer(&txn, transfer)? {
+            inserted.push(transfer);
+        }
     }
-    apply_transfer_balances(&txn, transfers)?;
-    refresh_holder_counts(&txn, transfers)?;
+    apply_transfer_balances(&txn, &inserted)?;
+    refresh_holder_counts(&txn, &inserted)?;
     for tx in txs {
         if let Some(addr) = &tx.contract_address {
             txn.execute(
@@ -614,9 +622,12 @@ pub fn get_token_by_symbol_or_name(db: &Db, q: &str) -> Option<TokenMetadata> {
 // Transfer events
 // ---------------------------------------------------------------------------
 
-fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<()> {
-    conn.execute(
-        "INSERT INTO transfer_events (tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at)
+/// Insert one transfer event. Returns `true` when the row was newly inserted
+/// and `false` when it duplicated an existing (block_number, log_index) —
+/// the unique key that makes re-writing an already-indexed block idempotent.
+fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<bool> {
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO transfer_events (tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             hex_blob(&transfer.tx_hash),
@@ -630,7 +641,7 @@ fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<()> {
             transfer.created_at,
         ],
     )?;
-    Ok(())
+    Ok(inserted != 0)
 }
 
 fn bigint(s: &str) -> num_bigint::BigInt {
@@ -677,7 +688,7 @@ fn adjust_balance(
     Ok(())
 }
 
-fn apply_transfer_balances(conn: &Connection, transfers: &[TransferEvent]) -> Result<()> {
+fn apply_transfer_balances(conn: &Connection, transfers: &[&TransferEvent]) -> Result<()> {
     for t in transfers {
         let amount = bigint(&t.amount);
         adjust_balance(conn, &t.token_addr, &t.from_addr, &-&amount)?;
@@ -688,7 +699,7 @@ fn apply_transfer_balances(conn: &Connection, transfers: &[TransferEvent]) -> Re
 
 /// Keep `token_metadata.holder_count` in sync for tokens touched by this
 /// batch of transfers. Uses the primary-key index so it stays cheap.
-fn refresh_holder_counts(conn: &Connection, transfers: &[TransferEvent]) -> Result<()> {
+fn refresh_holder_counts(conn: &Connection, transfers: &[&TransferEvent]) -> Result<()> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for t in transfers {
         if !seen.insert(t.token_addr.clone()) {
@@ -708,8 +719,11 @@ fn refresh_holder_counts(conn: &Connection, transfers: &[TransferEvent]) -> Resu
 }
 
 /// Rebuild `token_balances` + holder counts from the transfer history.
-/// Run once after upgrading a pre-existing database so incremental updates
-/// start from a correct state.
+/// Run once after upgrading a pre-existing database (or after the
+/// transfer_events dedup migration) so incremental updates start from a
+/// correct state. Address columns may be stored as BLOBs (current format) or
+/// TEXT (pre-upgrade format), so both are decoded and normalized to EIP-55
+/// checksummed hex, matching the keys the incremental balance path stores.
 pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM token_balances", [])?;
     let mut stmt = conn.prepare(
@@ -717,9 +731,9 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
+            addr_from_value(r.get_ref(0)?),
+            addr_from_value(r.get_ref(1)?),
+            addr_from_value(r.get_ref(2)?),
             r.get::<_, String>(3)?,
         ))
     })?;
@@ -748,9 +762,23 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Decode one address column of `transfer_events` into EIP-55 checksummed
+/// hex. The column is a BLOB (raw bytes, current storage) or TEXT (legacy
+/// storage); either way we end with the canonical form so `token_balances`
+/// keys stay comparable to the incremental path's writes.
+fn addr_from_value(v: ValueRef<'_>) -> String {
+    let hex = match v {
+        ValueRef::Blob(b) => format!("0x{}", hex::encode(b)),
+        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+        _ => String::new(),
+    };
+    crate::decoder::checksum_address(&hex)
+}
+
 pub fn save_transfer(db: &Db, transfer: &TransferEvent) -> Result<()> {
     let conn = lock(db);
-    insert_transfer(&conn, transfer)
+    insert_transfer(&conn, transfer)?;
+    Ok(())
 }
 
 fn row_to_transfer(row: &rusqlite::Row) -> rusqlite::Result<TransferEvent> {

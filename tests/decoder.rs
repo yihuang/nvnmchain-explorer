@@ -2,7 +2,7 @@ use nvnmchain_explorer::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
     flatten_trace, TRANSFER_TOPIC,
 };
-use nvnmchain_explorer::models::Transaction;
+use nvnmchain_explorer::models::{Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::format_token_amount;
 use serde_json::json;
@@ -364,4 +364,116 @@ fn blob_hex_round_trip() {
     assert_eq!(parsed.calls.len(), 1);
     let call_to = parsed.calls[0]["to"].as_str().unwrap().to_lowercase();
     assert_eq!(call_to, "0x20c0000000000000000000000000000000000000");
+}
+
+#[test]
+fn duplicate_bundle_is_idempotent() {
+    use nvnmchain_explorer::db::{self, Db};
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("dedup.db");
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    let db: Db = Arc::new(Mutex::new(conn));
+
+    let raw_block = json!({
+        "number": "0x10",
+        "hash": format!("0x{}", "ab".repeat(32)),
+        "parentHash": format!("0x{}", "cd".repeat(32)),
+        "timestamp": "0x64",
+        "gasUsed": "0x5208",
+        "gasLimit": "0x1c9c380",
+        "miner": format!("0x{}", "22".repeat(20)),
+        "consensusContext": {"epoch": 1, "view": 2, "proposer": format!("0x{}", "11".repeat(32))},
+        "transactions": [{
+            "hash": format!("0x{}", "ff".repeat(32)),
+            "blockNumber": "0x10",
+            "transactionIndex": "0x0",
+            "from": format!("0x{}", "33".repeat(20)),
+            "to": format!("0x{}", "44".repeat(20)),
+            "gas": "0x5208",
+            "gasPrice": "0x4a817c800",
+            "value": "0x1",
+            "nonce": "0x3",
+            "chainId": "0x2b45",
+            "type": "0x76",
+            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
+            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
+        }]
+    });
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    let token = checksum_address(&format!("0x{}", "aa".repeat(20)));
+    let from = checksum_address(&format!("0x{}", "11".repeat(20)));
+    let to = checksum_address(&format!("0x{}", "22".repeat(20)));
+    let transfer = TransferEvent {
+        id: 0,
+        tx_hash: tx.hash.clone(),
+        block_number: block.number,
+        log_index: 0,
+        token_addr: token.clone(),
+        from_addr: from.clone(),
+        to_addr: to.clone(),
+        amount: "100".into(),
+        timestamp: block.timestamp,
+        created_at: 0,
+    };
+
+    // The same block written twice (what the indexer's concurrent fetch/retry
+    // races can produce). Blocks and txs upsert; transfers must dedupe.
+    db::save_block_bundle(
+        &db,
+        &block,
+        std::slice::from_ref(&tx),
+        std::slice::from_ref(&transfer),
+        &[],
+    )
+    .expect("first save");
+    db::save_block_bundle(
+        &db,
+        &block,
+        std::slice::from_ref(&tx),
+        std::slice::from_ref(&transfer),
+        &[],
+    )
+    .expect("duplicate save");
+
+    let conn = db::lock(&db);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM transfer_events", [], |r| r.get(0))
+        .expect("transfer count");
+    assert_eq!(
+        count, 1,
+        "duplicate bundle must not duplicate transfer rows"
+    );
+
+    let unique: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_index_list('transfer_events') WHERE \"unique\"=1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("unique index lookup");
+    assert_eq!(
+        unique, 1,
+        "unique constraint on (block_number, log_index) should exist"
+    );
+
+    // Balance deltas are applied once per transfer, not once per write.
+    let recipient: String = conn
+        .query_row(
+            "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
+            rusqlite::params![token, to],
+            |r| r.get(0),
+        )
+        .expect("recipient balance");
+    assert_eq!(recipient, "100", "balance must not be double-applied");
+    let sender: String = conn
+        .query_row(
+            "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
+            rusqlite::params![token, from],
+            |r| r.get(0),
+        )
+        .expect("sender balance");
+    assert_eq!(sender, "-100", "sender delta applied exactly once");
 }
