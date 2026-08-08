@@ -3,21 +3,27 @@
 FROM rust:1.97-slim AS builder
 WORKDIR /build
 
+# Compile dependencies in their own layer using a stub binary, then overwrite
+# with the real sources so application changes only recompile the app crate.
 COPY Cargo.toml Cargo.lock ./
-RUN cargo fetch --locked
+RUN mkdir src \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release --locked \
+    && rm -rf src
 
 COPY src ./src
 COPY templates ./templates
-RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
-    cargo build --release --locked
+RUN cargo build --release --locked
 
 # stable (trixie) glibc >= whatever rust:1.97-slim ships, so the binary runs
 # regardless of which Debian release the builder image is based on.
 FROM debian:stable-slim
 RUN useradd --system --no-create-home --uid 10001 app
 COPY --from=builder /build/target/release/nvnmchain-explorer /usr/local/bin/nvnmchain-explorer
+COPY templates ./templates
 COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+WORKDIR /app
 
 ENV DB_PATH=/data/explorer.db \
     RUST_LOG=nvnmchain_explorer=info \
