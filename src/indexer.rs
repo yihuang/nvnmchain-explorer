@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use rusqlite::params;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
@@ -545,17 +545,11 @@ pub async fn run_forever(
             // Notify live viewers as soon as the block is durably written.
             if bundle.block.number > max_block {
                 max_block = bundle.block.number;
-                let _ = block_events.send(json!({
-                    "type": "block",
-                    "block": {
-                        "number": bundle.block.number,
-                        "hash": bundle.block.hash,
-                        "timestamp": bundle.block.timestamp,
-                        "tx_count": bundle.block.tx_count,
-                        "gas_used": bundle.block.gas_used,
-                        "gas_limit": bundle.block.gas_limit,
-                    }
-                }));
+                let _ = block_events.send(crate::models::block_event_json(
+                    &bundle.block,
+                    &bundle.txs,
+                    crate::models::STREAM_TX_CAP,
+                ));
             }
         }
     });

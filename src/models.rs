@@ -4,8 +4,43 @@
 //! templates.
 
 use serde::Serialize;
+use serde_json::json;
 
 pub type Json = serde_json::Value;
+
+/// How many transactions a single live-feed event may carry. Blocks can hold
+/// hundreds of transactions while the home page only shows a handful, so the
+/// overflow is intentionally skipped.
+pub const STREAM_TX_CAP: usize = 15;
+
+/// Live-feed payload for a freshly indexed block: the block plus its first
+/// `tx_cap` transactions in position order. Used by both the indexer writer
+/// and the SSE initial event so the wire shape stays identical.
+pub fn block_event_json(block: &Block, txs: &[Transaction], tx_cap: usize) -> Json {
+    json!({
+        "type": "block",
+        "block": {
+            "number": block.number,
+            "hash": block.hash,
+            "timestamp": block.timestamp,
+            "tx_count": block.tx_count,
+            "gas_used": block.gas_used,
+            "gas_limit": block.gas_limit,
+            "txs": txs
+                .iter()
+                .take(tx_cap)
+                .map(|t| json!({
+                    "hash": t.hash,
+                    "status": t.status,
+                    "from_addr": t.from_addr,
+                    "to_addr": t.to_addr,
+                    "block_number": t.block_number,
+                    "timestamp": t.timestamp,
+                }))
+                .collect::<Vec<_>>(),
+        }
+    })
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Block {

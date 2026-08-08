@@ -209,7 +209,10 @@ pub async fn home(
 /// immediately on connect, then every block as the indexer writes it.
 pub async fn events(State(state): State<AppState>) -> Response {
     let rx = state.block_events.subscribe();
-    let latest = db::get_latest_block(&state.db).map(block_event_json);
+    let latest = db::get_latest_block(&state.db).map(|b| {
+        let txs = db::get_block_transactions(&state.db, b.number);
+        crate::models::block_event_json(&b, &txs, crate::models::STREAM_TX_CAP)
+    });
     let stream = unfold((rx, latest, false), sse_step);
     Sse::new(stream)
         .keep_alive(
@@ -248,21 +251,6 @@ async fn sse_step(
         }
     }
 }
-
-fn block_event_json(block: crate::models::Block) -> Value {
-    json!({
-        "type": "block",
-        "block": {
-            "number": block.number,
-            "hash": block.hash,
-            "timestamp": block.timestamp,
-            "tx_count": block.tx_count,
-            "gas_used": block.gas_used,
-            "gas_limit": block.gas_limit,
-        }
-    })
-}
-
 pub async fn block_page(
     State(state): State<AppState>,
     Path(block_id): Path<String>,
