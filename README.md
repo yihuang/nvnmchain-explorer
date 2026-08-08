@@ -20,20 +20,34 @@ cargo run --release
 ```
 
 Open http://localhost:8080. On first boot the indexer seeds from the chain
-head, indexes new blocks every few seconds, and backfills history downward
-(`INDEX_BATCH` blocks per cycle — raise it, e.g. `INDEX_BATCH=2500`, to catch
-up faster).
+head, tracks new blocks continuously, and backfills history downward.
+
+The indexer is built for a sub-second chain:
+
+- **Instant heads** — subscribes to `eth_subscribe("newHeads")` over WebSocket
+  (`wss://ws.nvnm.canary.mantrachain.dev`); polling (`INDEX_POLL_SECONDS`)
+  keeps the feed alive while the socket reconnects, so head detection never
+  stalls.
+- **One RPC call per block** — receipts via `eth_getBlockReceipts` (with a
+  per-transaction batch fallback), traces via `debug_traceBlockByNumber`, and
+  blocks fetched concurrently (`INDEX_CONCURRENCY` in flight).
+- **Serialized SQLite writes** — every block (block row + txs + transfers +
+  token metadata) is persisted in one transaction by a single writer task,
+  measured at ~200 blocks/s while backfilling.
 
 ## Configuration (env vars)
 
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `NVNM_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted) |
+| `WS_URL` | `wss://ws.nvnm.canary.mantrachain.dev` | WebSocket endpoint for `newHeads` |
+| `INDEX_WS` | `1` | Set `0` to disable the WebSocket feed (pure polling) |
 | `CHAIN_ID` | `787222` | Chain id shown in the UI |
 | `DB_PATH` | `explorer.db` | SQLite database path |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address |
-| `INDEX_POLL_SECONDS` | `3` | Indexer poll interval |
+| `INDEX_POLL_SECONDS` | `1` | Poll interval when the WebSocket feed is unavailable |
 | `INDEX_BATCH` | `5` | Blocks indexed per cycle (forward + backfill) |
+| `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -53,19 +67,18 @@ All data endpoints accept `?format=json` or `Accept: application/json`.
 
 ## Indexer
 
-The background task polls the chain head every `INDEX_POLL_SECONDS` and indexes
-up to `INDEX_BATCH` blocks per cycle in two phases:
+Two background loops share a single SQLite writer task:
 
-1. **Forward** — new blocks at the tip.
+1. **Forward** — new blocks at the tip, driven by the WebSocket head feed (or
+   polling fallback), indexed as soon as they appear.
 2. **Backfill** — older blocks, descending (resumes from the lowest stored
    block after a restart, so an interrupted backfill is not abandoned).
 
 For each block it stores the raw block, every transaction (with receipt and
-flattened `debug_traceBlockByNumber` call tree when available), and decodes
-TIP-20 `Transfer` / `TransferWithMemo` events into the `transfer_events` table
-so address and token transfer tabs have data. Token metadata (name, symbol,
-decimals, total supply) is lazy-fetched via `eth_call` whenever a fee token
-appears.
+flattened call tree when tracing is available), and decodes TIP-20 `Transfer`
+/ `TransferWithMemo` events into the `transfer_events` table so address and
+token transfer tabs have data. Token metadata (name, symbol, decimals, total
+supply) is fetched via `eth_call` whenever a fee token appears.
 
 ## Tests
 
@@ -86,8 +99,9 @@ endpoints end to end.
 ```
 src/
   main.rs       entry point (server + indexer)
-  config.rs     settings
+  config.rs     settings (RPC, WS, DB, indexer)
   rpc.rs        async JSON-RPC client
+  ws.rs         WebSocket newHeads feed + polling fallback
   parse.rs      raw RPC → storage models
   db.rs         SQLite layer
   decoder.rs    ABI decoder, events, traces

@@ -1,5 +1,6 @@
 //! Async JSON-RPC client, mirroring `app/rpc.py`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -98,6 +99,73 @@ impl ChainRpc {
         Ok(body.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// Send several JSON-RPC calls in a single HTTP request. Results come back
+    /// in request order, each either `Ok(result)` or the per-call error.
+    pub async fn batch_call(
+        &self,
+        calls: Vec<(String, Value)>,
+    ) -> Result<Vec<Result<Value, RpcError>>> {
+        let payload: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (method, params))| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": i as u64 + 1,
+                    "method": method,
+                    "params": params,
+                })
+            })
+            .collect();
+        let resp = self
+            .client
+            .post(&self.url)
+            .json(&payload)
+            .send()
+            .await
+            .context("batch RPC request failed")?;
+        let body: Value = resp
+            .json()
+            .await
+            .context("batch RPC response was not JSON")?;
+        let items = body
+            .as_array()
+            .context("batch RPC response is not an array")?;
+        let mut by_id: HashMap<u64, &Value> = HashMap::with_capacity(items.len());
+        for item in items {
+            if let Some(id) = item.get("id").and_then(Value::as_u64) {
+                by_id.insert(id, item);
+            }
+        }
+        let mut out = Vec::with_capacity(calls.len());
+        for i in 0..calls.len() {
+            let id = i as u64 + 1;
+            match by_id.get(&id) {
+                Some(item) => {
+                    if let Some(err) = item.get("error").filter(|e| !e.is_null()) {
+                        out.push(Err(RpcError {
+                            code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
+                            message: err
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            data: err.get("data").cloned(),
+                        }));
+                    } else {
+                        out.push(Ok(item.get("result").cloned().unwrap_or(Value::Null)));
+                    }
+                }
+                None => out.push(Err(RpcError {
+                    code: -32603,
+                    message: "no response for batched request".into(),
+                    data: None,
+                })),
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn eth_block_number(&self) -> Result<u64> {
         let result = self.call("eth_blockNumber", json!([])).await?;
         hex_to_u64(&result).context("invalid eth_blockNumber result")
@@ -142,6 +210,45 @@ impl ChainRpc {
         } else {
             Ok(Some(result))
         }
+    }
+
+    /// All receipts for a block in a single call (`eth_getBlockReceipts`).
+    pub async fn eth_get_block_receipts(&self, num: u64) -> Result<Option<Vec<Value>>> {
+        let result = self
+            .call("eth_getBlockReceipts", json!([format!("0x{num:x}")]))
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(result.as_array().cloned().unwrap_or_default()))
+        }
+    }
+
+    /// Fetch receipts for a block: prefer the single `eth_getBlockReceipts`
+    /// call, fall back to one batched request of per-transaction receipts.
+    pub async fn fetch_block_receipts(
+        &self,
+        num: u64,
+        tx_hashes: &[String],
+    ) -> Result<Option<Vec<Value>>> {
+        if tx_hashes.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if let Ok(Some(receipts)) = self.eth_get_block_receipts(num).await {
+            if !receipts.is_empty() {
+                return Ok(Some(receipts));
+            }
+        }
+        let calls: Vec<(String, Value)> = tx_hashes
+            .iter()
+            .map(|h| ("eth_getTransactionReceipt".into(), json!([h])))
+            .collect();
+        let results = self.batch_call(calls).await?;
+        let receipts: Vec<Value> = results
+            .into_iter()
+            .filter_map(|r| r.ok().filter(|v| !v.is_null()))
+            .collect();
+        Ok(Some(receipts))
     }
 
     pub async fn eth_get_transaction_by_hash(&self, tx_hash: &str) -> Result<Option<Value>> {

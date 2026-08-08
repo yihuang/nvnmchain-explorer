@@ -128,8 +128,7 @@ pub fn lock<'a>(db: &'a Db) -> MutexGuard<'a, Connection> {
 // Blocks
 // ---------------------------------------------------------------------------
 
-pub fn save_block(db: &Db, block: &Block) -> Result<()> {
-    let conn = lock(db);
+fn upsert_block(conn: &Connection, block: &Block) -> Result<()> {
     conn.execute(
         r#"
         INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, miner, tx_count, raw, created_at)
@@ -152,6 +151,36 @@ pub fn save_block(db: &Db, block: &Block) -> Result<()> {
             block.created_at,
         ],
     )?;
+    Ok(())
+}
+
+pub fn save_block(db: &Db, block: &Block) -> Result<()> {
+    let conn = lock(db);
+    upsert_block(&conn, block)
+}
+
+/// Persist one indexed block atomically: the block, its transactions,
+/// transfer events, and any token metadata in a single SQLite transaction.
+pub fn save_block_bundle(
+    db: &Db,
+    block: &Block,
+    txs: &[Transaction],
+    transfers: &[TransferEvent],
+    tokens: &[crate::tokens::TokenMeta],
+) -> Result<()> {
+    let mut conn = lock(db);
+    let txn = conn.transaction().context("begin block transaction")?;
+    upsert_block(&txn, block)?;
+    for tx in txs {
+        upsert_transaction(&txn, tx)?;
+    }
+    for transfer in transfers {
+        insert_transfer(&txn, transfer)?;
+    }
+    for meta in tokens {
+        upsert_token_meta(&txn, meta)?;
+    }
+    txn.commit().context("commit block transaction")?;
     Ok(())
 }
 
@@ -231,8 +260,7 @@ pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
 // Transactions
 // ---------------------------------------------------------------------------
 
-pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
-    let conn = lock(db);
+fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
     conn.execute(
         r#"
         INSERT INTO transactions (
@@ -283,6 +311,11 @@ pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
+    let conn = lock(db);
+    upsert_transaction(&conn, tx)
 }
 
 const TX_COLS: &str = "hash, block_number, block_hash, position, from_addr, to_addr, status, gas_limit, gas_used, gas_price, max_fee_per_gas, max_priority_fee_per_gas, base_fee, contract_address, fee_token, fee_amount, nonce, nonce_key, value, chain_id, tx_type, input, raw, trace_data, receipt_data, timestamp, created_at";
@@ -390,8 +423,7 @@ pub fn get_address_transaction_count(db: &Db, address: &str) -> i64 {
 // Token metadata
 // ---------------------------------------------------------------------------
 
-pub fn save_token_metadata(db: &Db, meta: &crate::tokens::TokenMeta) -> Result<()> {
-    let conn = lock(db);
+fn upsert_token_meta(conn: &Connection, meta: &crate::tokens::TokenMeta) -> Result<()> {
     let ts = now_ts();
     conn.execute(
         r#"
@@ -404,6 +436,11 @@ pub fn save_token_metadata(db: &Db, meta: &crate::tokens::TokenMeta) -> Result<(
         params![meta.address, meta.name, meta.symbol, meta.decimals, meta.currency, meta.total_supply, ts],
     )?;
     Ok(())
+}
+
+pub fn save_token_metadata(db: &Db, meta: &crate::tokens::TokenMeta) -> Result<()> {
+    let conn = lock(db);
+    upsert_token_meta(&conn, meta)
 }
 
 fn row_to_token(row: &rusqlite::Row) -> rusqlite::Result<TokenMetadata> {
@@ -459,8 +496,7 @@ pub fn get_token_count(db: &Db) -> i64 {
 // Transfer events
 // ---------------------------------------------------------------------------
 
-pub fn save_transfer(db: &Db, transfer: &TransferEvent) -> Result<()> {
-    let conn = lock(db);
+fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<()> {
     conn.execute(
         "INSERT INTO transfer_events (tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -477,6 +513,11 @@ pub fn save_transfer(db: &Db, transfer: &TransferEvent) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+pub fn save_transfer(db: &Db, transfer: &TransferEvent) -> Result<()> {
+    let conn = lock(db);
+    insert_transfer(&conn, transfer)
 }
 
 fn row_to_transfer(row: &rusqlite::Row) -> rusqlite::Result<TransferEvent> {

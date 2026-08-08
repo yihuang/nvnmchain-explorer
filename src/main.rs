@@ -6,7 +6,7 @@ use tracing::info;
 
 use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db};
-use nvnmchain_explorer::indexer;
+use nvnmchain_explorer::indexer::{self, IndexerConfig};
 use nvnmchain_explorer::rpc::ChainRpc;
 use nvnmchain_explorer::web;
 
@@ -30,13 +30,15 @@ async fn main() -> anyhow::Result<()> {
     let rpc = ChainRpc::from_settings(&cfg)?;
     let tera = web::build_tera(db.clone())?;
 
-    // Background indexer: forward tip + backfill, never blocks serving.
+    // Background indexer: instant heads via WebSocket (poll fallback),
+    // concurrent block fetching, serialized SQLite writes.
     let indexer_rpc = ChainRpc::from_settings(&cfg)?;
     let indexer_db = db.clone();
-    let poll_seconds = cfg.poll_seconds;
-    let batch_size = cfg.batch_size;
+    let indexer_cfg = IndexerConfig::from_settings(&cfg);
+    let ws_url = cfg.ws_url.clone();
     tokio::spawn(async move {
-        indexer::run_forever(indexer_rpc, indexer_db, poll_seconds, batch_size).await
+        info!("indexer websocket feed: {ws_url}");
+        indexer::run_forever(indexer_rpc, indexer_db, indexer_cfg).await
     });
 
     let state = web::AppState {

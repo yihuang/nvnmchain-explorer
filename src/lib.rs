@@ -10,3 +10,4 @@ pub mod parse;
 pub mod rpc;
 pub mod tokens;
 pub mod web;
+pub mod ws;

@@ -5,12 +5,15 @@
 use std::env;
 
 pub const DEFAULT_RPC_URL: &str = "https://rpc.nvnm.canary.mantrachain.dev";
+pub const DEFAULT_WS_URL: &str = "wss://ws.nvnm.canary.mantrachain.dev";
 /// Chain id reported by the RPC above (`eth_chainId` → 0xc0316).
 pub const DEFAULT_CHAIN_ID: u64 = 787_222;
 
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub rpc_url: String,
+    pub ws_url: String,
+    pub index_ws: bool,
     pub chain_id: u64,
     pub host: String,
     pub port: u16,
@@ -18,10 +21,12 @@ pub struct Settings {
     pub max_cached_blocks: u64,
     pub recent_block_count: usize,
     pub recent_tx_count: usize,
-    /// Seconds between indexer poll cycles.
+    /// Seconds between poll cycles when the WebSocket feed is unavailable.
     pub poll_seconds: f64,
     /// Blocks indexed per poll cycle (forward and backfill each).
     pub batch_size: u64,
+    /// Max blocks fetched in parallel by the indexer.
+    pub index_concurrency: usize,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -60,6 +65,10 @@ impl Settings {
     pub fn from_env() -> Self {
         Self {
             rpc_url: rpc_url(),
+            ws_url: env_or("WS_URL", DEFAULT_WS_URL),
+            index_ws: env::var("INDEX_WS")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true),
             chain_id: env_u64("CHAIN_ID", DEFAULT_CHAIN_ID),
             host: env_or("HOST", "0.0.0.0"),
             port: env_u64("PORT", 8080) as u16,
@@ -67,8 +76,9 @@ impl Settings {
             max_cached_blocks: env_u64("MAX_CACHED_BLOCKS", 100_000),
             recent_block_count: env_usize("RECENT_BLOCK_COUNT", 15),
             recent_tx_count: env_usize("RECENT_TX_COUNT", 15),
-            poll_seconds: env_f64("INDEX_POLL_SECONDS", 3.0),
+            poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0),
             batch_size: env_u64("INDEX_BATCH", 5),
+            index_concurrency: env_usize("INDEX_CONCURRENCY", 32),
         }
     }
 }
