@@ -196,6 +196,7 @@ fn balance_changes_from_receipt() {
         value: "0".into(),
         chain_id: 0,
         tx_type: 0,
+        method_id: "0x".into(),
         input: "0x".into(),
         raw: None,
         trace_data: None,

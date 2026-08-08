@@ -138,24 +138,26 @@ fn infer_currency(symbol: &str) -> String {
 
 /// Format a token amount with up to six significant decimal places.
 pub fn format_token_amount(amount: &str, decimals: i64) -> String {
-    let amount: i128 = match amount.parse() {
-        Ok(n) => n,
-        Err(_) => return "0".into(),
-    };
-    if amount == 0 {
+    let amount = num_bigint::BigInt::parse_bytes(amount.as_bytes(), 10)
+        .unwrap_or_else(|| num_bigint::BigInt::from(0));
+    if amount.sign() == num_bigint::Sign::NoSign {
         return "0".into();
     }
     let decimals = decimals.clamp(0, 30) as u32;
-    let divisor = 10i128.checked_pow(decimals).unwrap_or(i128::MAX);
-    if divisor == 0 || divisor == i128::MAX {
+    let divisor = num_bigint::BigInt::from(10u8).pow(decimals);
+    if divisor.sign() == num_bigint::Sign::NoSign {
         return amount.to_string();
     }
-    let integer_part = amount / divisor;
-    let fractional_part = amount % divisor;
-    if fractional_part == 0 {
+    let integer_part = &amount / &divisor;
+    let fractional_part = &amount % &divisor;
+    if fractional_part.sign() == num_bigint::Sign::NoSign {
         return integer_part.to_string();
     }
-    let mut frac = fractional_part.abs().to_string();
+    let mut frac = if fractional_part.sign() == num_bigint::Sign::Minus {
+        (-&fractional_part).to_string()
+    } else {
+        fractional_part.to_string()
+    };
     if (frac.len() as u32) < decimals {
         frac = format!("{}{}", "0".repeat(decimals as usize - frac.len()), frac);
     }

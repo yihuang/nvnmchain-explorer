@@ -2,85 +2,154 @@
 {% block title %}Explore - nvnmchain Explorer{% endblock %}
 {% block content %}
 
-<!-- Stats -->
-<div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-    <div class="card card-body text-center">
-        <div class="stat-value accent">{% if recent_blocks %}{{ latest_num }}{% else %}—{% endif %}</div>
+<!-- Network stats -->
+<div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 mb-8">
+    <div class="card card-body">
+        <div class="stat-value accent">{% if stats %}{{ stats.latest_block | fallback(value=latest_num) }}{% else %}{{ latest_num }}{% endif %}</div>
         <div class="stat-label">Latest Block</div>
     </div>
-    <div class="card card-body text-center">
-        <div class="stat-value">{{ recent_blocks | length }}</div>
-        <div class="stat-label">Recent Blocks</div>
+    <div class="card card-body">
+        <div class="stat-value">{% if stats %}{{ stats.avg_block_time_display }}{% else %}—{% endif %}</div>
+        <div class="stat-label">Block Time</div>
     </div>
-    <div class="card card-body text-center">
-        <div class="stat-value">{{ recent_txs | length }}</div>
-        <div class="stat-label">Recent Txns</div>
+    <div class="card card-body">
+        <div class="stat-value">{% if stats %}{{ stats.tps_display }}{% else %}—{% endif %}</div>
+        <div class="stat-label">TPS (100 blk)</div>
     </div>
-    <div class="card card-body text-center">
-        <div class="stat-value">—</div>
-        <div class="stat-label">TPS</div>
+    <div class="card card-body">
+        <div class="stat-value">{% if stats %}{{ stats.gas_util_display }}{% else %}—{% endif %}</div>
+        <div class="stat-label">Gas Utilization</div>
+    </div>
+    <div class="card card-body">
+        <div class="stat-value">{% if stats %}{{ stats.total_txns }}{% else %}—{% endif %}</div>
+        <div class="stat-label">Total Txns</div>
+    </div>
+    <div class="card card-body">
+        <div class="stat-value">{% if stats %}{{ stats.token_count }}{% else %}—{% endif %}</div>
+        <div class="stat-label">Tokens</div>
     </div>
 </div>
+
+<!-- Activity sparklines -->
+{% if recent_blocks %}
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-8">
+    <div class="card">
+        <div class="card-header flex items-center justify-between">
+            <span>Transactions per block <span class="text-faint font-normal">(last {{ recent_blocks | length }})</span></span>
+        </div>
+        <div class="card-body">
+            <svg class="spark w-full" viewBox="0 0 160 32" preserveAspectRatio="none" style="height:64px;">
+                <defs>
+                    <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stop-color="#6ea8ff"/>
+                        <stop offset="100%" stop-color="#6ea8ff" stop-opacity="0"/>
+                    </linearGradient>
+                </defs>
+                <polygon class="spark-area" points="0,32 {{ spark_tx }} 160,32"/>
+                <polyline points="{{ spark_tx }}"/>
+            </svg>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header flex items-center justify-between">
+            <span>Gas utilization % <span class="text-faint font-normal">(last {{ recent_blocks | length }})</span></span>
+        </div>
+        <div class="card-body">
+            <svg class="spark gas w-full" viewBox="0 0 160 32" preserveAspectRatio="none" style="height:64px;">
+                <defs>
+                    <linearGradient id="sparkFillGas" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stop-color="#a78bfa"/>
+                        <stop offset="100%" stop-color="#a78bfa" stop-opacity="0"/>
+                    </linearGradient>
+                </defs>
+                <polygon class="spark-area" points="0,32 {{ spark_gas }} 160,32" style="fill:url(#sparkFillGas);"/>
+                <polyline points="{{ spark_gas }}"/>
+            </svg>
+        </div>
+    </div>
+</div>
+{% endif %}
 
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
     <!-- Recent Blocks -->
     <div class="card">
         <div class="card-header flex items-center justify-between">
-            <span>Blocks</span>
-            <a href="/blocks" class="text-xs text-blue-400 font-normal">View all →</a>
+            <span>Latest Blocks</span>
+            <a href="/blocks" class="text-xs text-blue-400 font-normal hover:text-blue-300">View all →</a>
         </div>
+        {% if recent_blocks %}
         <div>
-            {% if recent_blocks %}
             {% for block in recent_blocks %}
-            <div class="t-row flex items-center px-4 py-3 text-sm">
-                <div class="w-20 font-mono text-xs">
-                    <a href="/block/{{ block.number }}" class="text-blue-400 hover:text-blue-300">
-                        #{{ block.number }}
-                    </a>
+            <div class="t-row flex items-center px-4 py-3 gap-3">
+                <div class="w-24 shrink-0">
+                    <a href="/block/{{ block.number }}" class="mono text-sm text-blue-400 hover:text-blue-300">#{{ block.number }}</a>
                 </div>
-                <div class="flex-1 font-mono text-xs text-dim truncate px-2">
-                    {{ truncate_hash(h=block.hash) }}
+                <div class="flex-1 min-w-0">
+                    <a href="/block/{{ block.number }}" class="mono text-xs text-dim hover:text-blue-300 block truncate">{{ block.hash }}</a>
+                    <div class="flex items-center gap-2 mt-1">
+                        {% if block.tx_count > 0 %}
+                        <span class="badge badge-info">{{ block.tx_count }} txns</span>
+                        {% else %}
+                        <span class="badge text-faint" style="background:rgba(255,255,255,0.04);">empty</span>
+                        {% endif %}
+                        {% if block.gas_limit > 0 %}
+                        <div class="gas-bar flex-1 max-w-[120px]">
+                            <div style="width: {{ block.gas_used * 100 / block.gas_limit }}%;"></div>
+                        </div>
+                        {% endif %}
+                    </div>
                 </div>
-                <div class="w-20 text-xs text-dim text-right">
-                    {{ format_time_ago(timestamp=block.timestamp) }}
-                </div>
-                <div class="w-16 text-xs text-dim text-right">
-                    {{ block.tx_count }} txns
-                </div>
+                <div class="text-xs text-dim shrink-0">{{ format_time_ago(timestamp=block.timestamp) }}</div>
             </div>
             {% endfor %}
-            {% else %}
-            <div class="px-4 py-6 text-center text-dim text-sm">No blocks cached yet</div>
-            {% endif %}
         </div>
+        {% else %}
+        <div class="card-body text-center text-dim text-sm py-10">
+            No blocks cached yet — the indexer is syncing.
+        </div>
+        {% endif %}
     </div>
 
     <!-- Recent Transactions -->
     <div class="card">
-        <div class="card-header">
-            <span>Transactions</span>
+        <div class="card-header flex items-center justify-between">
+            <span>Latest Transactions</span>
         </div>
+        {% if recent_txs %}
         <div>
-            {% if recent_txs %}
             {% for tx in recent_txs %}
-            <div class="t-row flex items-center px-4 py-3 text-sm">
-                <div class="flex-1 min-w-0">
-                    <a href="/tx/{{ tx.hash }}" class="font-mono text-xs text-blue-400 hover:text-blue-300">
+            <div class="t-row px-4 py-3">
+                <div class="flex items-center gap-2 mb-1">
+                    <a href="/tx/{{ tx.hash }}" class="mono text-xs text-blue-400 hover:text-blue-300 truncate">
                         {{ truncate_hash(h=tx.hash, prefix=10, suffix=6) }}
                     </a>
-                    <div class="text-xs text-dim truncate mt-0.5">
-                        {{ truncate_hash(h=tx.from_addr) }} → {{ truncate_hash(h=tx.to_addr) }}
-                    </div>
+                    {% if tx.status == 1 %}
+                    <span class="badge badge-success">ok</span>
+                    {% else %}
+                    <span class="badge badge-error">fail</span>
+                    {% endif %}
                 </div>
-                <div class="w-16 text-xs text-dim text-right ml-2">
-                    {{ format_time_ago(timestamp=tx.timestamp) }}
+                <div class="flex items-center gap-1.5 text-xs mono truncate">
+                    <a href="{{ get_address_url(address=tx.from_addr) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=tx.from_addr) }}</a>
+                    <span class="text-faint">→</span>
+                    {% if tx.to_addr %}
+                    <a href="{{ get_address_url(address=tx.to_addr) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=tx.to_addr) }}</a>
+                    {% else %}
+                    <span class="text-faint">create</span>
+                    {% endif %}
+                </div>
+                <div class="text-xs text-faint mt-1">
+                    block <a href="/block/{{ tx.block_number }}" class="mono text-blue-400 hover:text-blue-300">{{ tx.block_number }}</a>
+                    <span class="mx-1">·</span>{{ format_time_ago(timestamp=tx.timestamp) }}
                 </div>
             </div>
             {% endfor %}
-            {% else %}
-            <div class="px-4 py-6 text-center text-dim text-sm">No transactions cached yet</div>
-            {% endif %}
         </div>
+        {% else %}
+        <div class="card-body text-center text-dim text-sm py-10">
+            No transactions cached yet.
+        </div>
+        {% endif %}
     </div>
 </div>
 {% endblock %}

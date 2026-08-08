@@ -27,6 +27,10 @@ pub struct Settings {
     pub batch_size: u64,
     /// Max blocks fetched in parallel by the indexer.
     pub index_concurrency: usize,
+    /// Symbol shown for the native gas/currency token.
+    pub native_symbol: String,
+    /// Seconds between background recomputes of the home-page stats blob.
+    pub stats_interval_seconds: f64,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -79,6 +83,8 @@ impl Settings {
             poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0),
             batch_size: env_u64("INDEX_BATCH", 5),
             index_concurrency: env_usize("INDEX_CONCURRENCY", 32),
+            native_symbol: env_or("NATIVE_SYMBOL", "OM"),
+            stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0),
         }
     }
 }

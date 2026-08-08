@@ -6,9 +6,11 @@
 //! SQLite writer, one transaction per block.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use rusqlite::params;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -28,6 +30,7 @@ pub struct IndexerConfig {
     pub concurrency: usize,
     pub ws_url: String,
     pub index_ws: bool,
+    pub stats_interval: Duration,
 }
 
 impl IndexerConfig {
@@ -38,6 +41,7 @@ impl IndexerConfig {
             concurrency: s.index_concurrency.max(1),
             ws_url: s.ws_url.clone(),
             index_ws: s.index_ws,
+            stats_interval: Duration::from_secs_f64(s.stats_interval_seconds.max(1.0)),
         }
     }
 }
@@ -53,6 +57,16 @@ pub struct BlockBundle {
 /// Fetch a block and everything attached to it: transactions, receipts
 /// (one batched call), traces (one call), transfers, and fee-token metadata.
 pub async fn fetch_block_bundle(rpc: &ChainRpc, block_num: u64) -> Result<Option<BlockBundle>> {
+    fetch_block_bundle_with_cache(rpc, Arc::new(Mutex::new(HashSet::new())), block_num).await
+}
+
+/// Like [`fetch_block_bundle`], but skips token-metadata fetches for addresses
+/// already known to the indexer (shared across concurrent block tasks).
+pub async fn fetch_block_bundle_with_cache(
+    rpc: &ChainRpc,
+    known_tokens: Arc<Mutex<HashSet<String>>>,
+    block_num: u64,
+) -> Result<Option<BlockBundle>> {
     let Some(raw_block) = rpc.eth_get_block_by_number(block_num, true).await? else {
         warn!("block {block_num} not found");
         return Ok(None);
@@ -105,7 +119,7 @@ pub async fn fetch_block_bundle(rpc: &ChainRpc, block_num: u64) -> Result<Option
 
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
-    let mut fee_tokens: HashSet<String> = HashSet::new();
+    let mut transfer_tokens: HashSet<String> = HashSet::new();
 
     for tx_data in &raw_txs {
         let tx_hash = tx_data.get("hash").and_then(Value::as_str).unwrap_or("");
@@ -118,23 +132,40 @@ pub async fn fetch_block_bundle(rpc: &ChainRpc, block_num: u64) -> Result<Option
             tx.trace_data = Some(serde_json::to_string(flat).unwrap_or_else(|_| "[]".into()));
         }
         if let Some(receipt) = receipt_by_hash.get(tx_hash) {
-            apply_receipt(&mut tx, receipt, &mut transfers, &mut fee_tokens);
+            apply_receipt(&mut tx, receipt, &mut transfers, &mut transfer_tokens);
         }
         txs.push(tx);
     }
 
-    // Fee-token metadata is network I/O; fetch concurrently, best-effort.
+    // Token metadata (fee tokens + transfer tokens) is network I/O; fetch
+    // concurrently for addresses the indexer hasn't seen yet, best-effort.
     let mut tokens = Vec::new();
-    if !fee_tokens.is_empty() {
+    let mut unseen: Vec<String> = Vec::new();
+    for addr in &transfer_tokens {
+        if !known_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(addr)
+        {
+            unseen.push(addr.clone());
+        }
+    }
+    if !unseen.is_empty() {
         let mut set = tokio::task::JoinSet::new();
-        for addr in &fee_tokens {
+        for addr in &unseen {
             let rpc = rpc.clone();
             let addr = addr.clone();
             set.spawn(async move { fetch_token_metadata(&rpc, &addr).await });
         }
         while let Some(res) = set.join_next().await {
             match res {
-                Ok(meta) => tokens.push(meta),
+                Ok(meta) => {
+                    known_tokens
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(meta.address.clone());
+                    tokens.push(meta);
+                }
                 Err(e) => warn!("token metadata task failed: {e:#}"),
             }
         }
@@ -152,7 +183,7 @@ fn apply_receipt(
     tx: &mut Transaction,
     receipt: &Value,
     transfers: &mut Vec<TransferEvent>,
-    fee_tokens: &mut HashSet<String>,
+    transfer_tokens: &mut HashSet<String>,
 ) {
     tx.receipt_data = Some(serde_json::to_string(receipt).unwrap_or_else(|_| "{}".into()));
     tx.status = receipt
@@ -164,11 +195,12 @@ fn apply_receipt(
         .map(crate::rpc::parse_int_any)
         .unwrap_or(0);
     if let Some(addr) = receipt.get("contractAddress").and_then(Value::as_str) {
-        tx.contract_address = Some(addr.to_string());
+        tx.contract_address = Some(checksum_address(addr));
     }
     if let Some(fee_token) = receipt.get("feeToken").and_then(Value::as_str) {
-        tx.fee_token = Some(fee_token.to_string());
-        fee_tokens.insert(fee_token.to_string());
+        let fee_token = checksum_address(fee_token);
+        tx.fee_token = Some(fee_token.clone());
+        transfer_tokens.insert(fee_token);
     }
     if let Some(fee_amount) = receipt.get("feeAmount") {
         tx.fee_amount = match fee_amount {
@@ -200,9 +232,10 @@ fn apply_receipt(
         let Some(decoded) = decode_event(log) else {
             continue;
         };
-        if decoded.name.as_deref() != Some("Transfer")
-            && decoded.name.as_deref() != Some("TransferWithMemo")
-        {
+        if !matches!(
+            decoded.name.as_deref(),
+            Some("Transfer") | Some("TransferWithMemo")
+        ) {
             continue;
         }
         let mut from = String::new();
@@ -214,6 +247,24 @@ fn apply_receipt(
                 "to" => to = p.value.clone(),
                 "amount" => amount = p.value.clone(),
                 _ => {}
+            }
+        }
+        // The receipt often omits `feeAmount`; the fee is settled as a
+        // Transfer to the Fee Manager, so derive it from that log.
+        if tx.fee_amount.parse::<i64>().map(|n| n <= 0).unwrap_or(true) {
+            let token = log
+                .get("address")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_lowercase();
+            let fee_manager = crate::decoder::FEE_MANAGER_ADDRESS.to_lowercase();
+            let fee_token_matches = tx
+                .fee_token
+                .as_deref()
+                .map(|f| f.to_lowercase() == token)
+                .unwrap_or(false);
+            if fee_token_matches && to.to_lowercase() == fee_manager && !amount.is_empty() {
+                tx.fee_amount = amount.clone();
             }
         }
         if from.is_empty() || to.is_empty() || amount.is_empty() {
@@ -230,13 +281,14 @@ fn apply_receipt(
             tx_hash: tx.hash.clone(),
             block_number: tx.block_number,
             log_index,
-            token_addr: token,
+            token_addr: token.clone(),
             from_addr: from,
             to_addr: to,
             amount,
             timestamp: tx.timestamp,
             created_at: db::now_ts(),
         });
+        transfer_tokens.insert(token.clone());
     }
 }
 
@@ -259,9 +311,10 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
 async fn index_block_send(
     rpc: &ChainRpc,
     tx: &mpsc::Sender<BlockBundle>,
+    known_tokens: Arc<Mutex<HashSet<String>>>,
     block_num: u64,
 ) -> Result<()> {
-    let Some(bundle) = fetch_block_bundle(rpc, block_num).await? else {
+    let Some(bundle) = fetch_block_bundle_with_cache(rpc, known_tokens, block_num).await? else {
         return Ok(());
     };
     tx.send(bundle)
@@ -279,6 +332,7 @@ async fn index_range_concurrent(
     from: u64,
     to: u64,
     concurrency: usize,
+    known_tokens: Arc<Mutex<HashSet<String>>>,
 ) {
     if from > to {
         return;
@@ -290,9 +344,10 @@ async fn index_range_concurrent(
         while remaining > 0 && set.len() < concurrency {
             let rpc = rpc.clone();
             let tx = tx.clone();
+            let known = known_tokens.clone();
             let num = next;
             set.spawn(async move {
-                if let Err(e) = index_block_send(&rpc, &tx, num).await {
+                if let Err(e) = index_block_send(&rpc, &tx, known, num).await {
                     warn!("index_block({num}) failed: {e:#}");
                 }
             });
@@ -313,6 +368,7 @@ async fn forward_loop(
     db: Db,
     cfg: IndexerConfig,
     bundle_tx: mpsc::Sender<BlockBundle>,
+    known_tokens: Arc<Mutex<HashSet<String>>>,
 ) {
     let (head_tx, mut head_rx) = mpsc::channel::<u64>(256);
     let watcher_rpc = rpc.clone();
@@ -347,7 +403,15 @@ async fn forward_loop(
         }
         if head > sent {
             info!("new blocks: {sent} -> {head} (+{})", head - sent);
-            index_range_concurrent(&rpc, &bundle_tx, sent + 1, head, cfg.concurrency).await;
+            index_range_concurrent(
+                &rpc,
+                &bundle_tx,
+                sent + 1,
+                head,
+                cfg.concurrency,
+                known_tokens.clone(),
+            )
+            .await;
             sent = head;
         }
     }
@@ -359,6 +423,7 @@ async fn backfill_loop(
     db: Db,
     cfg: IndexerConfig,
     bundle_tx: mpsc::Sender<BlockBundle>,
+    known_tokens: Arc<Mutex<HashSet<String>>>,
 ) {
     info!(
         "backfill loop started (batch {}, concurrency {})",
@@ -389,7 +454,15 @@ async fn backfill_loop(
             }
         };
         let start = target.saturating_sub(cfg.batch).max(1);
-        index_range_concurrent(&rpc, &bundle_tx, start, target - 1, cfg.concurrency).await;
+        index_range_concurrent(
+            &rpc,
+            &bundle_tx,
+            start,
+            target - 1,
+            cfg.concurrency,
+            known_tokens.clone(),
+        )
+        .await;
 
         let new_min = db::get_min_block_number(&db).unwrap_or(0) as u64;
         if new_min >= target {
@@ -408,6 +481,44 @@ async fn backfill_loop(
 
 /// Run the indexer: one serialized DB writer plus forward and backfill loops.
 pub async fn run_forever(rpc: ChainRpc, db: Db, cfg: IndexerConfig) {
+    let stats_interval = cfg.stats_interval;
+    let stats_db = db.clone();
+    tokio::spawn(async move { stats_loop(stats_db, stats_interval).await });
+
+    // Seed the token-metadata cache and repair balances on legacy databases.
+    let known_tokens = Arc::new(Mutex::new(
+        db::get_all_token_addresses(&db).into_iter().collect(),
+    ));
+    let rebuild_db = db.clone();
+    tokio::spawn(async move {
+        let conn = db::lock(&rebuild_db);
+        let has_transfers = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM transfer_events LIMIT 1)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n != 0)
+            .unwrap_or(false);
+        let has_balances = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM token_balances LIMIT 1)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n != 0)
+            .unwrap_or(false);
+        drop(conn);
+        // Legacy databases have transfers but no incremental balances yet;
+        // rebuild once so holder counts and holdings stay correct.
+        if has_transfers && !has_balances {
+            let conn = db::lock(&rebuild_db);
+            if let Err(e) = db::rebuild_token_balances(&conn) {
+                warn!("token balance rebuild failed: {e:#}");
+            }
+        }
+    });
+
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
     let writer_db = db.clone();
     let writer = tokio::spawn(async move {
@@ -429,12 +540,14 @@ pub async fn run_forever(rpc: ChainRpc, db: Db, cfg: IndexerConfig) {
         db.clone(),
         cfg.clone(),
         bundle_tx.clone(),
+        known_tokens.clone(),
     ));
     let backfill = tokio::spawn(backfill_loop(
         rpc.clone(),
         db.clone(),
         cfg.clone(),
         bundle_tx.clone(),
+        known_tokens.clone(),
     ));
     drop(bundle_tx);
 
@@ -443,4 +556,98 @@ pub async fn run_forever(rpc: ChainRpc, db: Db, cfg: IndexerConfig) {
         r = backfill => { if let Err(e) = r { warn!("backfill loop ended: {e:#}"); } }
     }
     let _ = writer.await;
+}
+
+// ---------------------------------------------------------------------------
+// Precomputed network stats
+// ---------------------------------------------------------------------------
+
+/// Recompute the home-page stats blob into the `kv` table every interval so
+/// the web layer never has to scan history at request time.
+async fn stats_loop(db: Db, interval: Duration) {
+    loop {
+        if let Err(e) = compute_and_store_stats(&db) {
+            warn!("stats recompute failed: {e:#}");
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn compute_and_store_stats(db: &Db) -> Result<()> {
+    let conn = db::lock(db);
+    let now = db::now_ts();
+
+    let total_blocks: i64 = conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))?;
+    let total_txns: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))?;
+    let token_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM token_metadata", [], |r| r.get(0))?;
+    let txns_24h: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM transactions WHERE timestamp >= ?1",
+        params![now - 86400],
+        |r| r.get(0),
+    )?;
+    let blocks_24h: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM blocks WHERE timestamp >= ?1",
+        params![now - 86400],
+        |r| r.get(0),
+    )?;
+
+    // Rolling window over the newest blocks (cheap PK scan, no history sweep).
+    let window: i64 = 100;
+    let (min_ts, max_ts, tx_sum, gas_sum, gas_den, n): (i64, i64, i64, f64, f64, i64) = conn
+        .query_row(
+            "SELECT MIN(timestamp), MAX(timestamp), SUM(tx_count),
+                    SUM(CASE WHEN gas_limit > 0 THEN gas_used * 1.0 / gas_limit ELSE 0 END),
+                    SUM(CASE WHEN gas_limit > 0 THEN 1 ELSE 0 END),
+                    COUNT(*)
+             FROM (SELECT timestamp, tx_count, gas_used, gas_limit
+                   FROM blocks ORDER BY number DESC LIMIT ?1)",
+            params![window],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                    r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                    r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                ))
+            },
+        )
+        .unwrap_or((0, 0, 0, 0.0, 0.0, 0));
+
+    let span_secs = (max_ts - min_ts).max(1) as f64;
+    let avg_block_time_ms = if n > 1 {
+        span_secs / (n - 1) as f64 * 1000.0
+    } else {
+        0.0
+    };
+    let tps = if span_secs > 0.0 {
+        tx_sum as f64 / span_secs
+    } else {
+        0.0
+    };
+    let gas_util_pct = if gas_den > 0.0 {
+        gas_sum / gas_den * 100.0
+    } else {
+        0.0
+    };
+    let latest_block = conn.query_row("SELECT MAX(number) FROM blocks", [], |r| {
+        r.get::<_, Option<i64>>(0)
+    })?;
+
+    let stats = serde_json::json!({
+        "latest_block": latest_block,
+        "total_blocks": total_blocks,
+        "total_txns": total_txns,
+        "token_count": token_count,
+        "txns_24h": txns_24h,
+        "blocks_24h": blocks_24h,
+        "avg_block_time_ms": avg_block_time_ms,
+        "tps": tps,
+        "gas_util_pct": gas_util_pct,
+        "updated_at": now,
+    });
+    db::set_kv(&conn, "stats", &stats.to_string())?;
+    Ok(())
 }

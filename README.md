@@ -4,6 +4,11 @@ Blockchain explorer for the nvnm chain — the Mantra canary EVM network
 (chain id `0xc0316`) — with no native token (gas paid in ERC-20/TIP-20
 tokens).
 
+The UI is a dark, Blockscout-style dashboard: network stats with activity
+sparklines, gas-utilization bars, method badges on transactions, token
+holdings and holder counts, and decoded call/event views on transaction
+pages.
+
 Written in Rust with [axum](https://github.com/tokio-rs/axum) + [Tera](https://tera.netlify.app/),
 rusqlite (schema created on boot), an async reqwest JSON-RPC client, a
 self-contained ABIv2 decoder with keccak, and a tokio indexer (forward tip +
@@ -34,8 +39,12 @@ The indexer is built for a sub-second chain:
   per-transaction batch fallback), traces via `debug_traceBlockByNumber`, and
   blocks fetched concurrently (`INDEX_CONCURRENCY` in flight).
 - **Serialized SQLite writes** — every block (block row + txs + transfers +
-  token metadata) is persisted in one transaction by a single writer task,
-  measured at ~200 blocks/s while backfilling.
+  balances + token metadata) is persisted in one transaction by a single
+  writer task, measured at ~200 blocks/s while backfilling.
+- **Cheap pages** — network stats (block time, TPS, gas utilization, 24h
+  counts) are recomputed in the background into a `kv` row, and token
+  balances/holder counts are maintained incrementally per block, so no page
+  scans history at request time.
 
 ## Configuration (env vars)
 
@@ -50,6 +59,8 @@ The indexer is built for a sub-second chain:
 | `INDEX_POLL_SECONDS` | `1` | Poll interval when the WebSocket feed is unavailable |
 | `INDEX_BATCH` | `5` | Blocks indexed per cycle (forward + backfill) |
 | `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
+| `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
+| `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -76,11 +87,16 @@ Two background loops share a single SQLite writer task:
 2. **Backfill** — older blocks, descending (resumes from the lowest stored
    block after a restart, so an interrupted backfill is not abandoned).
 
-For each block it stores the raw block, every transaction (with receipt and
-flattened call tree when tracing is available), and decodes TIP-20 `Transfer`
-/ `TransferWithMemo` events into the `transfer_events` table so address and
-token transfer tabs have data. Token metadata (name, symbol, decimals, total
-supply) is fetched via `eth_call` whenever a fee token appears.
+For each block it stores the raw block plus indexed fields (base fee, size,
+extra data, consensus epoch/view, proposer), every transaction (with receipt,
+flattened call tree when tracing is available, and a method-id badge derived
+from the call data), and decodes TIP-20 `Transfer` / `TransferWithMemo` events
+into the `transfer_events` table so address and token transfer tabs have data.
+Fees are derived from the Fee Manager transfer when the receipt omits
+`feeAmount`. Token metadata (name, symbol, decimals, total supply) is fetched
+via `eth_call` for fee tokens and transfer tokens alike (deduplicated, so each
+token is fetched once), and token balances are applied incrementally so
+holder counts and address holdings stay exact without rescanning history.
 
 ## Tests
 

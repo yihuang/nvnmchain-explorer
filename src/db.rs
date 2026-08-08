@@ -11,6 +11,19 @@ use crate::models::{Block, TokenMetadata, Transaction, TransferEvent};
 
 pub type Db = Arc<Mutex<Connection>>;
 
+/// Add a column to an existing table when the schema predates it.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+    let cols: Vec<String> = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.filter_map(|c| c.ok()).collect()
+    };
+    if !cols.iter().any(|c| c == column) {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl};"))?;
+    }
+    Ok(())
+}
+
 pub fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -115,7 +128,50 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_transfer_token ON transfer_events(token_addr);
         CREATE INDEX IF NOT EXISTS idx_transfer_from ON transfer_events(from_addr);
         CREATE INDEX IF NOT EXISTS idx_transfer_to ON transfer_events(to_addr);
+
+        CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS token_balances (
+            token_addr TEXT NOT NULL,
+            holder_addr TEXT NOT NULL,
+            balance TEXT NOT NULL DEFAULT '0',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (token_addr, holder_addr)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances(holder_addr);
         "#,
+    )?;
+    // Schema migrations for databases created before these columns existed.
+    add_column_if_missing(
+        &conn,
+        "blocks",
+        "base_fee",
+        "base_fee TEXT NOT NULL DEFAULT '0'",
+    )?;
+    add_column_if_missing(&conn, "blocks", "size", "size INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        &conn,
+        "blocks",
+        "extra_data",
+        "extra_data TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(&conn, "blocks", "epoch", "epoch INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "blocks", "view", "view INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        &conn,
+        "blocks",
+        "proposer",
+        "proposer TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        &conn,
+        "transactions",
+        "method_id",
+        "method_id TEXT NOT NULL DEFAULT ''",
     )?;
     Ok(conn)
 }
@@ -125,17 +181,48 @@ pub fn lock<'a>(db: &'a Db) -> MutexGuard<'a, Connection> {
 }
 
 // ---------------------------------------------------------------------------
+// Key/value store (precomputed stats, etc.)
+// ---------------------------------------------------------------------------
+
+pub fn set_kv(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        params![key, value, now_ts()],
+    )?;
+    Ok(())
+}
+
+pub fn get_kv(db: &Db, key: &str) -> Option<String> {
+    let conn = lock(db);
+    conn.query_row("SELECT value FROM kv WHERE key=?1", params![key], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+}
+
+// ---------------------------------------------------------------------------
 // Blocks
 // ---------------------------------------------------------------------------
+
+const BLOCK_COLS: &str =
+    "number, hash, parent_hash, timestamp, gas_used, gas_limit, base_fee, size, extra_data, \
+     epoch, view, proposer, miner, tx_count, raw, created_at";
 
 fn upsert_block(conn: &Connection, block: &Block) -> Result<()> {
     conn.execute(
         r#"
-        INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit, miner, tx_count, raw, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        INSERT INTO blocks (number, hash, parent_hash, timestamp, gas_used, gas_limit,
+                            base_fee, size, extra_data, epoch, view, proposer,
+                            miner, tx_count, raw, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(number) DO UPDATE SET
             hash=excluded.hash, parent_hash=excluded.parent_hash, timestamp=excluded.timestamp,
-            gas_used=excluded.gas_used, gas_limit=excluded.gas_limit, miner=excluded.miner,
+            gas_used=excluded.gas_used, gas_limit=excluded.gas_limit, base_fee=excluded.base_fee,
+            size=excluded.size, extra_data=excluded.extra_data, epoch=excluded.epoch,
+            view=excluded.view, proposer=excluded.proposer, miner=excluded.miner,
             tx_count=excluded.tx_count, raw=excluded.raw
         "#,
         params![
@@ -145,6 +232,12 @@ fn upsert_block(conn: &Connection, block: &Block) -> Result<()> {
             block.timestamp,
             block.gas_used,
             block.gas_limit,
+            block.base_fee,
+            block.size,
+            block.extra_data,
+            block.epoch,
+            block.view,
+            block.proposer,
             block.miner,
             block.tx_count,
             block.raw,
@@ -177,6 +270,17 @@ pub fn save_block_bundle(
     for transfer in transfers {
         insert_transfer(&txn, transfer)?;
     }
+    apply_transfer_balances(&txn, transfers)?;
+    refresh_holder_counts(&txn, transfers)?;
+    for tx in txs {
+        if let Some(addr) = &tx.contract_address {
+            txn.execute(
+                "INSERT OR IGNORE INTO contract_labels (address, name, abi, is_token, is_precompile, created_at)
+                 VALUES (?1, '', '[]', 0, 0, ?2)",
+                params![addr, now_ts()],
+            )?;
+        }
+    }
     for meta in tokens {
         upsert_token_meta(&txn, meta)?;
     }
@@ -192,17 +296,23 @@ fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
         timestamp: row.get(3)?,
         gas_used: row.get(4)?,
         gas_limit: row.get(5)?,
-        miner: row.get(6)?,
-        tx_count: row.get(7)?,
-        raw: row.get(8)?,
-        created_at: row.get(9)?,
+        base_fee: row.get(6)?,
+        size: row.get(7)?,
+        extra_data: row.get(8)?,
+        epoch: row.get(9)?,
+        view: row.get(10)?,
+        proposer: row.get(11)?,
+        miner: row.get(12)?,
+        tx_count: row.get(13)?,
+        raw: row.get(14)?,
+        created_at: row.get(15)?,
     })
 }
 
 pub fn get_block_by_number(db: &Db, number: i64) -> Option<Block> {
     let conn = lock(db);
     conn.query_row(
-        "SELECT number, hash, parent_hash, timestamp, gas_used, gas_limit, miner, tx_count, raw, created_at FROM blocks WHERE number=?1",
+        &format!("SELECT {BLOCK_COLS} FROM blocks WHERE number=?1"),
         params![number],
         row_to_block,
     )
@@ -214,7 +324,7 @@ pub fn get_block_by_number(db: &Db, number: i64) -> Option<Block> {
 pub fn get_block_by_hash(db: &Db, hash: &str) -> Option<Block> {
     let conn = lock(db);
     conn.query_row(
-        "SELECT number, hash, parent_hash, timestamp, gas_used, gas_limit, miner, tx_count, raw, created_at FROM blocks WHERE hash=?1",
+        &format!("SELECT {BLOCK_COLS} FROM blocks WHERE hash=?1"),
         params![hash],
         row_to_block,
     )
@@ -226,7 +336,7 @@ pub fn get_block_by_hash(db: &Db, hash: &str) -> Option<Block> {
 pub fn get_latest_block(db: &Db) -> Option<Block> {
     let conn = lock(db);
     conn.query_row(
-        "SELECT number, hash, parent_hash, timestamp, gas_used, gas_limit, miner, tx_count, raw, created_at FROM blocks ORDER BY number DESC LIMIT 1",
+        &format!("SELECT {BLOCK_COLS} FROM blocks ORDER BY number DESC LIMIT 1"),
         [],
         row_to_block,
     )
@@ -245,9 +355,9 @@ pub fn get_min_block_number(db: &Db) -> Option<i64> {
 
 pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
     let conn = lock(db);
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT number, hash, parent_hash, timestamp, gas_used, gas_limit, miner, tx_count, raw, created_at FROM blocks ORDER BY number DESC LIMIT ?1",
-    ) else {
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT {BLOCK_COLS} FROM blocks ORDER BY number DESC LIMIT ?1"
+    )) else {
         return Vec::new();
     };
     let Ok(rows) = stmt.query_map(params![limit as i64], row_to_block) else {
@@ -267,8 +377,8 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
             hash, block_number, block_hash, position, from_addr, to_addr, status,
             gas_limit, gas_used, gas_price, max_fee_per_gas, max_priority_fee_per_gas,
             base_fee, contract_address, fee_token, fee_amount, nonce, nonce_key,
-            value, chain_id, tx_type, input, raw, trace_data, receipt_data, timestamp, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+            value, chain_id, tx_type, method_id, input, raw, trace_data, receipt_data, timestamp, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
         ON CONFLICT(hash) DO UPDATE SET
             block_number=excluded.block_number, block_hash=excluded.block_hash, position=excluded.position,
             from_addr=excluded.from_addr, to_addr=excluded.to_addr, status=excluded.status,
@@ -276,7 +386,7 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
             max_fee_per_gas=excluded.max_fee_per_gas, max_priority_fee_per_gas=excluded.max_priority_fee_per_gas,
             base_fee=excluded.base_fee, contract_address=excluded.contract_address, fee_token=excluded.fee_token,
             fee_amount=excluded.fee_amount, nonce=excluded.nonce, nonce_key=excluded.nonce_key,
-            value=excluded.value, chain_id=excluded.chain_id, tx_type=excluded.tx_type,
+            value=excluded.value, chain_id=excluded.chain_id, tx_type=excluded.tx_type, method_id=excluded.method_id,
             input=excluded.input, raw=excluded.raw, trace_data=excluded.trace_data,
             receipt_data=excluded.receipt_data, timestamp=excluded.timestamp
         "#,
@@ -302,6 +412,7 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
             tx.value,
             tx.chain_id,
             tx.tx_type,
+            tx.method_id,
             tx.input,
             tx.raw,
             tx.trace_data,
@@ -318,7 +429,7 @@ pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
     upsert_transaction(&conn, tx)
 }
 
-const TX_COLS: &str = "hash, block_number, block_hash, position, from_addr, to_addr, status, gas_limit, gas_used, gas_price, max_fee_per_gas, max_priority_fee_per_gas, base_fee, contract_address, fee_token, fee_amount, nonce, nonce_key, value, chain_id, tx_type, input, raw, trace_data, receipt_data, timestamp, created_at";
+const TX_COLS: &str = "hash, block_number, block_hash, position, from_addr, to_addr, status, gas_limit, gas_used, gas_price, max_fee_per_gas, max_priority_fee_per_gas, base_fee, contract_address, fee_token, fee_amount, nonce, nonce_key, value, chain_id, tx_type, method_id, input, raw, trace_data, receipt_data, timestamp, created_at";
 
 fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
     Ok(Transaction {
@@ -343,12 +454,13 @@ fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         value: row.get(18)?,
         chain_id: row.get(19)?,
         tx_type: row.get(20)?,
-        input: row.get(21)?,
-        raw: row.get(22)?,
-        trace_data: row.get(23)?,
-        receipt_data: row.get(24)?,
-        timestamp: row.get(25)?,
-        created_at: row.get(26)?,
+        method_id: row.get(21)?,
+        input: row.get(22)?,
+        raw: row.get(23)?,
+        trace_data: row.get(24)?,
+        receipt_data: row.get(25)?,
+        timestamp: row.get(26)?,
+        created_at: row.get(27)?,
     })
 }
 
@@ -492,6 +604,31 @@ pub fn get_token_count(db: &Db) -> i64 {
     .unwrap_or(0)
 }
 
+pub fn get_token_transfer_count(db: &Db, token_addr: &str) -> i64 {
+    let conn = lock(db);
+    conn.query_row(
+        "SELECT COUNT(*) FROM transfer_events WHERE lower(token_addr)=lower(?1)",
+        params![token_addr],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Find a token by exact symbol/name (case-insensitive), used by search.
+pub fn get_token_by_symbol_or_name(db: &Db, q: &str) -> Option<TokenMetadata> {
+    let conn = lock(db);
+    conn.query_row(
+        "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, \
+         holder_count, created_at, updated_at FROM token_metadata \
+         WHERE lower(symbol)=lower(?1) OR lower(name)=lower(?1) LIMIT 1",
+        params![q],
+        row_to_token,
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 // ---------------------------------------------------------------------------
 // Transfer events
 // ---------------------------------------------------------------------------
@@ -512,6 +649,121 @@ fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<()> {
             transfer.created_at,
         ],
     )?;
+    Ok(())
+}
+
+fn bigint(s: &str) -> num_bigint::BigInt {
+    num_bigint::BigInt::parse_bytes(s.as_bytes(), 10).unwrap_or_else(|| num_bigint::BigInt::from(0))
+}
+
+/// Apply a signed amount delta to one (token, holder) balance, removing the
+/// row when the balance hits zero so `holder_count` stays exact and the table
+/// stays small.
+fn adjust_balance(
+    conn: &Connection,
+    token: &str,
+    holder: &str,
+    delta: &num_bigint::BigInt,
+) -> Result<()> {
+    if delta.sign() == num_bigint::Sign::NoSign {
+        return Ok(());
+    }
+    let current = conn
+        .query_row(
+            "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
+            params![token, holder],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "0".into());
+    let new = bigint(&current) + delta;
+    if new.sign() == num_bigint::Sign::NoSign {
+        conn.execute(
+            "DELETE FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
+            params![token, holder],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO token_balances (token_addr, holder_addr, balance, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(token_addr, holder_addr) DO UPDATE SET
+                 balance=excluded.balance, updated_at=excluded.updated_at",
+            params![token, holder, new.to_string(), now_ts()],
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_transfer_balances(conn: &Connection, transfers: &[TransferEvent]) -> Result<()> {
+    for t in transfers {
+        let amount = bigint(&t.amount);
+        adjust_balance(conn, &t.token_addr, &t.from_addr, &-&amount)?;
+        adjust_balance(conn, &t.token_addr, &t.to_addr, &amount)?;
+    }
+    Ok(())
+}
+
+/// Keep `token_metadata.holder_count` in sync for tokens touched by this
+/// batch of transfers. Uses the primary-key index so it stays cheap.
+fn refresh_holder_counts(conn: &Connection, transfers: &[TransferEvent]) -> Result<()> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in transfers {
+        if !seen.insert(t.token_addr.clone()) {
+            continue;
+        }
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
+            params![t.token_addr],
+            |r| r.get::<_, i64>(0),
+        )?;
+        conn.execute(
+            "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
+            params![count, now_ts(), t.token_addr],
+        )?;
+    }
+    Ok(())
+}
+
+/// Rebuild `token_balances` + holder counts from the transfer history.
+/// Run once after upgrading a pre-existing database so incremental updates
+/// start from a correct state.
+pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM token_balances", [])?;
+    let mut stmt = conn.prepare(
+        "SELECT token_addr, from_addr, to_addr, amount FROM transfer_events ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut n = 0usize;
+    for row in rows {
+        let (token, from, to, amount) = row?;
+        let amount = bigint(&amount);
+        adjust_balance(conn, &token, &from, &-&amount)?;
+        adjust_balance(conn, &token, &to, &amount)?;
+        touched.insert(token);
+        n += 1;
+    }
+    for token in touched {
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
+            params![token],
+            |r| r.get::<_, i64>(0),
+        )?;
+        conn.execute(
+            "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
+            params![count, now_ts(), token],
+        )?;
+    }
+    tracing::info!("rebuilt token balances from {n} transfer events");
     Ok(())
 }
 
@@ -622,33 +874,92 @@ pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -
 // Holdings
 // ---------------------------------------------------------------------------
 
+/// Batch token metadata lookup; one query per ~100 addresses.
+pub fn get_tokens_metadata(
+    db: &Db,
+    addresses: &[String],
+) -> std::collections::HashMap<String, TokenMetadata> {
+    let mut out = std::collections::HashMap::new();
+    if addresses.is_empty() {
+        return out;
+    }
+    let conn = lock(db);
+    for chunk in addresses.chunks(100) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, \
+             holder_count, created_at, updated_at FROM token_metadata WHERE address IN ({placeholders})"
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let params = rusqlite::params_from_iter(chunk.iter().map(|a| a.as_str()));
+        let Ok(rows) = stmt.query_map(params, row_to_token) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            out.insert(row.address.clone(), row);
+        }
+    }
+    out
+}
+
+/// All token addresses known to the indexer (for cache seeding).
+pub fn get_all_token_addresses(db: &Db) -> Vec<String> {
+    let conn = lock(db);
+    let Ok(mut stmt) = conn.prepare("SELECT address FROM token_metadata") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+pub fn get_token_holder_count(db: &Db, token_addr: &str) -> i64 {
+    let conn = lock(db);
+    conn.query_row(
+        "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
+        params![token_addr],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Contract-label lookup (populated at index time for created contracts).
+pub fn get_contract_label(db: &Db, addr: &str) -> Option<String> {
+    let conn = lock(db);
+    conn.query_row(
+        "SELECT name FROM contract_labels WHERE address=?1",
+        params![addr],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 pub fn get_address_holdings(db: &Db, address: &str) -> Vec<Value> {
-    let balances: Vec<(String, i64)> = {
+    let balances: Vec<(String, String)> = {
         let conn = lock(db);
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT token_addr,
-                    SUM(CASE WHEN to_addr = ?1 THEN CAST(amount AS INTEGER)
-                             WHEN from_addr = ?1 THEN -CAST(amount AS INTEGER)
-                        END) as balance
-             FROM transfer_events
-             WHERE from_addr = ?1 OR to_addr = ?1
-             GROUP BY token_addr
-             HAVING balance != 0",
-        ) else {
+        let Ok(mut stmt) =
+            conn.prepare("SELECT token_addr, balance FROM token_balances WHERE holder_addr=?1")
+        else {
             return Vec::new();
         };
         let Ok(rows) = stmt.query_map(params![address], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         }) else {
             return Vec::new();
         };
         rows.filter_map(|r| r.ok()).collect()
     };
     let mut holdings = Vec::new();
+    let token_addrs: Vec<String> = balances.iter().map(|(a, _)| a.clone()).collect();
+    let metas = get_tokens_metadata(db, &token_addrs);
     for (token_addr, balance) in &balances {
-        let token_key = crate::decoder::checksum_address(token_addr);
-        if let Some(meta) = get_token_metadata(db, &token_key) {
-            let formatted = crate::tokens::format_token_amount(&balance.to_string(), meta.decimals);
+        if let Some(meta) = metas.get(token_addr) {
+            let formatted = crate::tokens::format_token_amount(balance, meta.decimals);
             holdings.push(json!({
                 "token": meta.address,
                 "name": meta.name,

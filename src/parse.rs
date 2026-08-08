@@ -15,6 +15,21 @@ pub fn parse_block(raw: &Value) -> Block {
         .and_then(Value::as_array)
         .map(|a| a.len() as i64)
         .unwrap_or(0);
+    let base_fee = raw
+        .get("baseFeePerGas")
+        .and_then(Value::as_str)
+        .and_then(|s| {
+            s.strip_prefix("0x")
+                .and_then(|h| num_bigint::BigInt::parse_bytes(h.as_bytes(), 16))
+                .map(|n| n.to_string())
+        })
+        .unwrap_or_else(|| "0".into());
+    let consensus = raw.get("consensusContext");
+    let proposer = consensus
+        .and_then(|c| c.get("proposer"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     Block {
         number,
         hash: str_field(raw, "hash"),
@@ -22,6 +37,18 @@ pub fn parse_block(raw: &Value) -> Block {
         timestamp: raw.get("timestamp").map(parse_int_any).unwrap_or(0),
         gas_used: raw.get("gasUsed").map(parse_int_any).unwrap_or(0),
         gas_limit: raw.get("gasLimit").map(parse_int_any).unwrap_or(0),
+        base_fee,
+        size: raw.get("size").map(parse_int_any).unwrap_or(0),
+        extra_data: str_field(raw, "extraData"),
+        epoch: consensus
+            .and_then(|c| c.get("epoch"))
+            .map(parse_int_any)
+            .unwrap_or(0),
+        view: consensus
+            .and_then(|c| c.get("view"))
+            .map(parse_int_any)
+            .unwrap_or(0),
+        proposer,
         miner: str_field(raw, "miner"),
         tx_count,
         raw: serde_json::to_string(raw).unwrap_or_else(|_| "{}".into()),
@@ -73,6 +100,24 @@ pub fn parse_transaction(tx: &Value, block: &Block) -> Transaction {
         })
         .unwrap_or_else(|| "0".into());
 
+    let input = {
+        let input = str_field(tx, "input");
+        let data = str_field(tx, "data");
+        if input.is_empty() && !data.is_empty() {
+            data
+        } else {
+            input
+        }
+    };
+    let method_id = if let Some(hex) = input.strip_prefix("0x") {
+        if hex.len() >= 8 {
+            format!("0x{}", &hex[..8])
+        } else {
+            "0x".into()
+        }
+    } else {
+        String::new()
+    };
     Transaction {
         hash: str_field(tx, "hash"),
         block_number: tx.get("blockNumber").map(parse_int_any).unwrap_or(0),
@@ -106,15 +151,8 @@ pub fn parse_transaction(tx: &Value, block: &Block) -> Transaction {
         value,
         chain_id: tx.get("chainId").map(parse_int_any).unwrap_or(0),
         tx_type: tx.get("type").map(parse_int_any).unwrap_or(0x76),
-        input: {
-            let input = str_field(tx, "input");
-            let data = str_field(tx, "data");
-            if input.is_empty() && !data.is_empty() {
-                data
-            } else {
-                input
-            }
-        },
+        method_id,
+        input,
         raw: None,
         trace_data: None,
         receipt_data: None,

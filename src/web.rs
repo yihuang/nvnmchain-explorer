@@ -11,11 +11,12 @@ use axum::routing::get;
 use axum::Json;
 use axum::Router;
 use chrono::{Local, TimeZone};
+use num_bigint::BigInt;
 use serde_json::{json, Value};
 use tera::Tera;
 
 use crate::config::Settings;
-use crate::contracts::identify_address;
+use crate::contracts::{identify_address, is_contract};
 use crate::db::{self, Db};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
@@ -44,7 +45,7 @@ fn render_html(tera: &Tera, template: &str, ctx: &Value) -> Response {
         Ok(tera_ctx) => match tera.render(template, &tera_ctx) {
             Ok(html) => Html(html).into_response(),
             Err(e) => {
-                tracing::error!("template {template} render failed: {e}");
+                tracing::error!("template {template} render failed: {e:?}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Html("Internal server error"),
@@ -81,6 +82,59 @@ fn html_or_json(
     }
 }
 
+/// Common context keys every page needs (latest block + native symbol).
+fn page_ctx(state: &AppState, extra: Value) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "latest_block".into(),
+        serde_json::to_value(db::get_latest_block(&state.db)).unwrap_or(Value::Null),
+    );
+    map.insert("native_symbol".into(), json!(state.cfg.native_symbol));
+    if let Value::Object(o) = extra {
+        for (k, v) in o {
+            map.insert(k, v);
+        }
+    }
+    Value::Object(map)
+}
+
+/// Compact method badge for a transaction: decoded name > signature > selector.
+fn tx_method_badge(input: &str) -> Option<String> {
+    if input.is_empty() || input == "0x" {
+        return None;
+    }
+    decode_function_call(input).map(|d| d.name.or(d.signature).unwrap_or(d.selector))
+}
+
+/// Burnt fees for a block: base fee × gas used, as a wei decimal string.
+fn burnt_fees_wei(base_fee: &str, gas_used: i64) -> String {
+    let base = BigInt::parse_bytes(base_fee.as_bytes(), 10).unwrap_or_else(|| BigInt::from(0));
+    (base * BigInt::from(gas_used.max(0))).to_string()
+}
+
+/// SVG polyline points for a 160×32 sparkline.
+fn sparkline(values: &[f64]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    let max = values.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
+    let n = values.len();
+    let pts: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let x = if n == 1 {
+                80.0
+            } else {
+                i as f64 / (n - 1) as f64 * 160.0
+            };
+            let y = 30.0 - (v / max * 26.0);
+            format!("{x:.1},{y:.1}")
+        })
+        .collect();
+    pts.join(" ")
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -94,13 +148,53 @@ pub async fn home(
     let recent_blocks = db::get_recent_blocks(&state.db, state.cfg.recent_block_count);
     let recent_txs = db::get_recent_transactions(&state.db, state.cfg.recent_tx_count);
     let latest_num = latest_block.as_ref().map(|b| b.number).unwrap_or(0);
-    let ctx = json!({
-        "latest_block": latest_block,
-        "recent_blocks": recent_blocks,
-        "recent_txs": recent_txs,
-        "latest_num": latest_num,
-        "query": "",
-    });
+    let mut stats = db::get_kv(&state.db, "stats")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(Value::Null);
+    if let Value::Object(ref mut o) = stats {
+        let avg_ms = o
+            .get("avg_block_time_ms")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let tps = o.get("tps").and_then(Value::as_f64).unwrap_or(0.0);
+        let gas = o.get("gas_util_pct").and_then(Value::as_f64).unwrap_or(0.0);
+        o.insert(
+            "avg_block_time_display".into(),
+            json!(format_block_time(avg_ms)),
+        );
+        o.insert("tps_display".into(), json!(format!("{tps:.2}")));
+        o.insert("gas_util_display".into(), json!(format!("{gas:.1}%")));
+    }
+    let spark_tx = sparkline(
+        &recent_blocks
+            .iter()
+            .map(|b| b.tx_count as f64)
+            .collect::<Vec<_>>(),
+    );
+    let spark_gas = sparkline(
+        &recent_blocks
+            .iter()
+            .map(|b| {
+                if b.gas_limit > 0 {
+                    b.gas_used as f64 / b.gas_limit as f64 * 100.0
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "stats": stats,
+            "recent_blocks": recent_blocks,
+            "recent_txs": recent_txs,
+            "latest_num": latest_num,
+            "spark_tx": spark_tx,
+            "spark_gas": spark_gas,
+            "query": "",
+        }),
+    );
     html_or_json(&state, &headers, &query, "home.html", &ctx)
 }
 
@@ -128,13 +222,41 @@ pub async fn block_page(
     };
     let transactions = db::get_block_transactions(&state.db, block.number);
     let gas_pct = block_pct(block.gas_used, block.gas_limit);
-    let ctx = json!({
-        "block": block,
-        "transactions": transactions,
-        "gas_pct": gas_pct,
-        "latest_block": db::get_latest_block(&state.db),
-        "query": "",
-    });
+    let token_addrs: Vec<String> = transactions
+        .iter()
+        .filter_map(|t| t.fee_token.clone())
+        .collect();
+    let metas = db::get_tokens_metadata(&state.db, &token_addrs);
+    let transactions: Vec<Value> = transactions
+        .iter()
+        .map(|t| {
+            let mut v = serde_json::to_value(t).unwrap_or(Value::Null);
+            if let Some(m) = tx_method_badge(&t.input) {
+                v["method"] = json!(m);
+            }
+            if let Some(meta) = t.fee_token.as_deref().and_then(|f| metas.get(f)) {
+                v["fee_token_meta"] = serde_json::to_value(meta).unwrap_or(Value::Null);
+                v["fee_formatted"] = json!(format_token_amount_with_symbol(
+                    &t.fee_amount,
+                    meta.decimals,
+                    &meta.symbol,
+                ));
+            }
+            v
+        })
+        .collect();
+    let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "block": block,
+            "transactions": transactions,
+            "gas_pct": gas_pct,
+            "base_fee_gwei": format_token_amount(&block.base_fee, 9),
+            "burnt_fees": burnt,
+            "query": "",
+        }),
+    );
     html_or_json(&state, &headers, &query, "block.html", &ctx)
 }
 
@@ -229,6 +351,60 @@ pub async fn tx_page(
         .as_ref()
         .map(|r| extract_balance_changes(r, &tx))
         .unwrap_or_default();
+    // Native value transfer: show it alongside token balance changes.
+    if tx.value != "0" {
+        if let Some(to) = tx.to_addr.as_deref() {
+            let symbol = &state.cfg.native_symbol;
+            let out = format_token_amount(&tx.value, 18);
+            balance_changes.push(json!({
+                "address": tx.from_addr.clone(),
+                "token": "",
+                "change": format!("-{}", tx.value),
+                "is_fee": false,
+                "native": true,
+                "symbol": symbol,
+                "formatted": format!("-{out} {symbol}"),
+            }));
+            balance_changes.push(json!({
+                "address": to,
+                "token": "",
+                "change": format!("+{}", tx.value),
+                "is_fee": false,
+                "native": true,
+                "symbol": symbol,
+                "formatted": format!("+{out} {symbol}"),
+            }));
+        }
+    }
+    // Attach symbol + formatted amount to token balance changes.
+    {
+        let mut token_addrs: Vec<String> = balance_changes
+            .iter()
+            .filter_map(|c| c.get("token").and_then(Value::as_str).map(String::from))
+            .filter(|a| !a.is_empty())
+            .collect();
+        token_addrs.dedup();
+        let metas = db::get_tokens_metadata(&state.db, &token_addrs);
+        for c in balance_changes.iter_mut() {
+            let Some(token) = c.get("token").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(m) = metas.get(token) {
+                let raw = c
+                    .get("change")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0")
+                    .to_string();
+                let (sign, amt) = raw
+                    .strip_prefix('+')
+                    .map(|a| ("+", a))
+                    .or_else(|| raw.strip_prefix('-').map(|a| ("-", a)))
+                    .unwrap_or(("", raw.as_str()));
+                c["symbol"] = json!(m.symbol);
+                c["formatted"] = json!(format!("{sign}{}", format_token_amount(amt, m.decimals)));
+            }
+        }
+    }
     for change in balance_changes.iter_mut() {
         let positive = change
             .get("change")
@@ -236,6 +412,18 @@ pub async fn tx_page(
             .map(|c| c.starts_with('+'))
             .unwrap_or(false);
         change["positive"] = json!(positive);
+        // Ensure every row has display keys (Tera errors on missing map keys).
+        change
+            .as_object_mut()
+            .expect("balance change is an object")
+            .entry("symbol")
+            .or_insert_with(|| json!(""));
+        let default_formatted = change.get("change").cloned().unwrap_or_else(|| json!(""));
+        change
+            .as_object_mut()
+            .expect("balance change is an object")
+            .entry("formatted")
+            .or_insert(default_formatted);
     }
 
     // Indent each call by depth for the tree view.
@@ -263,31 +451,35 @@ pub async fn tx_page(
         String::new()
     };
     let tx_type_hex = format!("{tx_type:02x}");
+    let method = tx_method_badge(&tx.input);
 
-    let ctx = json!({
-        "tx": tx,
-        "block": block,
-        "receipt": receipt,
-        "trace": trace,
-        "calls": calls,
-        "events": events,
-        "balance_changes": balance_changes,
-        "gas_price": gas_price,
-        "gas_used": gas_used,
-        "gas_limit": gas_limit,
-        "max_fee": max_fee,
-        "max_priority": max_priority,
-        "base_fee": base_fee,
-        "tx_type": tx_type,
-        "tx_type_hex": tx_type_hex,
-        "gas_pct": gas_pct,
-        "fee_token": fee_token,
-        "fee_amount": fee_amount,
-        "fee_token_meta": fee_token_meta,
-        "active_tab": query.get("tab").cloned().unwrap_or_else(|| "overview".into()),
-        "latest_block": db::get_latest_block(&state.db),
-        "query": "",
-    });
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "tx": tx,
+            "block": block,
+            "receipt": receipt,
+            "trace": trace,
+            "calls": calls,
+            "events": events,
+            "balance_changes": balance_changes,
+            "gas_price": gas_price,
+            "gas_used": gas_used,
+            "gas_limit": gas_limit,
+            "max_fee": max_fee,
+            "max_priority": max_priority,
+            "base_fee": base_fee,
+            "tx_type": tx_type,
+            "tx_type_hex": tx_type_hex,
+            "gas_pct": gas_pct,
+            "fee_token": fee_token,
+            "fee_amount": fee_amount,
+            "fee_token_meta": fee_token_meta,
+            "method": method,
+            "active_tab": query.get("tab").cloned().unwrap_or_else(|| "overview".into()),
+            "query": "",
+        }),
+    );
     html_or_json(&state, &headers, &query, "tx.html", &ctx)
 }
 
@@ -325,50 +517,76 @@ pub async fn address_page(
         .max(1);
     let per_page: u32 = 25;
 
-    let (transactions, html_transactions, tx_count, total_pages) = if tab == "transfers" {
-        let transfers = db::get_address_transfers(&state.db, &checksummed, page, per_page);
-        (transfers.clone(), transfers, 0, 0)
-    } else {
-        let txs = db::get_address_transactions(&state.db, &checksummed, page, per_page);
-        let count = db::get_address_transaction_count(&state.db, &checksummed);
-        let total_pages = ((count as f64) / (per_page as f64)).ceil().max(1.0) as u32;
-        (
-            txs.into_iter()
-                .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
-                .collect::<Vec<Value>>(),
-            db::get_address_transactions(&state.db, &checksummed, page, per_page)
-                .into_iter()
+    let (transactions, html_transactions, tx_count, total_pages, transfer_count) =
+        if tab == "transfers" {
+            let mut transfers = db::get_address_transfers(&state.db, &checksummed, page, per_page);
+            enrich_transfers(&state, &mut transfers);
+            let total = transfers.len() as i64;
+            (transfers.clone(), transfers, 0, 0, total)
+        } else {
+            let txs = db::get_address_transactions(&state.db, &checksummed, page, per_page);
+            let count = db::get_address_transaction_count(&state.db, &checksummed);
+            let total_pages = ((count as f64) / (per_page as f64)).ceil().max(1.0) as u32;
+            let html_txs: Vec<Value> = txs
+                .iter()
                 .map(|t| {
                     json!({
                         "tx_hash": t.hash,
                         "tx_from": t.from_addr,
                         "tx_to": t.to_addr,
                         "tx_timestamp": t.timestamp,
+                        "tx_status": t.status,
+                        "tx_block": t.block_number,
+                        "tx_value": t.value,
+                        "tx_method": tx_method_badge(&t.input),
                     })
                 })
-                .collect::<Vec<Value>>(),
-            count,
-            total_pages,
-        )
-    };
+                .collect();
+            (
+                txs.into_iter()
+                    .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+                    .collect::<Vec<Value>>(),
+                html_txs,
+                count,
+                total_pages,
+                0,
+            )
+        };
 
     let addr_info = identify_address(&checksummed);
-    let ctx = json!({
-        "address": checksummed,
-        "addr_info": addr_info,
-        "type": addr_info.kind,
-        "label": addr_info.label,
-        "transactions": transactions,
-        "html_transactions": html_transactions,
-        "holdings": db::get_address_holdings(&state.db, &checksummed),
-        "tx_count": tx_count,
-        "page": page,
-        "total_pages": total_pages,
-        "per_page": per_page,
-        "active_tab": tab,
-        "latest_block": db::get_latest_block(&state.db),
-        "query": "",
+    let is_token_addr = db::get_token_metadata(&state.db, &checksummed).is_some()
+        || crate::contracts::is_tip20_token(&checksummed);
+    let kind = if addr_info.kind == "eoa" && (is_contract(&checksummed) || is_token_addr) {
+        "contract"
+    } else {
+        addr_info.kind.as_str()
+    };
+    let label = addr_info.label.clone().or_else(|| {
+        if kind == "contract" {
+            db::get_contract_label(&state.db, &checksummed).filter(|n| !n.is_empty())
+        } else {
+            None
+        }
     });
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "address": checksummed,
+            "addr_info": addr_info,
+            "type": kind,
+            "label": label,
+            "transactions": transactions,
+            "html_transactions": html_transactions,
+            "holdings": db::get_address_holdings(&state.db, &checksummed),
+            "tx_count": tx_count,
+            "transfer_count": transfer_count,
+            "page": page,
+            "total_pages": total_pages,
+            "per_page": per_page,
+            "active_tab": tab,
+            "query": "",
+        }),
+    );
     html_or_json(&state, &headers, &query, "address.html", &ctx)
 }
 
@@ -430,15 +648,21 @@ pub async fn token_page(
         Vec::new()
     };
 
-    let ctx = json!({
-        "token": meta,
-        "transfers": transfers,
-        "page": page,
-        "per_page": per_page,
-        "active_tab": tab,
-        "latest_block": db::get_latest_block(&state.db),
-        "query": "",
-    });
+    let holders = db::get_token_holder_count(&state.db, &checksummed);
+    let transfer_count = db::get_token_transfer_count(&state.db, &checksummed);
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "token": meta,
+            "transfers": transfers,
+            "holders": holders,
+            "transfer_count": transfer_count,
+            "page": page,
+            "per_page": per_page,
+            "active_tab": tab,
+            "query": "",
+        }),
+    );
     html_or_json(&state, &headers, &query, "token.html", &ctx)
 }
 
@@ -456,15 +680,17 @@ pub async fn tokens_page(
     let tokens = db::get_all_tokens(&state.db, page, per_page);
     let total = db::get_token_count(&state.db);
     let total_pages = ((total as f64) / (per_page as f64)).ceil().max(1.0) as u32;
-    let ctx = json!({
-        "tokens": tokens,
-        "total": total,
-        "page": page,
-        "total_pages": total_pages,
-        "per_page": per_page,
-        "latest_block": db::get_latest_block(&state.db),
-        "query": "",
-    });
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "tokens": tokens,
+            "total": total,
+            "page": page,
+            "total_pages": total_pages,
+            "per_page": per_page,
+            "query": "",
+        }),
+    );
     html_or_json(&state, &headers, &query, "tokens.html", &ctx)
 }
 
@@ -511,7 +737,18 @@ pub async fn search_page(
                 "url": format!("/address/{checksummed}"),
             }));
         }
-        if let Some(meta) = db::get_token_metadata(&state.db, &q) {
+        if found.is_none() {
+            if let Some(meta) = db::get_token_metadata(&state.db, &q) {
+                found = Some(json!({
+                    "type": "token",
+                    "id": meta.address,
+                    "url": format!("/token/{}", meta.address),
+                }));
+            }
+        }
+    }
+    if found.is_none() {
+        if let Some(meta) = db::get_token_by_symbol_or_name(&state.db, &q) {
             found = Some(json!({
                 "type": "token",
                 "id": meta.address,
@@ -535,6 +772,7 @@ pub async fn search_page(
         "query": q,
         "results": [],
         "latest_block": db::get_latest_block(&state.db),
+        "native_symbol": state.cfg.native_symbol,
     });
     render_html(&state.tera, "search.html", &ctx)
 }
@@ -600,6 +838,44 @@ fn block_pct(gas_used: i64, gas_limit: i64) -> String {
         format!("{:.1}", gas_used as f64 / gas_limit as f64 * 100.0)
     } else {
         "0".into()
+    }
+}
+
+fn format_block_time(ms: f64) -> String {
+    if ms >= 1000.0 {
+        format!("{:.2}s", ms / 1000.0)
+    } else {
+        format!("{ms:.0} ms")
+    }
+}
+
+/// Attach token symbol/decimals + formatted amounts to transfer rows.
+fn enrich_transfers(state: &AppState, transfers: &mut [Value]) {
+    let addrs: Vec<String> = transfers
+        .iter()
+        .filter_map(|t| {
+            t.get("token_addr")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .collect();
+    let metas = db::get_tokens_metadata(&state.db, &addrs);
+    for t in transfers.iter_mut() {
+        let Some(addr) = t.get("token_addr").and_then(Value::as_str) else {
+            continue;
+        };
+        let amount = t
+            .get("amount")
+            .and_then(Value::as_str)
+            .unwrap_or("0")
+            .to_string();
+        let (symbol, decimals) = metas
+            .get(addr)
+            .map(|m| (m.symbol.clone(), m.decimals))
+            .unwrap_or_else(|| (String::new(), 18));
+        t["token_symbol"] = json!(symbol);
+        t["token_decimals"] = json!(decimals);
+        t["amount_formatted"] = json!(format_token_amount(&amount, decimals));
     }
 }
 

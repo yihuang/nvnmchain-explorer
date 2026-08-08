@@ -15,6 +15,16 @@ pub struct Block {
     pub timestamp: i64,
     pub gas_used: i64,
     pub gas_limit: i64,
+    /// Base fee per gas in wei (decimal string, `0` when unavailable).
+    pub base_fee: String,
+    /// Block size in bytes.
+    pub size: i64,
+    pub extra_data: String,
+    /// Consensus epoch / view from the node's `consensusContext`.
+    pub epoch: i64,
+    pub view: i64,
+    /// Consensus proposer (validator address) from `consensusContext`.
+    pub proposer: String,
     pub miner: String,
     pub tx_count: i64,
     pub raw: String,
@@ -44,6 +54,8 @@ pub struct Transaction {
     pub value: String,
     pub chain_id: i64,
     pub tx_type: i64,
+    /// First four bytes of the call data (e.g. `0xa9059cbb`).
+    pub method_id: String,
     pub input: String,
     pub raw: Option<String>,
     pub trace_data: Option<String>,
