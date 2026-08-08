@@ -11,10 +11,10 @@ use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event, flatten_trace};
 use crate::models::TransferEvent;
 use crate::parse::{parse_block, parse_transaction};
-use crate::rpc::TempoRpc;
+use crate::rpc::ChainRpc;
 use crate::tokens::fetch_token_metadata;
 
-pub async fn index_block(rpc: &TempoRpc, db: &Db, block_num: u64) -> Result<()> {
+pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> {
     // 1. Block with full transaction objects.
     let Some(raw_block) = rpc.eth_get_block_by_number(block_num, true).await? else {
         warn!("block {block_num} not found");
@@ -167,7 +167,7 @@ fn save_transfer_events(db: &Db, receipt: &Value, tx: &crate::models::Transactio
     }
 }
 
-pub async fn run_forever(rpc: TempoRpc, db: Db, poll_seconds: f64, batch: u64) {
+pub async fn run_forever(rpc: ChainRpc, db: Db, poll_seconds: f64, batch: u64) {
     let mut highest: u64 = db::get_latest_block(&db)
         .map(|b| b.number as u64)
         .unwrap_or(0);

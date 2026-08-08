@@ -1,16 +1,17 @@
-# Tempo Explorer
+# nvnmchain Explorer
 
-Blockchain explorer for [Tempo](https://tempo.xyz) — an EVM-compatible chain
-with no native token (gas paid in ERC-20/TIP-20 tokens).
+Blockchain explorer for the nvnm chain — the Mantra canary EVM network
+(chain id `0xc0316`) — with no native token (gas paid in ERC-20/TIP-20
+tokens).
 
 Written in Rust with [axum](https://github.com/tokio-rs/axum) + [Tera](https://tera.netlify.app/),
 rusqlite (schema created on boot), an async reqwest JSON-RPC client, a
 self-contained ABIv2 decoder with keccak, and a tokio indexer (forward tip +
 backfill).
 
-The default RPC is `https://rpc.nvnm.canary.mantrachain.dev` (Mantra EVM,
-chain id `0xc0316`) — the chain this codebase is validated against. Point it
-anywhere with `TEMPO_RPC`.
+The default RPC is `https://rpc.nvnm.canary.mantrachain.dev` — the chain this
+codebase is validated against. Point it anywhere with `NVNM_RPC` (the legacy
+`TEMPO_RPC` variable is still accepted).
 
 ## Quick start
 
@@ -27,13 +28,13 @@ up faster).
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `TEMPO_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint |
+| `NVNM_RPC` | `https://rpc.nvnm.canary.mantrachain.dev` | JSON-RPC endpoint (legacy `TEMPO_RPC` also accepted) |
 | `CHAIN_ID` | `787222` | Chain id shown in the UI |
 | `DB_PATH` | `explorer.db` | SQLite database path |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | Bind address |
 | `INDEX_POLL_SECONDS` | `3` | Indexer poll interval |
 | `INDEX_BATCH` | `5` | Blocks indexed per cycle (forward + backfill) |
-| `RUST_LOG` | `tempo_explorer=info` | Log verbosity |
+| `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
 

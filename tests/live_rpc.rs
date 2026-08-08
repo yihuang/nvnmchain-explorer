@@ -1,17 +1,17 @@
 //! Integration tests against the live chain RPC.
 //!
-//! These exercise the real node at `TEMPO_RPC` (default
+//! These exercise the real node at `NVNM_RPC` (default
 //! `https://rpc.nvnm.canary.mantrachain.dev`): chain metadata, block and tx
 //! fetching, indexing into SQLite, and the HTTP API end to end.
 
 use std::sync::{Arc, Mutex};
 
+use nvnmchain_explorer::config::{DEFAULT_CHAIN_ID, DEFAULT_RPC_URL};
+use nvnmchain_explorer::db::{self, Db};
+use nvnmchain_explorer::indexer::index_block;
+use nvnmchain_explorer::rpc::ChainRpc;
+use nvnmchain_explorer::web::{self, AppState};
 use serde_json::{json, Value};
-use tempo_explorer::config::{DEFAULT_CHAIN_ID, DEFAULT_RPC_URL};
-use tempo_explorer::db::{self, Db};
-use tempo_explorer::indexer::index_block;
-use tempo_explorer::rpc::TempoRpc;
-use tempo_explorer::web::{self, AppState};
 
 fn temp_db() -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -20,8 +20,8 @@ fn temp_db() -> (tempfile::TempDir, Db) {
     (dir, Arc::new(Mutex::new(conn)))
 }
 
-fn rpc() -> TempoRpc {
-    TempoRpc::new(DEFAULT_RPC_URL).expect("rpc client")
+fn rpc() -> ChainRpc {
+    ChainRpc::new(DEFAULT_RPC_URL).expect("rpc client")
 }
 
 #[tokio::test]
@@ -82,7 +82,7 @@ async fn index_recent_blocks_into_sqlite() {
             assert!(receipt.get("status").is_some());
         }
         if tx.input.len() > 10 {
-            assert!(tempo_explorer::decoder::decode_function_call(&tx.input).is_some());
+            assert!(nvnmchain_explorer::decoder::decode_function_call(&tx.input).is_some());
         }
     }
 }
@@ -94,7 +94,7 @@ async fn web_api_serves_indexed_data() {
     let head = rpc.eth_block_number().await.expect("head");
     index_block(&rpc, &db, head).await.expect("index tip");
 
-    let cfg = tempo_explorer::config::Settings {
+    let cfg = nvnmchain_explorer::config::Settings {
         rpc_url: DEFAULT_RPC_URL.into(),
         chain_id: DEFAULT_CHAIN_ID,
         host: "127.0.0.1".into(),

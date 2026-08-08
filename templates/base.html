@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-    <title>{% block title %}Tempo Explorer{% endblock %}</title>
+    <title>{% block title %}nvnmchain Explorer{% endblock %}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { background: radial-gradient(1200px 500px at 50% -10%, #131324 0%, #0a0a0f 55%) fixed; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
@@ -53,13 +53,12 @@
             <div class="flex items-center justify-between h-14">
                 <div class="flex items-center gap-6">
                     <a href="/" class="font-bold text-lg text-white hover:text-blue-400 hover:no-underline">
-                        <span class="text-blue-400">⏺</span> Explore
+                        <span class="text-blue-400">⏺</span> nvnmchain
                     </a>
                     <div class="hidden md:flex items-center gap-1">
                         <a href="/" class="nav-link">Home</a>
                         <a href="/blocks" class="nav-link">Blocks</a>
                         <a href="/tokens" class="nav-link">Tokens</a>
-                        <a href="https://docs.tempo.xyz" class="nav-link" target="_blank">Docs</a>
                     </div>
                 </div>
                 <div class="flex items-center gap-3">
@@ -83,7 +82,7 @@
     </main>
     <footer>
         <div class="max-w-7xl mx-auto px-4 py-6 text-xs text-dim flex flex-wrap items-center justify-between gap-2">
-            <span>⏺ Explore — chain explorer</span>
+            <span>⏺ nvnmchain — chain explorer</span>
             <span class="mono">{% if latest_block %}#{{ latest_block.number }}{% endif %} · <a href="https://rpc.nvnm.canary.mantrachain.dev" target="_blank" class="hover:text-blue-300">RPC</a></span>
         </div>
     </footer>

@@ -1,4 +1,4 @@
-//! Tempo Explorer — blockchain explorer for Tempo, an EVM-compatible chain.
+//! nvnmchain Explorer — blockchain explorer for the nvnm EVM chain.
 
 pub mod config;
 pub mod contracts;

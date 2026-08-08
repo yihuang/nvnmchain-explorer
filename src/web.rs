@@ -20,13 +20,13 @@ use crate::db::{self, Db};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
 };
-use crate::rpc::TempoRpc;
+use crate::rpc::ChainRpc;
 use crate::tokens::{fetch_token_metadata, format_token_amount, format_token_amount_with_symbol};
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
-    pub rpc: TempoRpc,
+    pub rpc: ChainRpc,
     pub cfg: Settings,
     pub tera: Arc<Tera>,
 }

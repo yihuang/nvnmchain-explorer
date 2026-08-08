@@ -28,6 +28,13 @@ fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Read `NVNM_RPC`, falling back to the legacy `TEMPO_RPC` variable.
+fn rpc_url() -> String {
+    env::var("NVNM_RPC")
+        .or_else(|_| env::var("TEMPO_RPC"))
+        .unwrap_or_else(|_| DEFAULT_RPC_URL.to_string())
+}
+
 fn env_u64(key: &str, default: u64) -> u64 {
     env::var(key)
         .ok()
@@ -52,7 +59,7 @@ fn env_f64(key: &str, default: f64) -> f64 {
 impl Settings {
     pub fn from_env() -> Self {
         Self {
-            rpc_url: env_or("TEMPO_RPC", DEFAULT_RPC_URL),
+            rpc_url: rpc_url(),
             chain_id: env_u64("CHAIN_ID", DEFAULT_CHAIN_ID),
             host: env_or("HOST", "0.0.0.0"),
             port: env_u64("PORT", 8080) as u16,

@@ -10,13 +10,13 @@ use serde_json::{json, Value};
 
 use crate::config::Settings;
 
-pub struct TempoRpc {
+pub struct ChainRpc {
     client: Client,
     url: String,
     req_id: AtomicU64,
 }
 
-impl Clone for TempoRpc {
+impl Clone for ChainRpc {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
@@ -41,7 +41,7 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-impl TempoRpc {
+impl ChainRpc {
     pub fn new(url: impl Into<String>) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -328,7 +328,7 @@ pub fn str_field(value: &Value, key: &str) -> String {
 
 /// Resolve a block reference `"latest"`/number to a concrete height,
 /// falling back to the head.
-pub async fn resolve_block_ref(rpc: &TempoRpc, reference: &str) -> Result<Option<u64>> {
+pub async fn resolve_block_ref(rpc: &ChainRpc, reference: &str) -> Result<Option<u64>> {
     if reference == "latest" || reference == "pending" || reference == "earliest" {
         return Ok(Some(rpc.eth_block_number().await?));
     }

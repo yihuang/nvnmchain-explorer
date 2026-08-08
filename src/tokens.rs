@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::contracts::get_known_token;
 use crate::decoder::checksum_address;
-use crate::rpc::TempoRpc;
+use crate::rpc::ChainRpc;
 
 const NAME_CALL: &str = "0x06fdde03";
 const SYMBOL_CALL: &str = "0x95d89b41";
@@ -68,7 +68,7 @@ fn decode_uint256_result(raw: &str) -> String {
 }
 
 /// Fetch TIP-20 token metadata from the chain, tolerating missing views.
-pub async fn fetch_token_metadata(rpc: &TempoRpc, address: &str) -> TokenMeta {
+pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> TokenMeta {
     let checksummed = checksum_address(address);
     let known = get_known_token(&checksummed);
 

@@ -4,34 +4,34 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use tempo_explorer::config::Settings;
-use tempo_explorer::db::{self, Db};
-use tempo_explorer::indexer;
-use tempo_explorer::rpc::TempoRpc;
-use tempo_explorer::web;
+use nvnmchain_explorer::config::Settings;
+use nvnmchain_explorer::db::{self, Db};
+use nvnmchain_explorer::indexer;
+use nvnmchain_explorer::rpc::ChainRpc;
+use nvnmchain_explorer::web;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "tempo_explorer=info".into()),
+                .unwrap_or_else(|_| "nvnmchain_explorer=info".into()),
         )
         .init();
 
     let cfg = Settings::from_env();
     info!(
-        "starting Tempo Explorer (rpc={}, db={})",
+        "starting nvnmchain Explorer (rpc={}, db={})",
         cfg.rpc_url, cfg.db_path
     );
 
     let conn = db::init_db(&cfg.db_path).context("initialize database")?;
     let db: Db = Arc::new(Mutex::new(conn));
-    let rpc = TempoRpc::from_settings(&cfg)?;
+    let rpc = ChainRpc::from_settings(&cfg)?;
     let tera = web::build_tera(db.clone())?;
 
     // Background indexer: forward tip + backfill, never blocks serving.
-    let indexer_rpc = TempoRpc::from_settings(&cfg)?;
+    let indexer_rpc = ChainRpc::from_settings(&cfg)?;
     let indexer_db = db.clone();
     let poll_seconds = cfg.poll_seconds;
     let batch_size = cfg.batch_size;

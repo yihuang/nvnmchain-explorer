@@ -1,8 +1,8 @@
 [package]
-name = "tempo-explorer"
+name = "nvnmchain-explorer"
 version = "0.1.0"
 edition = "2021"
-description = "Tempo blockchain explorer (Rust rewrite)"
+description = "nvnmchain blockchain explorer (Rust)"
 license = "MIT"
 
 [dependencies]
