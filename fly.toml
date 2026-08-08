@@ -18,8 +18,8 @@ primary_region = "hkg"
 [env]
   DB_PATH = "/data/explorer.db"
   RUST_LOG = "nvnmchain_explorer=info"
-  INDEX_WS = "1"
-  NATIVE_SYMBOL = "OM"
+  INDEX_WS = "0"
+  NATIVE_SYMBOL = "NVNM"
 
 [mounts]
   source = "nvnm_data"

@@ -18,7 +18,6 @@ pub struct Settings {
     pub host: String,
     pub port: u16,
     pub db_path: String,
-    pub max_cached_blocks: u64,
     pub recent_block_count: usize,
     pub recent_tx_count: usize,
     /// Seconds between poll cycles when the WebSocket feed is unavailable.
@@ -72,18 +71,17 @@ impl Settings {
             ws_url: env_or("WS_URL", DEFAULT_WS_URL),
             index_ws: env::var("INDEX_WS")
                 .map(|v| v != "0" && v.to_lowercase() != "false")
-                .unwrap_or(true),
+                .unwrap_or(false),
             chain_id: env_u64("CHAIN_ID", DEFAULT_CHAIN_ID),
             host: env_or("HOST", "0.0.0.0"),
             port: env_u64("PORT", 8080) as u16,
             db_path: env_or("DB_PATH", "explorer.db"),
-            max_cached_blocks: env_u64("MAX_CACHED_BLOCKS", 100_000),
             recent_block_count: env_usize("RECENT_BLOCK_COUNT", 15),
             recent_tx_count: env_usize("RECENT_TX_COUNT", 15),
             poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0),
-            batch_size: env_u64("INDEX_BATCH", 5),
+            batch_size: env_u64("INDEX_BATCH", 32),
             index_concurrency: env_usize("INDEX_CONCURRENCY", 32),
-            native_symbol: env_or("NATIVE_SYMBOL", "OM"),
+            native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0),
         }
     }
