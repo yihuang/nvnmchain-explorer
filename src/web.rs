@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use tera::Tera;
 use tokio::sync::broadcast;
 
-use crate::anchoring::{decode_envelope, is_self_verifying};
+use crate::anchoring::is_self_verifying;
 use crate::config::Settings;
 use crate::contracts::{identify_address, is_contract};
 use crate::db::{self, Db};
@@ -97,6 +97,7 @@ fn page_ctx(state: &AppState, extra: Value) -> Value {
         serde_json::to_value(db::get_latest_block(&state.db)).unwrap_or(Value::Null),
     );
     map.insert("native_symbol".into(), json!(state.cfg.native_symbol));
+    map.insert("anchoring_url".into(), json!(state.cfg.anchoring_url));
     if let Value::Object(o) = extra {
         for (k, v) in o {
             map.insert(k, v);
@@ -1004,35 +1005,11 @@ pub async fn tokens_page(
 // Anchoring
 // ---------------------------------------------------------------------------
 
-/// What an anchored payload is, or its commitment when it is not an envelope.
-///
-/// The commitment rather than the metadata, which for a foreign payload
-/// routinely opens with a zero-padded word — a whole column of those truncates
-/// to the same thing.
-fn anchored_label(key: &str, commitment: &str, metadata: &str) -> String {
-    match decode_envelope(key, metadata) {
-        Some(envelope) => envelope.summary,
-        None => truncate_hash(commitment, 10, 6),
-    }
-}
-
-/// Attach the human-readable label to rows that carry a metadata payload.
-fn label_rows(rows: &mut [Value]) {
-    for row in rows.iter_mut() {
-        let key = row.get("key").and_then(Value::as_str).unwrap_or("");
-        let commitment = row.get("commitment").and_then(Value::as_str).unwrap_or("");
-        let metadata = row.get("metadata").and_then(Value::as_str).unwrap_or("");
-        row["label"] = json!(anchored_label(key, commitment, metadata));
-    }
-}
-
 fn anchored_rows(events: &[crate::models::AnchoredEvent]) -> Vec<Value> {
-    let mut rows: Vec<Value> = events
+    events
         .iter()
         .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
-        .collect();
-    label_rows(&mut rows);
-    rows
+        .collect()
 }
 
 /// A namespace is an address; say so the way the client asked to hear it.
@@ -1098,8 +1075,7 @@ pub async fn anchoring_namespace_page(
         .unwrap_or(1)
         .max(1);
     let per_page: u32 = 25;
-    let mut keys = db::get_namespace_keys(&state.db, &namespace, page, per_page);
-    label_rows(&mut keys);
+    let keys = db::get_namespace_keys(&state.db, &namespace, page, per_page);
     let ctx = page_ctx(
         &state,
         json!({
@@ -1130,7 +1106,6 @@ pub async fn anchoring_key_page(
     let Some(head) = history.first() else {
         return not_found(&state, &headers, &query, "Anchored key", &key);
     };
-    let envelope = decode_envelope(&head.key, &head.metadata);
     let self_verifying = is_self_verifying(&head.commitment, &head.metadata);
     let rows = anchored_rows(&history);
     let ctx = page_ctx(
@@ -1139,7 +1114,6 @@ pub async fn anchoring_key_page(
             "namespace": namespace,
             "key": head.key,
             "head": rows[0],
-            "envelope": envelope,
             "self_verifying": self_verifying,
             "history": rows,
             "query": "",

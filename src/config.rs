@@ -26,6 +26,10 @@ pub struct Settings {
     pub batch_size: u64,
     /// Max blocks fetched in parallel by the indexer.
     pub index_concurrency: usize,
+    /// The anchoring indexer's UI, when one is deployed. Anchored payloads mean
+    /// something to an application, not to a chain explorer, so the pages link
+    /// out rather than decoding envelopes here.
+    pub anchoring_url: Option<String>,
     /// Symbol shown for the native gas/currency token.
     pub native_symbol: String,
     /// Seconds between background recomputes of the home-page stats blob.
@@ -81,6 +85,9 @@ impl Settings {
             poll_seconds: env_f64("INDEX_POLL_SECONDS", 1.0),
             batch_size: env_u64("INDEX_BATCH", 32),
             index_concurrency: env_usize("INDEX_CONCURRENCY", 32),
+            anchoring_url: env::var("ANCHORING_URL")
+                .ok()
+                .filter(|url| !url.trim().is_empty()),
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0),
         }

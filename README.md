@@ -152,6 +152,12 @@ The indexer is built for a sub-second chain:
 | `/anchoring` | Namespaces that have anchored, plus the latest commitments |
 | `/anchoring/{namespace}` | A namespace's keys, each at its head commitment |
 | `/anchoring/{namespace}/{key}` | Every revision of one key, newest first |
+
+These show the commitment log itself: what was anchored, by whom, in what
+order. What a payload *means* belongs to the application that wrote it — point
+`ANCHORING_URL` at
+[nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) and the
+pages link out for registries, records and roles.
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 

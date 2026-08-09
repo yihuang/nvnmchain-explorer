@@ -41,7 +41,7 @@
         <div class="flex table-header">
             <div class="w-44 px-3">Namespace</div>
             <div class="w-44 px-3">Key</div>
-            <div class="flex-1 px-3">Payload</div>
+            <div class="flex-1 px-3">Commitment</div>
             <div class="w-24 px-3 text-right">Block</div>
             <div class="w-24 px-3 text-right">Age</div>
         </div>
@@ -53,7 +53,7 @@
             <div class="w-44 px-3 py-3 mono truncate">
                 <a href="/anchoring/{{ row.namespace }}/{{ row.key }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=row.key) }}</a>
             </div>
-            <div class="flex-1 px-3 py-3 truncate text-dim">{{ row.label }}</div>
+            <div class="flex-1 px-3 py-3 truncate text-dim">{{ truncate_hash(h=row.commitment, prefix=10, suffix=6) }}</div>
             <div class="w-24 px-3 py-3 text-right">
                 <a href="/block/{{ row.block_number }}" class="text-blue-400 hover:text-blue-300">{{ row.block_number }}</a>
             </div>

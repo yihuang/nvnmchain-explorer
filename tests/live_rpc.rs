@@ -252,6 +252,7 @@ async fn web_api_serves_indexed_data() {
         batch_size: 5,
         index_concurrency: 8,
         native_symbol: "OM".into(),
+        anchoring_url: None,
         stats_interval_seconds: 5.0,
     };
     let tera = web::build_tera(db.clone()).expect("tera");

@@ -1,17 +1,13 @@
-//! Indexing the `Anchored` log and reading the envelopes anchored through it.
+//! Indexing the `Anchored` log.
 //!
 //! The precompile keeps only the head per `(namespace, key)`, so the indexed
-//! table is the entire history — these tests pin both halves: the log becomes a
-//! row, and a row that is an `AnchoringRegistry` envelope reads as itself.
-//!
-//! The payloads below are what `AnchoringRegistry.sol` actually emits, dumped
-//! from a forge run against the shipped contracts rather than re-encoded here;
-//! a decoder checked against its own guess proves nothing.
+//! table is the entire history. What a payload *means* is not tested here —
+//! that moved to the anchoring indexer along with the decoder.
 
 use std::sync::{Arc, Mutex};
 
 use nvnmchain_explorer::anchoring::{
-    decode_envelope, is_self_verifying, ANCHORED_SIGNATURE, ANCHORED_TOPIC, ANCHORING_ADDRESS,
+    is_self_verifying, ANCHORED_SIGNATURE, ANCHORED_TOPIC, ANCHORING_ADDRESS,
 };
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{decode_event, decode_function_call, keccak_hex};
@@ -23,69 +19,12 @@ use serde_json::{json, Value};
 /// namespace, since the precompile partitions by caller.
 const REGISTRY: &str = "0x44DA54d3f5416A9Ae699d54EcB83c3043c41319E";
 
+/// The explorer stores what was anchored without reading it, so the tests need
+/// a key, a commitment and some bytes — not a payload of any particular shape.
 const REGISTRY_KEY: &str = "0x173602657603c73bdfa5393aba98fa9e899f7c58898ea2a7d444639768d549d4";
 const REGISTRY_COMMITMENT: &str =
     "0xf6f0bcff7207ce080ce3900e9e8c378a31a0faa37441f4ce9f222929db9b9b0e";
-const REGISTRY_METADATA: &str = "0x\
-0000000000000000000000000000000000000000000000000000000000000001\
-00000000000000000000000000000000000000000000000000000000000000c0\
-0000000000000000000000000000000000000000000000000000000000000100\
-0000000000000000000000000000000000000000000000000000000000000140\
-0000000000000000000000002190d584e30f4a2396c1487aa784428f2068cbe8\
-0000000000000000000000000000000000000000000000000000000000000001\
-0000000000000000000000000000000000000000000000000000000000000004\
-446f637300000000000000000000000000000000000000000000000000000000\
-000000000000000000000000000000000000000000000000000000000000000d\
-696e7465726e616c20646f637300000000000000000000000000000000000000\
-0000000000000000000000000000000000000000000000000000000000000002\
-7b7d000000000000000000000000000000000000000000000000000000000000";
-
-const RECORD_KEY: &str = "0x50533b0f6489b8e319f1bd0705b9595a20a11ae5e9e54d1913d081c0232a880e";
-const RECORD_COMMITMENT: &str =
-    "0x9b60783ba653e4f1b87ddf01d26063b937c1a678365a21f4eb7d21abfaa349f3";
-const RECORD_METADATA: &str = "0x\
-0000000000000000000000000000000000000000000000000000000000000001\
-0000000000000000000000000000000000000000000000000000000000000001\
-0000000000000000000000000000000000000000000000000000000000000001\
-0000000000000000000000000000000000000000000000000000000000000100\
-0000000000000000000000000000000000000000000000000000000000000140\
-0000000000000000000000000000000000000000000000000000000000000180\
-00000000000000000000000000000000000000000000000000000000000001c0\
-0000000000000000000000000000000000000000000000000000000000000001\
-000000000000000000000000000000000000000000000000000000000000000a\
-697066733a2f2f63696400000000000000000000000000000000000000000000\
-0000000000000000000000000000000000000000000000000000000000000005\
-3078616263000000000000000000000000000000000000000000000000000000\
-0000000000000000000000000000000000000000000000000000000000000006\
-7368613235360000000000000000000000000000000000000000000000000000\
-0000000000000000000000000000000000000000000000000000000000000002\
-7b7d000000000000000000000000000000000000000000000000000000000000";
-
-const STATUS_KEY: &str = "0x6150b08c0c9138bbfbfff7e0da81375120124ecd0ec54b8bb8cb4a109966aae8";
-const STATUS_COMMITMENT: &str =
-    "0xa69b155a1ebf01b9f3bccc9a86e18fd1054bd2ab02e6aecc43184fa03662dbe8";
-const STATUS_METADATA: &str = "0x\
-0000000000000000000000000000000000000000000000000000000000000001\
-0000000000000000000000000000000000000000000000000000000000000001\
-0000000000000000000000000000000000000000000000000000000000000001\
-00000000000000000000000000000000000000000000000000000000000000a0\
-0000000000000000000000000000000000000000000000000000000000000001\
-0000000000000000000000000000000000000000000000000000000000000008\
-617070726f766564000000000000000000000000000000000000000000000000";
-
-fn field(envelope: &nvnmchain_explorer::anchoring::Envelope, name: &str) -> String {
-    envelope
-        .fields
-        .iter()
-        .find(|f| f.name == name)
-        .unwrap_or_else(|| panic!("field {name} missing from {} envelope", envelope.kind))
-        .value
-        .clone()
-}
-
-// ---------------------------------------------------------------------------
-// Envelopes
-// ---------------------------------------------------------------------------
+const REGISTRY_METADATA: &str = "0x7b2276223a317d";
 
 #[test]
 fn anchored_topic_matches_the_signature() {
@@ -93,76 +32,17 @@ fn anchored_topic_matches_the_signature() {
 }
 
 #[test]
-fn registry_envelope_decodes() {
-    let env = decode_envelope(REGISTRY_KEY, REGISTRY_METADATA).expect("registry envelope");
-    assert_eq!(env.kind, "registry");
-    assert_eq!(field(&env, "id"), "1");
-    assert_eq!(field(&env, "name"), "Docs");
-    assert_eq!(field(&env, "description"), "internal docs");
-    assert_eq!(
-        field(&env, "creator"),
-        "0x2190d584E30F4a2396C1487Aa784428f2068CBE8"
-    );
-    assert_eq!(env.summary, "Registry #1 — Docs");
-}
-
-#[test]
-fn record_envelope_decodes() {
-    let env = decode_envelope(RECORD_KEY, RECORD_METADATA).expect("record envelope");
-    assert_eq!(env.kind, "record");
-    assert_eq!(field(&env, "registry_id"), "1");
-    assert_eq!(field(&env, "uri"), "ipfs://cid");
-    assert_eq!(field(&env, "checksum_algo"), "sha256");
-    assert_eq!(env.summary, "Record #1 v1 — 0xabc");
-}
-
-#[test]
-fn status_envelope_decodes() {
-    let env = decode_envelope(STATUS_KEY, STATUS_METADATA).expect("status envelope");
-    assert_eq!(env.kind, "status");
-    assert_eq!(field(&env, "status"), "approved");
-    // The sequence number is what makes re-asserting the same status a fresh anchor.
-    assert_eq!(field(&env, "seq"), "1");
-    assert_eq!(env.summary, "Status of record #1 v1 — approved");
-}
-
-#[test]
-fn envelopes_are_identified_by_the_key_they_are_anchored_under() {
-    // The payloads carry nothing naming their shape; the key does, and each is
-    // `keccak256(abi.encode(kind, ids…))` over ids the payload itself repeats.
-    // Under any other key the same bytes are just bytes.
-    assert!(decode_envelope(RECORD_KEY, REGISTRY_METADATA).is_none());
-    assert!(decode_envelope(STATUS_KEY, RECORD_METADATA).is_none());
-    let wrong = format!("0x{}", "11".repeat(32));
-    assert!(decode_envelope(&wrong, STATUS_METADATA).is_none());
-}
-
-#[test]
-fn foreign_payloads_are_not_envelopes() {
-    // Anything may be anchored, so a payload that is not an envelope is the
-    // ordinary case, not an error.
-    for payload in [
-        "0x",
-        "0xdeadbeef",
-        &format!("0x{}", "ab".repeat(64)),
-        // Registry-shaped head, but the tail a string offset points at is absent.
-        &format!("0x{}", "00".repeat(32 * 6)),
-    ] {
-        assert!(
-            decode_envelope(REGISTRY_KEY, payload).is_none(),
-            "payload {payload} should not decode as an envelope"
-        );
-    }
-}
-
-#[test]
 fn anchor_and_hash_payloads_are_self_verifying() {
-    // `anchorAndHash` commits to `keccak256(metadata)`, which is what every
-    // AnchoringRegistry write uses.
-    assert!(is_self_verifying(REGISTRY_COMMITMENT, REGISTRY_METADATA));
-    assert!(is_self_verifying(RECORD_COMMITMENT, RECORD_METADATA));
-    assert!(is_self_verifying(STATUS_COMMITMENT, STATUS_METADATA));
-    assert!(!is_self_verifying(REGISTRY_COMMITMENT, RECORD_METADATA));
+    // The precompile's own guarantee: anchorAndHash commits to the digest of
+    // its own metadata, whatever that metadata turns out to mean.
+    let metadata = b"{\"v\":1}";
+    let commitment = keccak_hex(metadata);
+    let hexed = format!("0x{}", hex::encode(metadata));
+    assert!(is_self_verifying(&commitment, &hexed));
+    assert!(!is_self_verifying(
+        &format!("0x{}", "11".repeat(32)),
+        &hexed
+    ));
 }
 
 #[test]
@@ -462,7 +342,8 @@ async fn anchoring_pages_serve_json_and_html() {
         .expect("index json");
     assert_eq!(index["total"], json!(1));
     assert_eq!(index["namespaces"][0]["namespace"], json!(REGISTRY));
-    assert_eq!(index["recent"][0]["label"], json!("Registry #1 — Docs"));
+    // The row is the log row: what was anchored, not what it means.
+    assert_eq!(index["recent"][0]["commitment"], json!(REGISTRY_COMMITMENT));
 
     let namespace: Value = client
         .get(format!("{base}/anchoring/{REGISTRY}?format=json"))
@@ -487,10 +368,16 @@ async fn anchoring_pages_serve_json_and_html() {
         .expect("key json");
     assert_eq!(key["head"]["commitment"], json!(REGISTRY_COMMITMENT));
     assert_eq!(key["head"], key["history"][0]);
-    assert_eq!(key["envelope"]["kind"], json!("registry"));
-    assert_eq!(key["self_verifying"], json!(true));
+    assert_eq!(key["head"]["metadata"], json!(REGISTRY_METADATA));
+    assert!(
+        key.get("envelope").is_none(),
+        "envelopes belong to the indexer"
+    );
+    // anchorAndHash's guarantee is the precompile's, so the explorer can still
+    // say whether a payload verifies itself.
+    assert_eq!(key["self_verifying"], json!(false));
 
-    // Every page also renders, with the decoded envelope on the key page.
+    // Every page renders.
     for path in [
         "/anchoring".to_string(),
         format!("/anchoring/{REGISTRY}"),
@@ -511,8 +398,10 @@ async fn anchoring_pages_serve_json_and_html() {
         assert!(content_type.contains("text/html"), "GET {path}");
         let body = resp.text().await.expect("body");
         if path.contains(REGISTRY_KEY) {
-            assert!(body.contains("Registry #1 — Docs"), "envelope summary");
-            assert!(body.contains("internal docs"), "envelope fields");
+            assert!(
+                body.contains(REGISTRY_COMMITMENT),
+                "the commitment is shown"
+            );
         }
     }
 }
