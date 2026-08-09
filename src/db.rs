@@ -30,6 +30,13 @@ fn blob_hex(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
+/// One stored address, in the checksummed form the rest of the explorer keys
+/// on — links, balance rows and metadata lookups all compare that spelling, and
+/// binary storage has dropped the case by the time it comes back.
+fn blob_addr(bytes: &[u8]) -> String {
+    crate::decoder::checksum_address(&blob_hex(bytes))
+}
+
 /// Degrade a failed query to "no data", after saying so.
 ///
 /// Pages must survive a database problem — that is why the explorer answers an
@@ -335,6 +342,11 @@ pub fn save_block_bundle(
             inserted.push(transfer);
         }
     }
+    // Token metadata first: refresh_holder_counts updates that row, and a token
+    // first seen in this very block would otherwise not exist yet to update.
+    for meta in tokens {
+        upsert_token_meta(&txn, meta)?;
+    }
     apply_transfer_balances(&txn, &inserted)?;
     refresh_holder_counts(&txn, &inserted)?;
     for tx in txs {
@@ -345,9 +357,6 @@ pub fn save_block_bundle(
                 params![addr, now_ts()],
             )?;
         }
-    }
-    for meta in tokens {
-        upsert_token_meta(&txn, meta)?;
     }
     txn.commit().context("commit block transaction")?;
     Ok(())
@@ -507,13 +516,13 @@ fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),
         block_number: row.get(1)?,
         position: row.get(2)?,
-        from_addr: blob_hex(&row.get::<_, Vec<u8>>(3)?),
-        to_addr: row.get::<_, Option<Vec<u8>>>(4)?.map(|b| blob_hex(&b)),
+        from_addr: blob_addr(&row.get::<_, Vec<u8>>(3)?),
+        to_addr: row.get::<_, Option<Vec<u8>>>(4)?.map(|b| blob_addr(&b)),
         status: row.get(5)?,
         gas_used: row.get(6)?,
         base_fee: row.get(7)?,
-        contract_address: row.get::<_, Option<Vec<u8>>>(8)?.map(|b| blob_hex(&b)),
-        fee_token: row.get::<_, Option<Vec<u8>>>(9)?.map(|b| blob_hex(&b)),
+        contract_address: row.get::<_, Option<Vec<u8>>>(8)?.map(|b| blob_addr(&b)),
+        fee_token: row.get::<_, Option<Vec<u8>>>(9)?.map(|b| blob_addr(&b)),
         fee_amount: row.get(10)?,
         input: row.get(11)?,
         raw: row
@@ -624,7 +633,7 @@ const TOKEN_COLS: &str = "address, name, symbol, decimals, currency, total_suppl
 
 fn row_to_token(row: &rusqlite::Row) -> rusqlite::Result<TokenMetadata> {
     Ok(TokenMetadata {
-        address: blob_hex(&row.get::<_, Vec<u8>>(0)?),
+        address: blob_addr(&row.get::<_, Vec<u8>>(0)?),
         name: row.get(1)?,
         symbol: row.get(2)?,
         decimals: row.get(3)?,
@@ -783,7 +792,7 @@ fn refresh_holder_counts(conn: &Connection, transfers: &[&TransferEvent]) -> Res
         )?;
         conn.execute(
             "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
-            params![count, now_ts(), t.token_addr],
+            params![count, now_ts(), hex_blob(&t.token_addr)],
         )?;
     }
     Ok(())
@@ -826,7 +835,7 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
         )?;
         conn.execute(
             "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
-            params![count, now_ts(), token],
+            params![count, now_ts(), hex_blob(&token)],
         )?;
     }
     tracing::info!("rebuilt token balances from {n} transfer events");
@@ -852,34 +861,46 @@ pub fn save_transfer(db: &Db, transfer: &TransferEvent) -> Result<()> {
     Ok(())
 }
 
+const TRANSFER_COLS: &str = "e.id, e.tx_hash, e.block_number, e.log_index, e.token_addr, \
+                             e.from_addr, e.to_addr, e.amount, e.timestamp, e.created_at";
+
 fn row_to_transfer(row: &rusqlite::Row) -> rusqlite::Result<TransferEvent> {
     Ok(TransferEvent {
         id: row.get(0)?,
-        tx_hash: row.get(1)?,
+        tx_hash: blob_hex(&row.get::<_, Vec<u8>>(1)?),
         block_number: row.get(2)?,
         log_index: row.get(3)?,
-        token_addr: row.get(4)?,
-        from_addr: row.get(5)?,
-        to_addr: row.get(6)?,
+        token_addr: blob_addr(&row.get::<_, Vec<u8>>(4)?),
+        from_addr: blob_addr(&row.get::<_, Vec<u8>>(5)?),
+        to_addr: blob_addr(&row.get::<_, Vec<u8>>(6)?),
         amount: row.get(7)?,
         timestamp: row.get(8)?,
         created_at: row.get(9)?,
     })
 }
 
-const TRANSFER_COLS: &str = "id, tx_hash, block_number, log_index, token_addr, from_addr, \
-                             to_addr, amount, timestamp, created_at";
-
-fn transfer_to_json(transfer: &TransferEvent, tx: Option<&Transaction>) -> Value {
-    let tx_from = tx
-        .map(|t| t.from_addr.clone())
-        .unwrap_or_else(|| transfer.from_addr.clone());
-    let tx_to = tx
-        .map(|t| t.to_addr.clone())
-        .unwrap_or_else(|| Some(transfer.to_addr.clone()));
-    let tx_timestamp = tx.map(|t| t.timestamp).unwrap_or(transfer.timestamp);
-    let tx_status = tx.map(|t| t.status).unwrap_or(1);
-    json!({
+/// A transfer row plus the four fields of its transaction the listings show.
+/// Columns 10..14 come from the `LEFT JOIN`, so they are all null together when
+/// the transaction has not been indexed; the transfer's own values stand in.
+fn row_to_transfer_json(row: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let transfer = row_to_transfer(row)?;
+    let joined = row.get::<_, Option<Vec<u8>>>(10)?.is_some();
+    let (tx_from, tx_to, tx_timestamp, tx_status) = if joined {
+        (
+            blob_addr(&row.get::<_, Vec<u8>>(11)?),
+            row.get::<_, Option<Vec<u8>>>(12)?.map(|b| blob_addr(&b)),
+            row.get(13)?,
+            row.get(14)?,
+        )
+    } else {
+        (
+            transfer.from_addr.clone(),
+            Some(transfer.to_addr.clone()),
+            transfer.timestamp,
+            1,
+        )
+    };
+    Ok(json!({
         "id": transfer.id,
         "tx_hash": transfer.tx_hash,
         "block_number": transfer.block_number,
@@ -894,44 +915,57 @@ fn transfer_to_json(transfer: &TransferEvent, tx: Option<&Transaction>) -> Value
         "tx_to": tx_to,
         "tx_timestamp": tx_timestamp,
         "tx_status": tx_status,
-    })
+    }))
 }
 
-/// Attach each transfer's transaction, for the sender/recipient/status the
-/// listings show alongside the log.
-fn with_transactions(db: &Db, transfers: &[TransferEvent]) -> Vec<Value> {
-    transfers
-        .iter()
-        .map(|t| transfer_to_json(t, get_transaction(db, &t.tx_hash).as_ref()))
-        .collect()
+/// One page of transfers matching `filter`, joined to their transactions.
+///
+/// Joined rather than fetched per row: the listing wants four fields of the
+/// transaction, and reading each one back whole would re-materialize the raw
+/// RLP and the stored trace once per line of the page.
+fn transfer_page(
+    db: &Db,
+    what: &str,
+    filter: &str,
+    key: &str,
+    page: u32,
+    per_page: u32,
+) -> Vec<Value> {
+    let sql = format!(
+        "SELECT {TRANSFER_COLS}, t.hash, t.from_addr, t.to_addr, t.timestamp, t.status
+         FROM transfer_events e LEFT JOIN transactions t ON t.hash = e.tx_hash
+         WHERE {filter}
+         ORDER BY e.block_number DESC, e.log_index DESC LIMIT ?2 OFFSET ?3"
+    );
+    query_rows(
+        &lock(db),
+        what,
+        &sql,
+        params![hex_blob(key), per_page as i64, page_offset(page, per_page)],
+        row_to_transfer_json,
+    )
 }
 
 pub fn get_token_transfers(db: &Db, token_addr: &str, page: u32, per_page: u32) -> Vec<Value> {
-    let transfers = query_rows(
-        &lock(db),
+    transfer_page(
+        db,
         "get_token_transfers",
-        &format!(
-            "SELECT {TRANSFER_COLS} FROM transfer_events WHERE lower(token_addr)=lower(?1) \
-             ORDER BY block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3"
-        ),
-        params![token_addr, per_page as i64, page_offset(page, per_page)],
-        row_to_transfer,
-    );
-    with_transactions(db, &transfers)
+        "e.token_addr=?1",
+        token_addr,
+        page,
+        per_page,
+    )
 }
 
 pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -> Vec<Value> {
-    let transfers = query_rows(
-        &lock(db),
+    transfer_page(
+        db,
         "get_address_transfers",
-        &format!(
-            "SELECT {TRANSFER_COLS} FROM transfer_events WHERE from_addr=?1 OR to_addr=?1 \
-             ORDER BY block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3"
-        ),
-        params![address, per_page as i64, page_offset(page, per_page)],
-        row_to_transfer,
-    );
-    with_transactions(db, &transfers)
+        "e.from_addr=?1 OR e.to_addr=?1",
+        address,
+        page,
+        per_page,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -952,7 +986,7 @@ pub fn get_tokens_metadata(
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql =
             format!("SELECT {TOKEN_COLS} FROM token_metadata WHERE address IN ({placeholders})");
-        let params = rusqlite::params_from_iter(chunk.iter().map(|a| a.as_str()));
+        let params = rusqlite::params_from_iter(chunk.iter().map(|a| hex_blob(a)));
         for row in query_rows(&conn, "get_tokens_metadata", &sql, params, row_to_token) {
             out.insert(row.address.clone(), row);
         }
@@ -967,7 +1001,7 @@ pub fn get_all_token_addresses(db: &Db) -> Vec<String> {
         "get_all_token_addresses",
         "SELECT address FROM token_metadata",
         [],
-        |r| r.get::<_, String>(0),
+        |r| Ok(blob_addr(&r.get::<_, Vec<u8>>(0)?)),
     )
 }
 

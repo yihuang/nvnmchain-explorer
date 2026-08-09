@@ -997,11 +997,10 @@ pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> 
     for log in &logs {
         if let Some(decoded) = decode_event(log) {
             if decoded.name.as_deref() == Some("Transfer") {
-                let token = log
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                // Checksummed: the token metadata this is rendered with is
+                // looked up by that spelling.
+                let token =
+                    checksum_address(log.get("address").and_then(Value::as_str).unwrap_or(""));
                 let mut from = String::new();
                 let mut to = String::new();
                 let mut amount = String::new();

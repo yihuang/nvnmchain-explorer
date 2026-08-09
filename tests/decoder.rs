@@ -1,3 +1,4 @@
+use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
     flatten_trace, TRANSFER_TOPIC,
@@ -5,7 +6,73 @@ use nvnmchain_explorer::decoder::{
 use nvnmchain_explorer::models::{Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::format_token_amount;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+
+fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    (dir, Arc::new(Mutex::new(conn)))
+}
+
+/// A block carrying one transaction, in the shape the RPC returns it.
+///
+/// Every address here has alphabetic nibbles on purpose: a fixture of digits
+/// alone cannot tell a checksummed address from a lowercase one, and that is
+/// exactly what the storage round-trip has to preserve.
+fn sample_raw_block() -> Value {
+    json!({
+        "number": "0x10",
+        "hash": format!("0x{}", "ab".repeat(32)),
+        "parentHash": format!("0x{}", "cd".repeat(32)),
+        "timestamp": "0x64",
+        "gasUsed": "0x5208",
+        "gasLimit": "0x1c9c380",
+        "miner": format!("0x{}", "2b".repeat(20)),
+        "consensusContext": {"epoch": 1, "view": 2, "proposer": format!("0x{}", "11".repeat(32))},
+        "transactions": [{
+            "hash": format!("0x{}", "ff".repeat(32)),
+            "blockNumber": "0x10",
+            "transactionIndex": "0x0",
+            "from": format!("0x{}", "3c".repeat(20)),
+            "to": format!("0x{}", "4d".repeat(20)),
+            "gas": "0x5208",
+            "gasPrice": "0x4a817c800",
+            "value": "0x1",
+            "nonce": "0x3",
+            "chainId": "0x2b45",
+            "type": "0x76",
+            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
+            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
+        }]
+    })
+}
+
+/// The token and the two parties of the sample transfer.
+fn sample_parties() -> (String, String, String) {
+    (
+        checksum_address(&format!("0x{}", "aa".repeat(20))),
+        checksum_address(&format!("0x{}", "1a".repeat(20))),
+        checksum_address(&format!("0x{}", "2b".repeat(20))),
+    )
+}
+
+fn sample_transfer(block: &nvnmchain_explorer::models::Block, tx: &Transaction) -> TransferEvent {
+    let (token, from, to) = sample_parties();
+    TransferEvent {
+        id: 0,
+        tx_hash: tx.hash.clone(),
+        block_number: block.number,
+        log_index: 0,
+        token_addr: token,
+        from_addr: from,
+        to_addr: to,
+        amount: "100".into(),
+        timestamp: block.timestamp,
+        created_at: 0,
+    }
+}
 
 fn transfer_calldata(to: &str, amount: u128) -> String {
     format!(
@@ -289,45 +356,20 @@ fn fresh_schema_has_all_columns() {
 
 #[test]
 fn blob_hex_round_trip() {
-    use nvnmchain_explorer::db::{self, Db};
-    use std::sync::{Arc, Mutex};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("blob.db");
-    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
-    let db: Db = Arc::new(Mutex::new(conn));
-
     // Block with one transaction (so the tx row is exercised too).
-    let hash = format!("0x{}", "ab".repeat(32));
-    let parent = format!("0x{}", "cd".repeat(32));
-    let proposer = format!("0x{}", "11".repeat(32));
-    let miner = format!("0x{}", "22".repeat(20));
-    let tx_hash = format!("0x{}", "ff".repeat(32));
-    let raw_block = json!({
-        "number": "0x10",
-        "hash": hash,
-        "parentHash": parent,
-        "timestamp": "0x64",
-        "gasUsed": "0x5208",
-        "gasLimit": "0x1c9c380",
-        "miner": miner,
-        "consensusContext": {"epoch": 1, "view": 2, "proposer": proposer},
-        "transactions": [{
-            "hash": tx_hash,
-            "blockNumber": "0x10",
-            "transactionIndex": "0x0",
-            "from": format!("0x{}", "33".repeat(20)),
-            "to": format!("0x{}", "44".repeat(20)),
-            "gas": "0x5208",
-            "gasPrice": "0x4a817c800",
-            "value": "0x1",
-            "nonce": "0x3",
-            "chainId": "0x2b45",
-            "type": "0x76",
-            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
-            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
-        }]
-    });
+    let (_dir, db) = temp_db("blob.db");
+    let raw_block = sample_raw_block();
+    let hash = raw_block["hash"].as_str().unwrap().to_string();
+    let parent = raw_block["parentHash"].as_str().unwrap().to_string();
+    let proposer = raw_block["consensusContext"]["proposer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let miner = raw_block["miner"].as_str().unwrap().to_string();
+    let tx_hash = raw_block["transactions"][0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let block = parse_block(&raw_block);
     // The indexer fills the canonical RLP encoding separately; embed the real
     // bytes of a known tempo 0x76 transaction (block 664125).
@@ -368,56 +410,12 @@ fn blob_hex_round_trip() {
 
 #[test]
 fn duplicate_bundle_is_idempotent() {
-    use nvnmchain_explorer::db::{self, Db};
-    use std::sync::{Arc, Mutex};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("dedup.db");
-    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
-    let db: Db = Arc::new(Mutex::new(conn));
-
-    let raw_block = json!({
-        "number": "0x10",
-        "hash": format!("0x{}", "ab".repeat(32)),
-        "parentHash": format!("0x{}", "cd".repeat(32)),
-        "timestamp": "0x64",
-        "gasUsed": "0x5208",
-        "gasLimit": "0x1c9c380",
-        "miner": format!("0x{}", "22".repeat(20)),
-        "consensusContext": {"epoch": 1, "view": 2, "proposer": format!("0x{}", "11".repeat(32))},
-        "transactions": [{
-            "hash": format!("0x{}", "ff".repeat(32)),
-            "blockNumber": "0x10",
-            "transactionIndex": "0x0",
-            "from": format!("0x{}", "33".repeat(20)),
-            "to": format!("0x{}", "44".repeat(20)),
-            "gas": "0x5208",
-            "gasPrice": "0x4a817c800",
-            "value": "0x1",
-            "nonce": "0x3",
-            "chainId": "0x2b45",
-            "type": "0x76",
-            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
-            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
-        }]
-    });
+    let (_dir, db) = temp_db("dedup.db");
+    let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
-    let token = checksum_address(&format!("0x{}", "aa".repeat(20)));
-    let from = checksum_address(&format!("0x{}", "11".repeat(20)));
-    let to = checksum_address(&format!("0x{}", "22".repeat(20)));
-    let transfer = TransferEvent {
-        id: 0,
-        tx_hash: tx.hash.clone(),
-        block_number: block.number,
-        log_index: 0,
-        token_addr: token.clone(),
-        from_addr: from.clone(),
-        to_addr: to.clone(),
-        amount: "100".into(),
-        timestamp: block.timestamp,
-        created_at: 0,
-    };
+    let (token, from, to) = sample_parties();
+    let transfer = sample_transfer(&block, &tx);
 
     // The same block written twice (what the indexer's concurrent fetch/retry
     // races can produce). Blocks and txs upsert; transfers must dedupe.
@@ -476,4 +474,74 @@ fn duplicate_bundle_is_idempotent() {
         )
         .expect("sender balance");
     assert_eq!(sender, "-100", "sender delta applied exactly once");
+}
+
+/// A transfer written by the indexer must read back through every listing that
+/// shows it. The columns are BLOBs; readers that bound TEXT against them
+/// matched nothing, so these tabs were permanently empty while the counters
+/// beside them reported rows.
+#[test]
+fn indexed_transfer_reads_back_through_every_listing() {
+    let (_dir, db) = temp_db("listings.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    let (token, from, to) = sample_parties();
+    let transfer = sample_transfer(&block, &tx);
+    let meta = nvnmchain_explorer::tokens::TokenMeta {
+        address: token.clone(),
+        name: "Probe".into(),
+        symbol: "PRB".into(),
+        decimals: 2,
+        currency: "USD".into(),
+        total_supply: "1000".into(),
+    };
+    db::save_block_bundle(
+        &db,
+        &block,
+        std::slice::from_ref(&tx),
+        std::slice::from_ref(&transfer),
+        std::slice::from_ref(&meta),
+    )
+    .expect("save bundle");
+
+    let by_token = db::get_token_transfers(&db, &token, 1, 25);
+    assert_eq!(by_token.len(), 1, "token transfers");
+    assert_eq!(by_token[0]["from_addr"], json!(from));
+    assert_eq!(by_token[0]["to_addr"], json!(to));
+    assert_eq!(by_token[0]["amount"], json!("100"));
+    // Joined against the transaction, not just the log — and canonicalized, not
+    // handed back in whatever case the node happened to report.
+    assert_eq!(
+        by_token[0]["tx_from"],
+        json!(checksum_address(&tx.from_addr))
+    );
+    assert_ne!(tx.from_addr, checksum_address(&tx.from_addr));
+
+    assert_eq!(
+        db::get_address_transfers(&db, &to, 1, 25).len(),
+        1,
+        "recipient"
+    );
+    assert_eq!(
+        db::get_address_transfers(&db, &from, 1, 25).len(),
+        1,
+        "sender"
+    );
+    assert_eq!(db::get_token_transfer_count(&db, &token), 1);
+
+    // Holdings need the batch metadata lookup, which bound TEXT as well.
+    assert_eq!(
+        db::get_tokens_metadata(&db, std::slice::from_ref(&token)).len(),
+        1
+    );
+    let holdings = db::get_address_holdings(&db, &to);
+    assert_eq!(holdings.len(), 1, "recipient holdings");
+    assert_eq!(holdings[0]["symbol"], json!("PRB"));
+    assert_eq!(holdings[0]["formatted"], json!("1"));
+
+    // And the tokens list reports the holders the transfer created.
+    assert_eq!(db::get_token_holder_count(&db, &token), 2);
+    let stored = db::get_token_metadata(&db, &token).expect("token metadata");
+    assert_eq!(stored.holder_count, 2, "holder_count on the tokens list");
 }
