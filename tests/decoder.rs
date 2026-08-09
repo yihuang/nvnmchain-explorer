@@ -1,11 +1,16 @@
 use nvnmchain_explorer::decoder::{
-    checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
-    flatten_trace, TRANSFER_TOPIC,
+    checksum_address, decode_abi_args, decode_event, decode_function_call, extract_balance_changes,
+    extract_calls, flatten_trace, TRANSFER_TOPIC,
 };
 use nvnmchain_explorer::models::{Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::format_token_amount;
 use serde_json::json;
+
+/// A fixture address from one repeated byte: `addr("22")` is `0x2222…2222`.
+fn addr(byte: &str) -> String {
+    checksum_address(&format!("0x{}", byte.repeat(20)))
+}
 
 fn transfer_calldata(to: &str, amount: u128) -> String {
     format!(
@@ -480,39 +485,32 @@ fn duplicate_bundle_is_idempotent() {
 
 /// `authorizeKey(keyId, WebAuthn, KeyRestrictions{expiry, enforceLimits, one
 /// TokenLimit, allowAnyCalls: false, no CallScopes})`, encoded by `cast`.
-const AUTHORIZE_KEY_CALLDATA: &str = "0x980a6025\
-0000000000000000000000001111111111111111111111111111111111111111\
-0000000000000000000000000000000000000000000000000000000000000002\
-0000000000000000000000000000000000000000000000000000000000000060\
-0000000000000000000000000000000000000000000000000000000070dbd880\
-0000000000000000000000000000000000000000000000000000000000000001\
-00000000000000000000000000000000000000000000000000000000000000a0\
-0000000000000000000000000000000000000000000000000000000000000000\
-0000000000000000000000000000000000000000000000000000000000000120\
-0000000000000000000000000000000000000000000000000000000000000001\
-0000000000000000000000002222222222222222222222222222222222222222\
-00000000000000000000000000000000000000000000000000000000000003e8\
-0000000000000000000000000000000000000000000000000000000000015180\
-0000000000000000000000000000000000000000000000000000000000000000";
+/// One 32-byte argument word per line; `->` marks an offset.
+const AUTHORIZE_KEY_CALLDATA: &str = concat!(
+    "0x980a6025",
+    "0000000000000000000000001111111111111111111111111111111111111111", // keyId
+    "0000000000000000000000000000000000000000000000000000000000000002", // signatureType: WebAuthn
+    "0000000000000000000000000000000000000000000000000000000000000060", // -> restrictions
+    "0000000000000000000000000000000000000000000000000000000070dbd880", // restrictions.expiry
+    "0000000000000000000000000000000000000000000000000000000000000001", // restrictions.enforceLimits
+    "00000000000000000000000000000000000000000000000000000000000000a0", // -> limits
+    "0000000000000000000000000000000000000000000000000000000000000000", // restrictions.allowAnyCalls
+    "0000000000000000000000000000000000000000000000000000000000000120", // -> allowedCalls
+    "0000000000000000000000000000000000000000000000000000000000000001", // limits.len
+    "0000000000000000000000002222222222222222222222222222222222222222", // limits[0].token
+    "00000000000000000000000000000000000000000000000000000000000003e8", // limits[0].amount
+    "0000000000000000000000000000000000000000000000000000000000015180", // limits[0].period
+    "0000000000000000000000000000000000000000000000000000000000000000", // allowedCalls.len
+);
 
 #[test]
 fn keychain_calls_are_recognized() {
-    // Selectors are derived from the canonical signature, so these are the
-    // 4 bytes the chain actually sees — a hardcoded table had them wrong and
-    // matched nothing.
-    let call = decode_function_call(AUTHORIZE_KEY_CALLDATA).expect("authorizeKey");
-    assert_eq!(call.name.as_deref(), Some("authorizeKey"));
-    assert_eq!(call.selector, "0x980a6025");
-
     let revoke = format!("0x5ae7ab32{}{}", "00".repeat(12), "33".repeat(20));
     let call = decode_function_call(&revoke).expect("revokeKey");
     assert_eq!(call.name.as_deref(), Some("revokeKey"));
     assert_eq!(call.params.len(), 1);
     assert_eq!(call.params[0].name, "keyId");
-    assert_eq!(
-        call.params[0].value,
-        checksum_address(&format!("0x{}", "33".repeat(20)))
-    );
+    assert_eq!(call.params[0].value, addr("33"));
 }
 
 #[test]
@@ -522,17 +520,14 @@ fn authorize_key_restrictions_decode() {
     let call = decode_function_call(AUTHORIZE_KEY_CALLDATA).expect("authorizeKey");
     let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
-    assert_eq!(
-        call.params[0].value,
-        checksum_address(&format!("0x{}", "11".repeat(20)))
-    );
+    assert_eq!(call.params[0].value, addr("11"));
     assert_eq!(call.params[1].value, "2");
     // expiry, enforceLimits, one TokenLimit, allowAnyCalls, no CallScopes.
     assert_eq!(
         call.params[2].value,
         format!(
             "(1893456000, true, [({}, 1000, 86400)], false, [])",
-            checksum_address(&format!("0x{}", "22".repeat(20)))
+            addr("22")
         )
     );
 }
@@ -555,10 +550,9 @@ fn tip20_table_answers_before_the_signature_list() {
 
 #[test]
 fn signature_list_selectors_are_the_well_known_ones() {
-    // Selectors are derived by stripping parameter names off the named form, so
-    // a bad derivation would silently stop matching instead of failing loudly.
-    // These six are fixed by ERC-20; pin the 4 bytes rather than trust a
-    // round-trip through the same code that produces them.
+    // Names are stripped off the named form to derive these, and a bad derivation
+    // stops matching silently. Pin the 4 bytes rather than trust a round trip
+    // through the code that produces them.
     for (selector, name) in [
         ("0x70a08231", "balanceOf"),
         ("0x18160ddd", "totalSupply"),
@@ -570,4 +564,171 @@ fn signature_list_selectors_are_the_well_known_ones() {
         let call = decode_function_call(selector).expect(name);
         assert_eq!(call.name.as_deref(), Some(name), "selector {selector}");
     }
+}
+
+/// The same authorization carrying two `CallScope`s, the first with a
+/// `SelectorRule` that names a recipient — encoded by `cast`.
+const SCOPES_CALLDATA: &str = concat!(
+    "0x980a6025",
+    "0000000000000000000000001111111111111111111111111111111111111111", // keyId
+    "0000000000000000000000000000000000000000000000000000000000000002", // signatureType: WebAuthn
+    "0000000000000000000000000000000000000000000000000000000000000060", // -> restrictions
+    "0000000000000000000000000000000000000000000000000000000070dbd880", // restrictions.expiry
+    "0000000000000000000000000000000000000000000000000000000000000001", // restrictions.enforceLimits
+    "00000000000000000000000000000000000000000000000000000000000000a0", // -> limits
+    "0000000000000000000000000000000000000000000000000000000000000000", // restrictions.allowAnyCalls
+    "00000000000000000000000000000000000000000000000000000000000000c0", // -> allowedCalls
+    "0000000000000000000000000000000000000000000000000000000000000000", // limits.len
+    "0000000000000000000000000000000000000000000000000000000000000002", // allowedCalls.len
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> allowedCalls[0]
+    "0000000000000000000000000000000000000000000000000000000000000140", // -> allowedCalls[1]
+    "0000000000000000000000002222222222222222222222222222222222222222", // allowedCalls[0].target
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> [0].selectorRules
+    "0000000000000000000000000000000000000000000000000000000000000001", // [0].selectorRules.len
+    "0000000000000000000000000000000000000000000000000000000000000020", // -> [0].selectorRules[0]
+    "a9059cbb00000000000000000000000000000000000000000000000000000000", // [0].rule[0].selector
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> [0].rule[0].recipients
+    "0000000000000000000000000000000000000000000000000000000000000001", // [0].rule[0].recipients.len
+    "0000000000000000000000003333333333333333333333333333333333333333", // [0].rule[0].recipients[0]
+    "0000000000000000000000004444444444444444444444444444444444444444", // allowedCalls[1].target
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> [1].selectorRules
+    "0000000000000000000000000000000000000000000000000000000000000001", // [1].selectorRules.len
+    "0000000000000000000000000000000000000000000000000000000000000020", // -> [1].selectorRules[0]
+    "095ea7b300000000000000000000000000000000000000000000000000000000", // [1].rule[0].selector
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> [1].rule[0].recipients
+    "0000000000000000000000000000000000000000000000000000000000000000", // [1].rule[0].recipients.len
+);
+
+/// Calldata with one argument word replaced, so a variant fixture cannot drift
+/// from the base it claims to match. `index` counts words after the selector.
+fn with_arg_word(calldata: &str, index: usize, word: &str) -> String {
+    let (selector, args) = calldata.split_at(10);
+    let mut words: Vec<&str> = args
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    assert_eq!(word.len(), 64, "a replacement word is 32 bytes of hex");
+    words[index] = word;
+    format!("{selector}{}", words.concat())
+}
+
+/// Each element of a dynamic array is one offset word. Advancing the head by the
+/// element's field count read the second scope's offset out of the first's
+/// payload, rendering an address built from an offset.
+#[test]
+fn multiple_call_scopes_decode() {
+    let call = decode_function_call(SCOPES_CALLDATA).expect("authorizeKey");
+    assert_eq!(
+        call.params[2].value,
+        format!(
+            "(1893456000, true, [], false, [({}, [(0xa9059cbb, [{}])]), ({}, [(0x095ea7b3, [])])])",
+            addr("22"),
+            addr("33"),
+            addr("44"),
+        )
+    );
+}
+
+/// The count is a claim; the encoding bounds it. Trusting it let one cheap
+/// transaction spin the decoder for 2^64 iterations on every page showing it.
+#[test]
+fn array_length_is_bounded_by_the_calldata() {
+    // Argument word 8 is the `TokenLimit[]` length; one limit is encoded.
+    let hostile = with_arg_word(
+        AUTHORIZE_KEY_CALLDATA,
+        8,
+        "000000000000000000000000000000000000000000000000ffffffffffffffff",
+    );
+    let call = decode_function_call(&hostile).expect("authorizeKey");
+    assert_eq!(
+        call.params[2].value,
+        format!(
+            "(1893456000, true, [({}, 1000, 86400)], false, [])",
+            addr("22")
+        ),
+        "u64::MAX limits claimed, exactly one encoded"
+    );
+}
+
+/// A fixed-size array of dynamic elements has no length prefix — its head is `k`
+/// offsets. Reading a count there consumed the first offset and shifted the rest.
+#[test]
+fn fixed_size_array_of_dynamic_elements_has_no_length_prefix() {
+    // The argument is dynamic, so the head is one offset to the array; the array
+    // is two offsets relative to its own start, with no length word.
+    let calldata = [
+        format!("{:064x}", 0x20),   // argument -> array
+        format!("{:064x}", 0x40),   // element 0 -> "hi"
+        format!("{:064x}", 0x80),   // element 1 -> "yo"
+        format!("{:064x}", 2),      //
+        format!("{:0<64}", "6869"), // "hi"
+        format!("{:064x}", 2),      //
+        format!("{:0<64}", "796f"), // "yo"
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["string[2]"], &bytes),
+        vec!["[hi, yo]".to_string()]
+    );
+}
+
+/// Dynamic `bytes` and `string`: offsets to a length word and padded payload.
+#[test]
+fn bytes_and_string_arguments_decode() {
+    let calldata = [
+        format!("{:064x}", 0x40),       // -> bytes
+        format!("{:064x}", 0x80),       // -> string
+        format!("{:064x}", 4),          //
+        format!("{:0<64}", "deadbeef"), //
+        format!("{:064x}", 2),          //
+        format!("{:0<64}", "6869"),     // "hi"
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["bytes", "string"], &bytes),
+        vec!["0xdeadbeef".to_string(), "hi".to_string()]
+    );
+}
+
+/// A length the payload cannot back reads empty, not whatever follows.
+#[test]
+fn a_length_longer_than_its_payload_reads_empty() {
+    let calldata = [
+        format!("{:064x}", 0x20),
+        format!("{:064x}", 100),        // claims 100 bytes
+        format!("{:0<64}", "deadbeef"), // 32 are present
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(decode_abi_args(&["bytes"], &bytes), vec!["0x".to_string()]);
+}
+
+/// A static array sits inline at its element width — no offset, no length.
+#[test]
+fn fixed_size_array_of_static_elements_is_inline() {
+    let calldata = [
+        format!("{:064x}", 1),
+        format!("{:064x}", 2),
+        format!("{:064x}", 3),
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["uint256[3]"], &bytes),
+        vec!["[1, 2, 3]".to_string()]
+    );
+}
+
+/// Truncated calldata decodes what is there rather than padding with zeros.
+#[test]
+fn a_truncated_static_array_stops_at_the_data() {
+    let calldata = [format!("{:064x}", 1), format!("{:064x}", 2)].concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["uint256[3]"], &bytes),
+        vec!["[]".to_string()]
+    );
 }

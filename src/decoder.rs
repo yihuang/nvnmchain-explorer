@@ -276,12 +276,21 @@ impl AbiType {
         }
     }
 
-    /// Number of 32-byte head words a value of this type occupies (only valid
-    /// for static types; dynamic values always occupy one head word).
+    /// 32-byte head words this type occupies; a dynamic value is one offset word.
     fn head_words(&self) -> usize {
+        if self.is_dynamic() {
+            1
+        } else {
+            self.static_head_words()
+        }
+    }
+
+    /// Head words for a type already known static. Its fields are static too, so
+    /// the recursion never re-checks — asking per level would re-walk the subtree.
+    fn static_head_words(&self) -> usize {
         match self {
-            AbiType::Array(elem, Some(k)) => k * elem.head_words(),
-            AbiType::Tuple(types) => types.iter().map(|t| t.head_words()).sum(),
+            AbiType::Array(elem, Some(k)) => k * elem.static_head_words(),
+            AbiType::Tuple(types) => types.iter().map(|t| t.static_head_words()).sum(),
             _ => 1,
         }
     }
@@ -339,6 +348,19 @@ fn hex_bytes(value: &[u8]) -> String {
     format!("0x{}", hex::encode(value))
 }
 
+/// A leading word as a count or offset; one too large to be real reads as 0.
+fn word_usize(bytes: &[u8]) -> usize {
+    big_from_word(word(bytes)).to_string().parse().unwrap_or(0)
+}
+
+/// Payload of a length-prefixed value; a length the data cannot back reads empty.
+fn payload_after_len(value: &[u8]) -> &[u8] {
+    value
+        .get(32..)
+        .and_then(|rest| rest.get(..word_usize(value)))
+        .unwrap_or(&[])
+}
+
 /// Format a decoded value: addresses checksummed, ints decimal, bytes hex,
 /// bools lowercase.
 fn format_value(ty: &AbiType, value: &[u8], _ty_str: &str) -> String {
@@ -365,23 +387,8 @@ fn format_value(ty: &AbiType, value: &[u8], _ty_str: &str) -> String {
             }
         }
         AbiType::FixedBytes(len) => hex_bytes(&value[..*len.min(&value.len())]),
-        AbiType::Bytes => {
-            // len word + payload
-            let len = big_from_word(value)
-                .to_string()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let payload = value.get(32..32 + len).unwrap_or(&[]);
-            hex_bytes(payload)
-        }
-        AbiType::String => {
-            let len = big_from_word(value)
-                .to_string()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let payload = value.get(32..32 + len).unwrap_or(&[]);
-            String::from_utf8_lossy(payload).into_owned()
-        }
+        AbiType::Bytes => hex_bytes(payload_after_len(value)),
+        AbiType::String => String::from_utf8_lossy(payload_after_len(value)).into_owned(),
         AbiType::Function => hex_bytes(&value[..24.min(value.len())]),
         AbiType::Array(_, _) | AbiType::Tuple(_) => {
             // Decoded higher up; fall back to raw hex.
@@ -390,86 +397,77 @@ fn format_value(ty: &AbiType, value: &[u8], _ty_str: &str) -> String {
     }
 }
 
+/// Elements one call may decode. Nested arrays let a small payload describe
+/// quadratically many, so the whole decode shares one allowance.
+const MAX_ELEMENTS: usize = 4096;
+
 /// Decode a tuple (or top-level argument list) of `types` from `data`.
-fn decode_tuple(types: &[AbiType], data: &[u8]) -> Vec<String> {
+fn decode_tuple(types: &[AbiType], data: &[u8], budget: &mut usize) -> Vec<String> {
     let mut values = Vec::with_capacity(types.len());
     let mut head_off = 0usize;
     for ty in types {
+        let head = data.get(head_off * 32..).unwrap_or(&[]);
         if ty.is_dynamic() {
-            let off_bytes = word(data.get(head_off * 32..head_off * 32 + 32).unwrap_or(&[]));
-            let off = big_from_word(off_bytes)
-                .to_string()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let tail = data.get(off..).unwrap_or(&[]);
-            values.push(decode_dynamic(ty, tail));
+            // One offset word, pointing at the tail.
+            let tail = data.get(word_usize(head)..).unwrap_or(&[]);
+            values.push(decode_dynamic(ty, tail, budget));
+            head_off += 1;
         } else {
-            let words = ty.head_words();
-            let start = head_off * 32;
-            let slice = data.get(start..start + words * 32).unwrap_or(&[]);
-            values.push(decode_static(ty, slice));
+            let words = ty.static_head_words();
+            values.push(decode_static(
+                ty,
+                head.get(..words * 32).unwrap_or(&[]),
+                budget,
+            ));
+            head_off += words;
         }
-        head_off += ty.head_words();
     }
     values
 }
 
-fn decode_static(ty: &AbiType, slice: &[u8]) -> String {
+fn decode_static(ty: &AbiType, slice: &[u8], budget: &mut usize) -> String {
     match ty {
-        AbiType::Array(elem, Some(k)) => {
-            let mut parts = Vec::new();
-            let stride = elem.head_words() * 32;
-            for i in 0..*k {
-                let start = i * stride;
-                let item = slice.get(start..start + stride).unwrap_or(&[]);
-                if elem.is_dynamic() {
-                    parts.push(decode_dynamic(elem, item));
-                } else {
-                    parts.push(decode_static(elem, item));
-                }
-            }
-            format!("[{}]", parts.join(", "))
-        }
-        AbiType::Tuple(types) => format!("({})", decode_tuple(types, slice).join(", ")),
+        AbiType::Array(elem, len) => decode_array(elem, *len, slice, budget),
+        AbiType::Tuple(types) => format!("({})", decode_tuple(types, slice, budget).join(", ")),
         _ => format_value(ty, slice, ""),
     }
 }
 
-fn decode_dynamic(ty: &AbiType, data: &[u8]) -> String {
+fn decode_dynamic(ty: &AbiType, data: &[u8], budget: &mut usize) -> String {
     match ty {
         AbiType::Bytes | AbiType::String => format_value(ty, data, ""),
-        AbiType::Array(elem, _) => {
-            let count = big_from_word(word(data))
-                .to_string()
-                .parse::<usize>()
-                .unwrap_or(0);
-            let body = data.get(32..).unwrap_or(&[]);
-            let mut parts = Vec::new();
-            let mut head_off = 0usize;
-            for _ in 0..count {
-                if elem.is_dynamic() {
-                    let off = big_from_word(word(
-                        body.get(head_off * 32..head_off * 32 + 32).unwrap_or(&[]),
-                    ))
-                    .to_string()
-                    .parse::<usize>()
-                    .unwrap_or(0);
-                    parts.push(decode_dynamic(elem, body.get(off..).unwrap_or(&[])));
-                } else {
-                    let words = elem.head_words();
-                    let start = head_off * 32;
-                    parts.push(decode_static(
-                        elem,
-                        body.get(start..start + words * 32).unwrap_or(&[]),
-                    ));
-                }
-                head_off += elem.head_words();
-            }
-            format!("[{}]", parts.join(", "))
-        }
-        AbiType::Tuple(types) => format!("({})", decode_tuple(types, data).join(", ")),
+        AbiType::Array(elem, len) => decode_array(elem, *len, data, budget),
+        AbiType::Tuple(types) => format!("({})", decode_tuple(types, data, budget).join(", ")),
         _ => format_value(ty, data, ""),
     }
+}
+
+/// Array elements. Only a dynamic-length array is length-prefixed: `T[k]` states
+/// its count in the type. Dynamic elements are offset words, static ones inline.
+fn decode_array(elem: &AbiType, len: Option<usize>, data: &[u8], budget: &mut usize) -> String {
+    let (count, body) = match len {
+        Some(k) => (k, data),
+        None => (word_usize(data), data.get(32..).unwrap_or(&[])),
+    };
+    let dynamic = elem.is_dynamic();
+    let stride = elem.head_words().max(1);
+    // Decode only what the calldata carries: `MAX_ELEMENTS` bounds the work,
+    // this stops an overlong count fabricating entries and draining the budget.
+    let count = count.min(body.len() / (stride * 32));
+    let mut parts = Vec::new();
+    for i in 0..count {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        let head = body.get(i * stride * 32..).unwrap_or(&[]);
+        parts.push(if dynamic {
+            decode_dynamic(elem, body.get(word_usize(head)..).unwrap_or(&[]), budget)
+        } else {
+            decode_static(elem, head.get(..stride * 32).unwrap_or(&[]), budget)
+        });
+    }
+    format!("[{}]", parts.join(", "))
 }
 
 /// Decode ABI-encoded arguments for `types` from raw calldata (after selector).
@@ -478,7 +476,8 @@ pub fn decode_abi_args(types: &[&str], data: &[u8]) -> Vec<String> {
     if parsed.len() != types.len() {
         return Vec::new();
     }
-    decode_tuple(&parsed, data)
+    let mut budget = MAX_ELEMENTS;
+    decode_tuple(&parsed, data, &mut budget)
 }
 
 // ---------------------------------------------------------------------------
