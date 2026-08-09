@@ -504,7 +504,7 @@ const AUTHORIZE_KEY_CALLDATA: &str = concat!(
 );
 
 #[test]
-fn keychain_calls_are_recognized() {
+fn revoke_key_decodes() {
     let revoke = format!("0x5ae7ab32{}{}", "00".repeat(12), "33".repeat(20));
     let call = decode_function_call(&revoke).expect("revokeKey");
     assert_eq!(call.name.as_deref(), Some("revokeKey"));
@@ -533,9 +533,9 @@ fn authorize_key_restrictions_decode() {
 }
 
 #[test]
-fn tip20_table_answers_before_the_signature_list() {
-    // mint/burn are TIP-20 functions, and that table is consulted first — a
-    // second entry for them in the signature list could never be reached.
+fn tip20_functions_report_their_named_inputs() {
+    // mint/burn resolve from the TIP-20 table, which carries the canonical form
+    // and the names. Precedence needs a selector in both tables — unit-tested.
     let mint = format!("0x40c10f19{}{}{:064x}", "00".repeat(12), "11".repeat(20), 5);
     let call = decode_function_call(&mint).expect("mint");
     assert_eq!(call.signature.as_deref(), Some("mint(address,uint256)"));
@@ -560,6 +560,15 @@ fn signature_list_selectors_are_the_well_known_ones() {
         ("0x95d89b41", "symbol"),
         ("0x313ce567", "decimals"),
         ("0xdd62ed3e", "allowance"),
+        ("0x54063a55", "authorizeKey"),
+        ("0x980a6025", "authorizeKey"),
+        ("0xe3c154d2", "authorizeKey"),
+        ("0x9a424307", "authorizeAdminKey"),
+        ("0xcff31c46", "burnKeyAuthorizationWitness"),
+        ("0x5ae7ab32", "revokeKey"),
+        ("0xcbbb4480", "updateSpendingLimit"),
+        ("0xf5456703", "setAllowedCalls"),
+        ("0xf3941811", "removeAllowedCalls"),
     ] {
         let call = decode_function_call(selector).expect(name);
         assert_eq!(call.name.as_deref(), Some(name), "selector {selector}");
@@ -599,6 +608,26 @@ const SCOPES_CALLDATA: &str = concat!(
     "0000000000000000000000000000000000000000000000000000000000000000", // [1].rule[0].recipients.len
 );
 
+/// The TIP-1053 witness overload: `KeyRestrictions` sits *before* another
+/// argument — encoded by `cast`.
+const WITNESS_CALLDATA: &str = concat!(
+    "0xe3c154d2",
+    "0000000000000000000000001111111111111111111111111111111111111111", // keyId
+    "0000000000000000000000000000000000000000000000000000000000000001", // signatureType: P256
+    "0000000000000000000000000000000000000000000000000000000000000080", // -> restrictions
+    "00000000000000000000000000000000000000000000000000000000000000ab", // witness
+    "0000000000000000000000000000000000000000000000000000000070dbd880", // restrictions.expiry
+    "0000000000000000000000000000000000000000000000000000000000000000", // restrictions.enforceLimits
+    "00000000000000000000000000000000000000000000000000000000000000a0", // -> limits
+    "0000000000000000000000000000000000000000000000000000000000000001", // restrictions.allowAnyCalls
+    "0000000000000000000000000000000000000000000000000000000000000120", // -> allowedCalls
+    "0000000000000000000000000000000000000000000000000000000000000001", // limits.len
+    "0000000000000000000000002222222222222222222222222222222222222222", // limits[0].token
+    "00000000000000000000000000000000000000000000000000000000000003e8", // limits[0].amount
+    "0000000000000000000000000000000000000000000000000000000000015180", // limits[0].period
+    "0000000000000000000000000000000000000000000000000000000000000000", // allowedCalls.len
+);
+
 /// Calldata with one argument word replaced, so a variant fixture cannot drift
 /// from the base it claims to match. `index` counts words after the selector.
 fn with_arg_word(calldata: &str, index: usize, word: &str) -> String {
@@ -628,6 +657,24 @@ fn multiple_call_scopes_decode() {
             addr("44"),
         )
     );
+}
+
+/// A dynamic tuple occupies one head word, not one per field. With `restrictions`
+/// last nothing follows it to misplace; the witness overload is what catches it.
+#[test]
+fn witness_overload_decodes_the_argument_after_the_tuple() {
+    let call = decode_function_call(WITNESS_CALLDATA).expect("authorizeKey with witness");
+    assert_eq!(call.name.as_deref(), Some("authorizeKey"));
+    let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["keyId", "signatureType", "restrictions", "witness"]);
+    assert_eq!(
+        call.params[2].value,
+        format!(
+            "(1893456000, false, [({}, 1000, 86400)], true, [])",
+            addr("22")
+        )
+    );
+    assert_eq!(call.params[3].value, format!("0x{:064x}", 0xab));
 }
 
 /// The count is a claim; the encoding bounds it. Trusting it let one cheap

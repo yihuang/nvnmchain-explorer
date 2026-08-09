@@ -571,10 +571,22 @@ fn additional_sigs() -> &'static [&'static str] {
         "decimals()",
         "allowance(address owner, address spender)",
         // AccountKeychain. `KeyRestrictions` is spelled as the tuple it expands
-        // to: the selector is hashed over the expansion, not the struct name.
+        // to, since the selector hashes the expansion, not the struct name.
+        // `authorizeKey` is overloaded three times and each hashes to its own
+        // selector: legacy fills pre-T3 blocks, witness is the T5 path.
+        "authorizeKey(address keyId, uint8 signatureType, uint64 expiry, bool enforceLimits, \
+         (address,uint256)[] limits)",
         "authorizeKey(address keyId, uint8 signatureType, \
          (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions)",
+        "authorizeKey(address keyId, uint8 signatureType, \
+         (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions, \
+         bytes32 witness)",
+        "authorizeAdminKey(address keyId, uint8 signatureType, bytes32 witness)",
+        "burnKeyAuthorizationWitness(bytes32 witness)",
         "revokeKey(address keyId)",
+        "updateSpendingLimit(address keyId, address token, uint256 newLimit)",
+        "setAllowedCalls(address keyId, (address,(bytes4,address[])[])[] scopes)",
+        "removeAllowedCalls(address keyId, address target)",
     ]
 }
 
@@ -582,69 +594,106 @@ fn additional_sigs() -> &'static [&'static str] {
 /// inputs and report the canonical signature, the rest are read off the string.
 enum Known {
     Tip20(&'static FnDef),
-    Sig(&'static str),
+    Sig(SigEntry),
+}
+
+/// A signature-list entry, split up when the table is built rather than per decode.
+struct SigEntry {
+    name: &'static str,
+    canonical: String,
+    inputs: Vec<(&'static str, &'static str)>,
+}
+
+impl Known {
+    /// Name, canonical signature, and named inputs, whichever table answered.
+    fn parts(&self) -> (&str, &str, &[(&'static str, &'static str)]) {
+        match self {
+            Known::Tip20(def) => (def.name, def.canonical, def.inputs),
+            Known::Sig(entry) => (entry.name, &entry.canonical, &entry.inputs),
+        }
+    }
 }
 
 /// Selectors are keccak hashes, so they are derived once here rather than on
 /// every decode. TIP-20 takes precedence: a function listed in both tables is
 /// answered from the richer entry.
-static BY_SELECTOR: LazyLock<HashMap<String, Known>> = LazyLock::new(|| {
+static BY_SELECTOR: LazyLock<HashMap<String, Known>> =
+    LazyLock::new(|| build_table(tip20_fns(), additional_sigs()));
+
+/// Split out so the precedence rule can be tested against a deliberate collision:
+/// the live tables no longer share a selector.
+fn build_table(tip20: &'static [FnDef], sigs: &'static [&'static str]) -> HashMap<String, Known> {
     let mut by_selector = HashMap::new();
-    for def in tip20_fns() {
+    for def in tip20 {
         by_selector.insert(selector_hex(def.canonical), Known::Tip20(def));
     }
-    for &sig in additional_sigs() {
+    for &sig in sigs {
+        let canonical = canonical_sig(sig);
         by_selector
-            .entry(selector_hex(&canonical_sig(sig)))
-            .or_insert(Known::Sig(sig));
+            .entry(selector_hex(&canonical))
+            .or_insert_with(|| {
+                Known::Sig(SigEntry {
+                    name: sig.split('(').next().unwrap_or(""),
+                    canonical,
+                    inputs: params_from_sig(sig),
+                })
+            });
     }
     by_selector
-});
+}
 
 fn selector_hex(sig: &str) -> String {
     let hash = keccak256(sig.as_bytes());
     format!("0x{}", hex::encode(&hash[..4]))
 }
 
+/// Pair each declared input with its value. A missing one renders empty rather
+/// than dropping the parameter, so the call's shape stays visible.
+fn decoded_params(inputs: &[(&str, &str)], values: &[String]) -> Vec<DecodedParam> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (ty, name))| DecodedParam {
+            ty: ty.to_string(),
+            name: if name.is_empty() {
+                format!("arg{i}")
+            } else {
+                name.to_string()
+            },
+            value: values.get(i).cloned().unwrap_or_default(),
+            indexed: false,
+        })
+        .collect()
+}
+
 /// The canonical form the selector is hashed over: parameter names dropped, so
 /// `f(address to, uint256 amount)` becomes `f(address,uint256)`.
 fn canonical_sig(sig: &str) -> String {
     let name = sig.split('(').next().unwrap_or("");
-    format!("{name}({})", types_from_sig(sig).join(","))
+    let types: Vec<&str> = params_from_sig(sig).into_iter().map(|(t, _)| t).collect();
+    format!("{name}({})", types.join(","))
 }
 
-fn param_names_from_sig(sig: &str) -> Vec<String> {
+/// The `(type, name)` of each parameter, split once so the two cannot fall out of
+/// index alignment; an unnamed parameter gets an empty name. `get` rather than
+/// slicing keeps a malformed entry from panicking inside the [`BY_SELECTOR`]
+/// initializer, which would poison the lock for every later decode.
+fn params_from_sig(sig: &str) -> Vec<(&str, &str)> {
     let open = sig.find('(').unwrap_or(0);
     let close = sig.rfind(')').unwrap_or(sig.len());
-    let inner = &sig[open + 1..close];
-    let mut names = Vec::new();
-    for part in split_top_level(inner) {
-        let part = part.trim();
-        if part.is_empty() {
-            names.push(String::new());
-        } else if let Some(sp) = part.rfind(' ') {
-            names.push(part[sp + 1..].trim().to_string());
-        } else {
-            names.push(String::new());
-        }
-    }
-    names
-}
-
-fn types_from_sig(sig: &str) -> Vec<String> {
-    let open = sig.find('(').unwrap_or(0);
-    let close = sig.rfind(')').unwrap_or(sig.len());
-    let inner = &sig[open + 1..close];
+    let inner = sig.get(open + 1..close).unwrap_or("");
     split_top_level(inner)
         .into_iter()
-        .map(|p| {
-            let p = p.trim();
-            match p.rfind(' ') {
-                Some(i) => p[..i].trim().to_string(),
-                None => p.to_string(),
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
             }
+            Some(match part.rfind(' ') {
+                Some(i) => (part[..i].trim(), part[i + 1..].trim()),
+                None => (part, ""),
+            })
         })
-        .filter(|s| !s.is_empty())
         .collect()
 }
 
@@ -661,46 +710,17 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     let (selector, args) = raw.split_at(4);
     let sel_hex = format!("0x{}", hex::encode(selector));
 
+    // Both tables report the canonical signature; the names are on `params`, and
+    // the named form of a struct-taking function is a wall of nested types.
     let (name, signature, params) = match BY_SELECTOR.get(&sel_hex) {
-        Some(Known::Tip20(def)) => {
-            let types: Vec<&str> = def.inputs.iter().map(|(t, _)| *t).collect();
+        Some(known) => {
+            let (name, canonical, inputs) = known.parts();
+            let types: Vec<&str> = inputs.iter().map(|(t, _)| *t).collect();
             let values = decode_abi_args(&types, args);
-            let params: Vec<DecodedParam> = def
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(i, (t, n))| DecodedParam {
-                    ty: t.to_string(),
-                    name: n.to_string(),
-                    value: values.get(i).cloned().unwrap_or_default(),
-                    indexed: false,
-                })
-                .collect();
             (
-                Some(def.name.to_string()),
-                Some(def.canonical.to_string()),
-                params,
-            )
-        }
-        Some(Known::Sig(sig)) => {
-            let types = types_from_sig(sig);
-            let type_refs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
-            let values = decode_abi_args(&type_refs, args);
-            let names = param_names_from_sig(sig);
-            let params: Vec<DecodedParam> = types
-                .iter()
-                .enumerate()
-                .map(|(i, t)| DecodedParam {
-                    ty: t.clone(),
-                    name: names.get(i).cloned().unwrap_or_else(|| format!("arg{i}")),
-                    value: values.get(i).cloned().unwrap_or_default(),
-                    indexed: false,
-                })
-                .collect();
-            (
-                Some(sig.split('(').next().unwrap_or("").to_string()),
-                Some(sig.to_string()),
-                params,
+                Some(name.to_string()),
+                Some(canonical.to_string()),
+                decoded_params(inputs, &values),
             )
         }
         None => (None, None, Vec::new()),
@@ -1121,5 +1141,52 @@ pub fn parse_decimal_or_hex(s: &str) -> i128 {
         i128::from_str_radix(h, 16).unwrap_or(0)
     } else {
         s.parse().unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The live tables share no selector, so this invariant has to be checked
+    /// against a collision built for the purpose: an ERC-20 spelling of a
+    /// TIP-20 function must not shadow the richer entry.
+    #[test]
+    fn tip20_wins_when_both_tables_claim_a_selector() {
+        static TIP20: [FnDef; 1] = [FnDef {
+            name: "burn",
+            canonical: "burn(uint256)",
+            inputs: &[("uint256", "amount")],
+        }];
+        let table = build_table(&TIP20, &["burn(uint256 value)"]);
+        match table.get(&selector_hex("burn(uint256)")) {
+            Some(Known::Tip20(def)) => assert_eq!(def.inputs[0].1, "amount"),
+            Some(Known::Sig(entry)) => {
+                panic!(
+                    "signature list shadowed the TIP-20 entry: {}",
+                    entry.canonical
+                )
+            }
+            None => panic!("burn(uint256) missing from the table"),
+        }
+    }
+
+    /// Every entry must survive the round trip its selector depends on: names
+    /// stripped cleanly, and every resulting type understood by the decoder.
+    #[test]
+    fn every_signature_canonicalizes_and_parses() {
+        for &sig in additional_sigs() {
+            let canonical = canonical_sig(sig);
+            assert!(
+                !canonical.contains(' '),
+                "`{sig}` canonicalizes to `{canonical}`: a type contains a space"
+            );
+            for (ty, _) in params_from_sig(sig) {
+                assert!(
+                    AbiType::parse(ty).is_some(),
+                    "`{sig}` has a type the decoder cannot parse: `{ty}`"
+                );
+            }
+        }
     }
 }
