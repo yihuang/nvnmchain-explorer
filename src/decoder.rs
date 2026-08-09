@@ -3,6 +3,9 @@
 //! A self-contained ABIv2 decoder (no alloy dependency) plus built-in TIP-20 /
 //! ERC-20 token metadata and labels.
 
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
 use num_bigint::{BigInt, Sign};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -235,18 +238,8 @@ impl AbiType {
                 }
             }
         }
-        if s.starts_with('(') {
-            let inner = {
-                let i = find_tuple_end(s)?;
-                &s[1..i]
-            };
-            let mut types = Vec::new();
-            for part in split_top_level(inner) {
-                types.push(AbiType::parse(part)?);
-            }
-            return Some(AbiType::Tuple(types));
-        }
-        // Array suffixes: T[] or T[k]
+        // Array suffixes (T[] or T[k]) before tuples: `(a,b)[]` also starts
+        // with '(', and reading it as a plain tuple drops the array entirely.
         if s.ends_with(']') {
             let open = s.rfind('[')?;
             let inner = &s[..open];
@@ -258,6 +251,17 @@ impl AbiType {
                 Some(dim.parse::<usize>().ok()?)
             };
             return Some(AbiType::Array(elem, len));
+        }
+        if s.starts_with('(') {
+            let inner = {
+                let i = find_tuple_end(s)?;
+                &s[1..i]
+            };
+            let mut types = Vec::new();
+            for part in split_top_level(inner) {
+                types.push(AbiType::parse(part)?);
+            }
+            return Some(AbiType::Tuple(types));
         }
         None
     }
@@ -555,25 +559,59 @@ fn tip20_fns() -> &'static [FnDef] {
     ]
 }
 
-fn additional_sigs() -> &'static [(&'static str, &'static str)] {
-    // selector -> "signature with parameter names"
+/// Functions known by signature alone, written in the named form the UI shows.
+/// The selector is derived from the same string via [`canonical_sig`], so there
+/// is no second spelling to keep in step — a hardcoded selector silently stops
+/// matching the moment it is mistyped.
+fn additional_sigs() -> &'static [&'static str] {
     &[
-        ("0x70a08231", "balanceOf(address account)"),
-        ("0x18160ddd", "totalSupply()"),
-        ("0x06fdde03", "name()"),
-        ("0x95d89b41", "symbol()"),
-        ("0x313ce567", "decimals()"),
-        ("0xdd62ed3e", "allowance(address owner, address spender)"),
-        ("0x40c10f19", "mint(address to, uint256 amount)"),
-        ("0x42966c68", "burn(uint256 amount)"),
-        ("0x0b631400", "authorizeKey(address,uint8,tuple)"),
-        ("0x18783a95", "revokeKey(address keyId)"),
+        "balanceOf(address account)",
+        "totalSupply()",
+        "name()",
+        "symbol()",
+        "decimals()",
+        "allowance(address owner, address spender)",
+        // AccountKeychain. `KeyRestrictions` is spelled as the tuple it expands
+        // to: the selector is hashed over the expansion, not the struct name.
+        "authorizeKey(address keyId, uint8 signatureType, \
+         (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions)",
+        "revokeKey(address keyId)",
     ]
 }
+
+/// How a recognised selector is decoded: TIP-20 functions carry their own named
+/// inputs and report the canonical signature, the rest are read off the string.
+enum Known {
+    Tip20(&'static FnDef),
+    Sig(&'static str),
+}
+
+/// Selectors are keccak hashes, so they are derived once here rather than on
+/// every decode. TIP-20 takes precedence: a function listed in both tables is
+/// answered from the richer entry.
+static BY_SELECTOR: LazyLock<HashMap<String, Known>> = LazyLock::new(|| {
+    let mut by_selector = HashMap::new();
+    for def in tip20_fns() {
+        by_selector.insert(selector_hex(def.canonical), Known::Tip20(def));
+    }
+    for &sig in additional_sigs() {
+        by_selector
+            .entry(selector_hex(&canonical_sig(sig)))
+            .or_insert(Known::Sig(sig));
+    }
+    by_selector
+});
 
 fn selector_hex(sig: &str) -> String {
     let hash = keccak256(sig.as_bytes());
     format!("0x{}", hex::encode(&hash[..4]))
+}
+
+/// The canonical form the selector is hashed over: parameter names dropped, so
+/// `f(address to, uint256 amount)` becomes `f(address,uint256)`.
+fn canonical_sig(sig: &str) -> String {
+    let name = sig.split('(').next().unwrap_or("");
+    format!("{name}({})", types_from_sig(sig).join(","))
 }
 
 fn param_names_from_sig(sig: &str) -> Vec<String> {
@@ -621,12 +659,11 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     if raw.len() < 4 {
         return None;
     }
-    let selector = &raw[..4];
+    let (selector, args) = raw.split_at(4);
     let sel_hex = format!("0x{}", hex::encode(selector));
-    let args = &raw[4..];
 
-    for def in tip20_fns() {
-        if selector_hex(def.canonical) == sel_hex {
+    let (name, signature, params) = match BY_SELECTOR.get(&sel_hex) {
+        Some(Known::Tip20(def)) => {
             let types: Vec<&str> = def.inputs.iter().map(|(t, _)| *t).collect();
             let values = decode_abi_args(&types, args);
             let params: Vec<DecodedParam> = def
@@ -640,44 +677,40 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
                     indexed: false,
                 })
                 .collect();
-            return Some(DecodedCall {
-                name: Some(def.name.to_string()),
-                signature: Some(def.canonical.to_string()),
+            (
+                Some(def.name.to_string()),
+                Some(def.canonical.to_string()),
                 params,
-                selector: sel_hex,
-                raw_args: format!("0x{}", hex::encode(args)),
-            });
+            )
         }
-    }
-
-    if let Some((_, sig)) = additional_sigs().iter().find(|(s, _)| s == &sel_hex) {
-        let types = types_from_sig(sig);
-        let type_refs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
-        let values = decode_abi_args(&type_refs, args);
-        let names = param_names_from_sig(sig);
-        let params: Vec<DecodedParam> = types
-            .iter()
-            .enumerate()
-            .map(|(i, t)| DecodedParam {
-                ty: t.clone(),
-                name: names.get(i).cloned().unwrap_or_else(|| format!("arg{i}")),
-                value: values.get(i).cloned().unwrap_or_default(),
-                indexed: false,
-            })
-            .collect();
-        return Some(DecodedCall {
-            name: Some(sig.split('(').next().unwrap_or("").to_string()),
-            signature: Some(sig.to_string()),
-            params,
-            selector: sel_hex,
-            raw_args: format!("0x{}", hex::encode(args)),
-        });
-    }
+        Some(Known::Sig(sig)) => {
+            let types = types_from_sig(sig);
+            let type_refs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
+            let values = decode_abi_args(&type_refs, args);
+            let names = param_names_from_sig(sig);
+            let params: Vec<DecodedParam> = types
+                .iter()
+                .enumerate()
+                .map(|(i, t)| DecodedParam {
+                    ty: t.clone(),
+                    name: names.get(i).cloned().unwrap_or_else(|| format!("arg{i}")),
+                    value: values.get(i).cloned().unwrap_or_default(),
+                    indexed: false,
+                })
+                .collect();
+            (
+                Some(sig.split('(').next().unwrap_or("").to_string()),
+                Some(sig.to_string()),
+                params,
+            )
+        }
+        None => (None, None, Vec::new()),
+    };
 
     Some(DecodedCall {
-        name: None,
-        signature: None,
-        params: Vec::new(),
+        name,
+        signature,
+        params,
         selector: sel_hex,
         raw_args: format!("0x{}", hex::encode(args)),
     })

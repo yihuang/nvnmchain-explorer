@@ -477,3 +477,97 @@ fn duplicate_bundle_is_idempotent() {
         .expect("sender balance");
     assert_eq!(sender, "-100", "sender delta applied exactly once");
 }
+
+/// `authorizeKey(keyId, WebAuthn, KeyRestrictions{expiry, enforceLimits, one
+/// TokenLimit, allowAnyCalls: false, no CallScopes})`, encoded by `cast`.
+const AUTHORIZE_KEY_CALLDATA: &str = "0x980a6025\
+0000000000000000000000001111111111111111111111111111111111111111\
+0000000000000000000000000000000000000000000000000000000000000002\
+0000000000000000000000000000000000000000000000000000000000000060\
+0000000000000000000000000000000000000000000000000000000070dbd880\
+0000000000000000000000000000000000000000000000000000000000000001\
+00000000000000000000000000000000000000000000000000000000000000a0\
+0000000000000000000000000000000000000000000000000000000000000000\
+0000000000000000000000000000000000000000000000000000000000000120\
+0000000000000000000000000000000000000000000000000000000000000001\
+0000000000000000000000002222222222222222222222222222222222222222\
+00000000000000000000000000000000000000000000000000000000000003e8\
+0000000000000000000000000000000000000000000000000000000000015180\
+0000000000000000000000000000000000000000000000000000000000000000";
+
+#[test]
+fn keychain_calls_are_recognized() {
+    // Selectors are derived from the canonical signature, so these are the
+    // 4 bytes the chain actually sees — a hardcoded table had them wrong and
+    // matched nothing.
+    let call = decode_function_call(AUTHORIZE_KEY_CALLDATA).expect("authorizeKey");
+    assert_eq!(call.name.as_deref(), Some("authorizeKey"));
+    assert_eq!(call.selector, "0x980a6025");
+
+    let revoke = format!("0x5ae7ab32{}{}", "00".repeat(12), "33".repeat(20));
+    let call = decode_function_call(&revoke).expect("revokeKey");
+    assert_eq!(call.name.as_deref(), Some("revokeKey"));
+    assert_eq!(call.params.len(), 1);
+    assert_eq!(call.params[0].name, "keyId");
+    assert_eq!(
+        call.params[0].value,
+        checksum_address(&format!("0x{}", "33".repeat(20)))
+    );
+}
+
+#[test]
+fn authorize_key_restrictions_decode() {
+    // `KeyRestrictions` is a tuple holding arrays of tuples; naming it `tuple`
+    // in the signature decoded to nothing at all.
+    let call = decode_function_call(AUTHORIZE_KEY_CALLDATA).expect("authorizeKey");
+    let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert_eq!(
+        call.params[0].value,
+        checksum_address(&format!("0x{}", "11".repeat(20)))
+    );
+    assert_eq!(call.params[1].value, "2");
+    // expiry, enforceLimits, one TokenLimit, allowAnyCalls, no CallScopes.
+    assert_eq!(
+        call.params[2].value,
+        format!(
+            "(1893456000, true, [({}, 1000, 86400)], false, [])",
+            checksum_address(&format!("0x{}", "22".repeat(20)))
+        )
+    );
+}
+
+#[test]
+fn tip20_table_answers_before_the_signature_list() {
+    // mint/burn are TIP-20 functions, and that table is consulted first — a
+    // second entry for them in the signature list could never be reached.
+    let mint = format!("0x40c10f19{}{}{:064x}", "00".repeat(12), "11".repeat(20), 5);
+    let call = decode_function_call(&mint).expect("mint");
+    assert_eq!(call.signature.as_deref(), Some("mint(address,uint256)"));
+    assert_eq!(call.params[1].value, "5");
+
+    let burn = format!("0x42966c68{:064x}", 7);
+    let call = decode_function_call(&burn).expect("burn");
+    assert_eq!(call.signature.as_deref(), Some("burn(uint256)"));
+    assert_eq!(call.params[0].name, "amount");
+    assert_eq!(call.params[0].value, "7");
+}
+
+#[test]
+fn signature_list_selectors_are_the_well_known_ones() {
+    // Selectors are derived by stripping parameter names off the named form, so
+    // a bad derivation would silently stop matching instead of failing loudly.
+    // These six are fixed by ERC-20; pin the 4 bytes rather than trust a
+    // round-trip through the same code that produces them.
+    for (selector, name) in [
+        ("0x70a08231", "balanceOf"),
+        ("0x18160ddd", "totalSupply"),
+        ("0x06fdde03", "name"),
+        ("0x95d89b41", "symbol"),
+        ("0x313ce567", "decimals"),
+        ("0xdd62ed3e", "allowance"),
+    ] {
+        let call = decode_function_call(selector).expect(name);
+        assert_eq!(call.name.as_deref(), Some(name), "selector {selector}");
+    }
+}
