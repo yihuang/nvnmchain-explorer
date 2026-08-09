@@ -149,6 +149,9 @@ The indexer is built for a sub-second chain:
 | `/address/{addr}` | Address info (transactions, transfers, holdings) |
 | `/token/{addr}` | Token metadata + transfers |
 | `/tokens` | Token list |
+| `/anchoring` | Namespaces that have anchored, plus the latest commitments |
+| `/anchoring/{namespace}` | A namespace's keys, each at its head commitment |
+| `/anchoring/{namespace}/{key}` | Every revision of one key, newest first |
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 

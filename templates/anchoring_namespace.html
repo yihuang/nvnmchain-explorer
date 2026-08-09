@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Namespace {{ truncate_hash(h=namespace) }} – nvnmchain Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-6">
+    <p class="text-xs text-dim"><a href="/anchoring" class="text-blue-400 hover:text-blue-300">Anchoring</a> / namespace</p>
+    <h1 class="text-xl font-extrabold tracking-tight mono break-all mt-1">{{ namespace }}</h1>
+    <p class="text-xs text-dim mt-1">
+        <a href="{{ get_address_url(address=namespace) }}" class="text-blue-400 hover:text-blue-300">View as address</a>
+    </p>
+</div>
+
+<div class="card overflow-x-auto">
+    <div class="min-w-[720px]">
+        <div class="flex table-header">
+            <div class="w-52 px-3">Key</div>
+            <div class="flex-1 px-3">Head</div>
+            <div class="w-24 px-3 text-right">Revisions</div>
+            <div class="w-24 px-3 text-right">Block</div>
+            <div class="w-24 px-3 text-right">Age</div>
+        </div>
+        {% if keys %}
+        {% for row in keys %}
+        <div class="t-row flex text-xs items-center">
+            <div class="w-52 px-3 py-3 mono truncate">
+                <a href="/anchoring/{{ namespace }}/{{ row.key }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=row.key, prefix=10, suffix=6) }}</a>
+            </div>
+            <div class="flex-1 px-3 py-3 truncate text-dim">{{ row.label }}</div>
+            <div class="w-24 px-3 py-3 text-right text-dim">{{ row.revisions }}</div>
+            <div class="w-24 px-3 py-3 text-right">
+                <a href="/block/{{ row.block_number }}" class="text-blue-400 hover:text-blue-300">{{ row.block_number }}</a>
+            </div>
+            <div class="w-24 px-3 py-3 text-right text-faint">{{ format_time_ago(timestamp=row.timestamp) }}</div>
+        </div>
+        {% endfor %}
+        {% else %}
+        <div class="card-body text-center text-dim text-sm py-10">This namespace has anchored nothing</div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="flex justify-center gap-3 mt-5 text-xs items-center">
+    {% if page > 1 %}
+    <a href="/anchoring/{{ namespace }}?page={{ page - 1 }}" class="badge badge-info hover:text-blue-300">← Previous</a>
+    {% endif %}
+    <span class="text-dim">Page {{ page }}</span>
+    {% if keys | length == per_page %}
+    <a href="/anchoring/{{ namespace }}?page={{ page + 1 }}" class="badge badge-info hover:text-blue-300">Next →</a>
+    {% endif %}
+</div>
+
+{% endblock %}

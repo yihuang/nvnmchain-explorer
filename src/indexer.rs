@@ -15,10 +15,11 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
+use crate::anchoring::ANCHORING_ADDRESS;
 use crate::config::Settings;
 use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event, flatten_trace};
-use crate::models::{Block, Transaction, TransferEvent};
+use crate::models::{AnchoredEvent, Block, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::tokens::{fetch_token_metadata, TokenMeta};
@@ -51,6 +52,7 @@ pub struct BlockBundle {
     pub block: Block,
     pub txs: Vec<Transaction>,
     pub transfers: Vec<TransferEvent>,
+    pub anchored: Vec<AnchoredEvent>,
     pub tokens: Vec<TokenMeta>,
 }
 
@@ -139,6 +141,7 @@ pub async fn fetch_block_bundle_with_cache(
 
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
+    let mut anchored = Vec::new();
     let mut transfer_tokens: HashSet<String> = HashSet::new();
     // Running log index across the whole block. Receipts normally carry a
     // unique `logIndex`; when one is missing or mangled the counter fills in
@@ -170,6 +173,7 @@ pub async fn fetch_block_bundle_with_cache(
                 &mut tx,
                 receipt,
                 &mut transfers,
+                &mut anchored,
                 &mut transfer_tokens,
                 &mut next_log_index,
             );
@@ -215,6 +219,7 @@ pub async fn fetch_block_bundle_with_cache(
         block,
         txs,
         transfers,
+        anchored,
         tokens,
     }))
 }
@@ -223,6 +228,7 @@ fn apply_receipt(
     tx: &mut Transaction,
     receipt: &Value,
     transfers: &mut Vec<TransferEvent>,
+    anchored: &mut Vec<AnchoredEvent>,
     transfer_tokens: &mut HashSet<String>,
     next_log_index: &mut u64,
 ) {
@@ -291,6 +297,18 @@ fn apply_receipt(
         let Some(decoded) = decode_event(log) else {
             continue;
         };
+        if decoded.name.as_deref() == Some("Anchored") {
+            // Only the precompile's own log carries a trustworthy namespace:
+            // the caller it records is the sender it saw, which a contract
+            // emitting the same signature could claim to be anyone.
+            if checksum_address(&decoded.contract) == ANCHORING_ADDRESS {
+                match anchored_event(&decoded, tx, log_index) {
+                    Some(event) => anchored.push(event),
+                    None => warn!("undecodable Anchored log {log_index} in {}", tx.hash),
+                }
+            }
+            continue;
+        }
         if !matches!(
             decoded.name.as_deref(),
             Some("Transfer") | Some("TransferWithMemo")
@@ -346,6 +364,40 @@ fn apply_receipt(
     }
 }
 
+/// One decoded `Anchored` log as a storable row, or `None` when the log does
+/// not carry a whole commitment — the precompile keeps only the head, so a row
+/// here is the only record that this revision ever existed.
+pub fn anchored_event(
+    decoded: &crate::decoder::DecodedEvent,
+    tx: &Transaction,
+    log_index: i64,
+) -> Option<AnchoredEvent> {
+    let arg = |name: &str| {
+        decoded
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.value.as_str())
+    };
+    let (key, commitment) = (arg("key")?, arg("commitment")?);
+    // `0x` + 64 hex digits. A truncated log decodes to a short or empty value,
+    // which would store a head the chain never wrote.
+    if key.len() != 66 || commitment.len() != 66 {
+        return None;
+    }
+    Some(AnchoredEvent {
+        tx_hash: tx.hash.clone(),
+        block_number: tx.block_number,
+        log_index,
+        namespace: checksum_address(arg("caller")?),
+        key: key.to_string(),
+        commitment: commitment.to_string(),
+        metadata: arg("metadata").unwrap_or("0x").to_string(),
+        timestamp: tx.timestamp,
+        created_at: db::now_ts(),
+    })
+}
+
 /// Fetch + persist one block (used by tests and simple callers).
 pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> {
     let Some(bundle) = fetch_block_bundle(rpc, block_num).await? else {
@@ -356,6 +408,7 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
         &bundle.block,
         &bundle.txs,
         &bundle.transfers,
+        &bundle.anchored,
         &bundle.tokens,
     )?;
     Ok(())
@@ -678,6 +731,7 @@ pub async fn run_forever(
                 &bundle.block,
                 &bundle.txs,
                 &bundle.transfers,
+                &bundle.anchored,
                 &bundle.tokens,
             ) {
                 warn!("db write failed for block {}: {e:#}", bundle.block.number);

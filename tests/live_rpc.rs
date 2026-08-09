@@ -112,6 +112,7 @@ async fn backfill_throughput() {
                         &bundle.block,
                         &bundle.txs,
                         &bundle.transfers,
+                        &bundle.anchored,
                         &bundle.tokens,
                     );
                 }

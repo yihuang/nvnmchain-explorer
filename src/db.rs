@@ -8,7 +8,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use crate::models::{Block, TokenMetadata, Transaction, TransferEvent};
+use crate::models::{AnchoredEvent, Block, TokenMetadata, Transaction, TransferEvent};
 
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -130,6 +130,25 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_transfer_from ON transfer_events(from_addr);
         CREATE INDEX IF NOT EXISTS idx_transfer_to ON transfer_events(to_addr);
 
+        CREATE TABLE IF NOT EXISTS anchored_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tx_hash BLOB NOT NULL,
+            block_number INTEGER NOT NULL,
+            log_index INTEGER NOT NULL DEFAULT 0,
+            namespace BLOB NOT NULL,
+            key BLOB NOT NULL,
+            commitment BLOB NOT NULL,
+            metadata BLOB NOT NULL DEFAULT X'',
+            timestamp INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            -- Re-indexing a block must not duplicate its logs.
+            UNIQUE (block_number, log_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_anchored_tx_hash ON anchored_events(tx_hash);
+        -- The head lookup and the per-key history both walk this.
+        CREATE INDEX IF NOT EXISTS idx_anchored_ns_key
+            ON anchored_events(namespace, key, block_number, log_index);
+
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
@@ -227,12 +246,14 @@ pub fn save_block(db: &Db, block: &Block) -> Result<()> {
 }
 
 /// Persist one indexed block atomically: the block, its transactions,
-/// transfer events, and any token metadata in a single SQLite transaction.
+/// transfer and anchored events, and any token metadata in a single SQLite
+/// transaction.
 pub fn save_block_bundle(
     db: &Db,
     block: &Block,
     txs: &[Transaction],
     transfers: &[TransferEvent],
+    anchored: &[AnchoredEvent],
     tokens: &[crate::tokens::TokenMeta],
 ) -> Result<()> {
     let mut conn = lock(db);
@@ -252,6 +273,9 @@ pub fn save_block_bundle(
     }
     apply_transfer_balances(&txn, &inserted)?;
     refresh_holder_counts(&txn, &inserted)?;
+    for event in anchored {
+        insert_anchored(&txn, event)?;
+    }
     for tx in txs {
         if let Some(addr) = &tx.contract_address {
             txn.execute(
@@ -877,6 +901,159 @@ pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -
         ));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Anchored events
+// ---------------------------------------------------------------------------
+
+const ANCHORED_COLS: &str = "tx_hash, block_number, log_index, namespace, key, commitment, \
+                             metadata, timestamp, created_at";
+
+/// Insert one `Anchored` log, ignoring a re-indexed block's duplicate.
+fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO anchored_events (tx_hash, block_number, log_index, namespace, key,
+                                                commitment, metadata, timestamp, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            hex_blob(&event.tx_hash),
+            event.block_number,
+            event.log_index,
+            hex_blob(&event.namespace),
+            hex_blob(&event.key),
+            hex_blob(&event.commitment),
+            hex_blob(&event.metadata),
+            event.timestamp,
+            event.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn save_anchored(db: &Db, event: &AnchoredEvent) -> Result<()> {
+    let conn = lock(db);
+    insert_anchored(&conn, event)
+}
+
+fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
+    Ok(AnchoredEvent {
+        tx_hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),
+        block_number: row.get(1)?,
+        log_index: row.get(2)?,
+        namespace: crate::decoder::checksum_address(&blob_hex(&row.get::<_, Vec<u8>>(3)?)),
+        key: blob_hex(&row.get::<_, Vec<u8>>(4)?),
+        commitment: blob_hex(&row.get::<_, Vec<u8>>(5)?),
+        metadata: blob_hex(&row.get::<_, Vec<u8>>(6)?),
+        timestamp: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+/// Namespaces that have anchored anything, busiest first.
+pub fn get_anchored_namespaces(db: &Db, page: u32, per_page: u32) -> Vec<Value> {
+    let conn = lock(db);
+    let offset = (page.saturating_sub(1) * per_page) as i64;
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT namespace,
+                COUNT(*) AS anchor_count,
+                COUNT(DISTINCT key) AS key_count,
+                MAX(block_number) AS last_block,
+                MAX(timestamp) AS last_timestamp
+         FROM anchored_events
+         GROUP BY namespace
+         ORDER BY anchor_count DESC, last_block DESC
+         LIMIT ?1 OFFSET ?2",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![per_page as i64, offset], |r| {
+        Ok(json!({
+            "namespace": crate::decoder::checksum_address(&blob_hex(&r.get::<_, Vec<u8>>(0)?)),
+            "anchor_count": r.get::<_, i64>(1)?,
+            "key_count": r.get::<_, i64>(2)?,
+            "last_block": r.get::<_, i64>(3)?,
+            "last_timestamp": r.get::<_, i64>(4)?,
+        }))
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// Keys a namespace has anchored, each at its head row — what `latest` returns.
+pub fn get_namespace_keys(db: &Db, namespace: &str, page: u32, per_page: u32) -> Vec<Value> {
+    let conn = lock(db);
+    let offset = (page.saturating_sub(1) * per_page) as i64;
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT key, commitment, metadata, block_number, timestamp, tx_hash, revisions
+         FROM (
+             SELECT *,
+                    COUNT(*) OVER (PARTITION BY key) AS revisions,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY key ORDER BY block_number DESC, log_index DESC
+                    ) AS rn
+             FROM anchored_events
+             WHERE namespace = ?1
+         )
+         WHERE rn = 1
+         ORDER BY block_number DESC, log_index DESC
+         LIMIT ?2 OFFSET ?3",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![hex_blob(namespace), per_page as i64, offset], |r| {
+        Ok(json!({
+            "key": blob_hex(&r.get::<_, Vec<u8>>(0)?),
+            "commitment": blob_hex(&r.get::<_, Vec<u8>>(1)?),
+            "metadata": blob_hex(&r.get::<_, Vec<u8>>(2)?),
+            "block_number": r.get::<_, i64>(3)?,
+            "timestamp": r.get::<_, i64>(4)?,
+            "tx_hash": blob_hex(&r.get::<_, Vec<u8>>(5)?),
+            "revisions": r.get::<_, i64>(6)?,
+        }))
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// Every revision of one `(namespace, key)`, newest first — the head is row zero.
+pub fn get_key_history(db: &Db, namespace: &str, key: &str) -> Vec<AnchoredEvent> {
+    let conn = lock(db);
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1 AND key=?2
+         ORDER BY block_number DESC, log_index DESC"
+    )) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![hex_blob(namespace), hex_blob(key)], row_to_anchored)
+    else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+pub fn get_recent_anchored(db: &Db, limit: usize) -> Vec<AnchoredEvent> {
+    let conn = lock(db);
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT {ANCHORED_COLS} FROM anchored_events
+         ORDER BY block_number DESC, log_index DESC LIMIT ?1"
+    )) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(params![limit as i64], row_to_anchored) else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+pub fn count_anchored(db: &Db) -> i64 {
+    let conn = lock(db);
+    conn.query_row("SELECT COUNT(*) FROM anchored_events", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

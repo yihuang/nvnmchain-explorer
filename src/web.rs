@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use tera::Tera;
 use tokio::sync::broadcast;
 
+use crate::anchoring::{decode_envelope, is_self_verifying};
 use crate::config::Settings;
 use crate::contracts::{identify_address, is_contract};
 use crate::db::{self, Db};
@@ -999,6 +1000,154 @@ pub async fn tokens_page(
     html_or_json(&state, &headers, &query, "tokens.html", &ctx)
 }
 
+// ---------------------------------------------------------------------------
+// Anchoring
+// ---------------------------------------------------------------------------
+
+/// What an anchored payload is, or its commitment when it is not an envelope.
+///
+/// The commitment rather than the metadata, which for a foreign payload
+/// routinely opens with a zero-padded word — a whole column of those truncates
+/// to the same thing.
+fn anchored_label(key: &str, commitment: &str, metadata: &str) -> String {
+    match decode_envelope(key, metadata) {
+        Some(envelope) => envelope.summary,
+        None => truncate_hash(commitment, 10, 6),
+    }
+}
+
+/// Attach the human-readable label to rows that carry a metadata payload.
+fn label_rows(rows: &mut [Value]) {
+    for row in rows.iter_mut() {
+        let key = row.get("key").and_then(Value::as_str).unwrap_or("");
+        let commitment = row.get("commitment").and_then(Value::as_str).unwrap_or("");
+        let metadata = row.get("metadata").and_then(Value::as_str).unwrap_or("");
+        row["label"] = json!(anchored_label(key, commitment, metadata));
+    }
+}
+
+fn anchored_rows(events: &[crate::models::AnchoredEvent]) -> Vec<Value> {
+    let mut rows: Vec<Value> = events
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
+        .collect();
+    label_rows(&mut rows);
+    rows
+}
+
+/// A namespace is an address; say so the way the client asked to hear it.
+fn invalid_namespace(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+    namespace: &str,
+) -> Response {
+    if wants_json(headers, query) {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid address: {namespace}")})),
+        )
+            .into_response()
+    } else {
+        not_found_html(state, "Namespace", namespace, "Invalid address")
+    }
+}
+
+/// Namespaces that have anchored something, plus the latest commitments
+/// chain-wide.
+pub async fn anchoring_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let page: u32 = query
+        .get("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let per_page: u32 = 25;
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "namespaces": db::get_anchored_namespaces(&state.db, page, per_page),
+            "recent": anchored_rows(&db::get_recent_anchored(&state.db, 10)),
+            "total": db::count_anchored(&state.db),
+            "page": page,
+            "per_page": per_page,
+            "query": "",
+        }),
+    );
+    html_or_json(&state, &headers, &query, "anchoring.html", &ctx)
+}
+
+/// One namespace's keys, each showing the commitment `latest` would return.
+pub async fn anchoring_namespace_page(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let checksummed = checksum_address(&namespace);
+    if !is_valid_address(&checksummed) {
+        return invalid_namespace(&state, &headers, &query, &namespace);
+    }
+    let namespace = checksummed;
+    let page: u32 = query
+        .get("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let per_page: u32 = 25;
+    let mut keys = db::get_namespace_keys(&state.db, &namespace, page, per_page);
+    label_rows(&mut keys);
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "namespace": namespace,
+            "keys": keys,
+            "page": page,
+            "per_page": per_page,
+            "query": "",
+        }),
+    );
+    html_or_json(&state, &headers, &query, "anchoring_namespace.html", &ctx)
+}
+
+/// Every revision of one key, newest first — the precompile itself keeps only
+/// the first row.
+pub async fn anchoring_key_page(
+    State(state): State<AppState>,
+    Path((namespace, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let checksummed = checksum_address(&namespace);
+    if !is_valid_address(&checksummed) {
+        return invalid_namespace(&state, &headers, &query, &namespace);
+    }
+    let namespace = checksummed;
+    let history = db::get_key_history(&state.db, &namespace, &key);
+    let Some(head) = history.first() else {
+        return not_found(&state, &headers, &query, "Anchored key", &key);
+    };
+    let envelope = decode_envelope(&head.key, &head.metadata);
+    let self_verifying = is_self_verifying(&head.commitment, &head.metadata);
+    let rows = anchored_rows(&history);
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "namespace": namespace,
+            "key": head.key,
+            "head": rows[0],
+            "envelope": envelope,
+            "self_verifying": self_verifying,
+            "history": rows,
+            "query": "",
+        }),
+    );
+    html_or_json(&state, &headers, &query, "anchoring_key.html", &ctx)
+}
+
 pub async fn search_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1343,6 +1492,9 @@ pub fn app(state: AppState) -> Router {
         .route("/address/{address}", get(address_page))
         .route("/token/{address}", get(token_page))
         .route("/tokens", get(tokens_page))
+        .route("/anchoring", get(anchoring_page))
+        .route("/anchoring/{namespace}", get(anchoring_namespace_page))
+        .route("/anchoring/{namespace}/{key}", get(anchoring_key_page))
         .route("/search", get(search_page))
         .with_state(state)
 }

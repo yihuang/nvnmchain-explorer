@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 
+use crate::anchoring::{normalize_hex, ANCHORED_SIGNATURE, ANCHORED_TOPIC};
 use crate::models::Transaction;
 
 // ---------------------------------------------------------------------------
@@ -555,6 +556,33 @@ fn tip20_fns() -> &'static [FnDef] {
     ]
 }
 
+/// The anchoring precompile's calls. Kept apart from the TIP-20 table because
+/// the precompile is this chain's, not upstream Tempo's — the selectors are
+/// still derived from the canonical signatures, so they cannot drift.
+fn anchoring_fns() -> &'static [FnDef] {
+    &[
+        FnDef {
+            name: "anchor",
+            canonical: "anchor(bytes32,bytes32,bytes)",
+            inputs: &[
+                ("bytes32", "key"),
+                ("bytes32", "commitment"),
+                ("bytes", "metadata"),
+            ],
+        },
+        FnDef {
+            name: "anchorAndHash",
+            canonical: "anchorAndHash(bytes32,bytes)",
+            inputs: &[("bytes32", "key"), ("bytes", "metadata")],
+        },
+        FnDef {
+            name: "latest",
+            canonical: "latest(address,bytes32)",
+            inputs: &[("address", "namespace"), ("bytes32", "key")],
+        },
+    ]
+}
+
 fn additional_sigs() -> &'static [(&'static str, &'static str)] {
     // selector -> "signature with parameter names"
     &[
@@ -625,7 +653,7 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     let sel_hex = format!("0x{}", hex::encode(selector));
     let args = &raw[4..];
 
-    for def in tip20_fns() {
+    for def in tip20_fns().iter().chain(anchoring_fns()) {
         if selector_hex(def.canonical) == sel_hex {
             let types: Vec<&str> = def.inputs.iter().map(|(t, _)| *t).collect();
             let values = decode_abi_args(&types, args);
@@ -867,6 +895,53 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
                         ty: "uint256".into(),
                         name: "amount".into(),
                         value: uint256_from_data(&data, 0),
+                        indexed: false,
+                    },
+                ],
+            ))
+        }
+        ANCHORED_TOPIC => {
+            if topics.len() < 3 {
+                return Some(DecodedEvent {
+                    name: Some("Anchored".into()),
+                    signature: Some(ANCHORED_SIGNATURE.into()),
+                    contract,
+                    params: Vec::new(),
+                    topic0,
+                    log_index,
+                    transaction_hash,
+                });
+            }
+            // data is `abi.encode(bytes32 commitment, bytes metadata)`; the
+            // caller and key are indexed, so they arrive as topics.
+            let raw = hex::decode(data.strip_prefix("0x").unwrap_or(&data)).unwrap_or_default();
+            let values = decode_abi_args(&["bytes32", "bytes"], &raw);
+            Some(make(
+                "Anchored",
+                ANCHORED_SIGNATURE,
+                vec![
+                    DecodedParam {
+                        ty: "address".into(),
+                        name: "caller".into(),
+                        value: address_from_topic(topics[1].as_str().unwrap_or("")),
+                        indexed: true,
+                    },
+                    DecodedParam {
+                        ty: "bytes32".into(),
+                        name: "key".into(),
+                        value: normalize_hex(topics[2].as_str().unwrap_or("")),
+                        indexed: true,
+                    },
+                    DecodedParam {
+                        ty: "bytes32".into(),
+                        name: "commitment".into(),
+                        value: values.first().cloned().unwrap_or_default(),
+                        indexed: false,
+                    },
+                    DecodedParam {
+                        ty: "bytes".into(),
+                        name: "metadata".into(),
+                        value: values.get(1).cloned().unwrap_or_default(),
                         indexed: false,
                     },
                 ],

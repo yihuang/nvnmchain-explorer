@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Key {{ truncate_hash(h=key) }} – nvnmchain Explorer{% endblock %}
+{% block content %}
+
+<div class="mb-6">
+    <p class="text-xs text-dim">
+        <a href="/anchoring" class="text-blue-400 hover:text-blue-300">Anchoring</a> /
+        <a href="/anchoring/{{ namespace }}" class="text-blue-400 hover:text-blue-300 mono">{{ truncate_hash(h=namespace) }}</a> / key
+    </p>
+    <h1 class="text-xl font-extrabold tracking-tight mono break-all mt-1">{{ key }}</h1>
+</div>
+
+<div class="card mb-6">
+    <div class="card-header flex items-center justify-between">
+        <span>Head — what <span class="mono">latest</span> returns</span>
+        {% if self_verifying %}<span class="badge badge-success">self-verifying</span>{% endif %}
+    </div>
+    <div class="card-body space-y-3">
+        <div class="kv-row">
+            <div class="kv-label">Commitment</div>
+            <div class="kv-value mono">{{ head.commitment }}</div>
+        </div>
+        {% if envelope %}
+        <div class="kv-row">
+            <div class="kv-label">Envelope</div>
+            <div class="kv-value"><span class="badge badge-method mono">{{ envelope.kind }}</span> {{ envelope.summary }}</div>
+        </div>
+        {% for field in envelope.fields %}
+        <div class="kv-row">
+            <div class="kv-label pl-4">{{ field.name }}</div>
+            <div class="kv-value mono">{{ field.value }}</div>
+        </div>
+        {% endfor %}
+        {% endif %}
+        <div class="kv-row">
+            <div class="kv-label">Metadata</div>
+            <div class="kv-value mono text-xs pre-wrap">{{ head.metadata }}</div>
+        </div>
+        <div class="kv-row">
+            <div class="kv-label">Anchored in</div>
+            <div class="kv-value">
+                <a href="/block/{{ head.block_number }}" class="text-blue-400 hover:text-blue-300">block {{ head.block_number }}</a>
+                <span class="text-dim">by</span>
+                <a href="{{ get_tx_url(tx_hash=head.tx_hash) }}" class="text-blue-400 hover:text-blue-300 mono">{{ truncate_hash(h=head.tx_hash) }}</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<h2 class="section-title mb-2">Revisions ({{ history | length }})</h2>
+<div class="card overflow-x-auto">
+    <div class="min-w-[720px]">
+        <div class="flex table-header">
+            <div class="w-24 px-3">Block</div>
+            <div class="w-52 px-3">Commitment</div>
+            <div class="flex-1 px-3">Payload</div>
+            <div class="w-40 px-3">Transaction</div>
+            <div class="w-24 px-3 text-right">Age</div>
+        </div>
+        {% for row in history %}
+        <div class="t-row flex text-xs items-center">
+            <div class="w-24 px-3 py-3">
+                <a href="/block/{{ row.block_number }}" class="text-blue-400 hover:text-blue-300">{{ row.block_number }}</a>
+            </div>
+            <div class="w-52 px-3 py-3 mono truncate text-dim">{{ truncate_hash(h=row.commitment, prefix=10, suffix=6) }}</div>
+            <div class="flex-1 px-3 py-3 truncate text-dim">{{ row.label }}</div>
+            <div class="w-40 px-3 py-3 mono truncate">
+                <a href="{{ get_tx_url(tx_hash=row.tx_hash) }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=row.tx_hash) }}</a>
+            </div>
+            <div class="w-24 px-3 py-3 text-right text-faint">{{ format_time_ago(timestamp=row.timestamp) }}</div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+{% endblock %}

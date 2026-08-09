@@ -118,6 +118,25 @@ pub struct ContractLabel {
     pub created_at: i64,
 }
 
+/// One `Anchored` log: the commitment `namespace` published under `key`.
+///
+/// The precompile keeps only the head, so this table is the whole history —
+/// `(namespace, key)` by block and log index replays a key.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnchoredEvent {
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub log_index: i64,
+    /// The calling address, which is the namespace the commitment lives in.
+    pub namespace: String,
+    pub key: String,
+    pub commitment: String,
+    /// The emitted payload, never stored on chain (`0x…`).
+    pub metadata: String,
+    pub timestamp: i64,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferEvent {
     pub id: i64,

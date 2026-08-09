@@ -334,7 +334,7 @@ fn blob_hex_round_trip() {
     let rlp = include_str!("../fixtures/tx_664125.rlp").trim();
     let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
     tx.raw = Some(rlp.to_string());
-    db::save_block_bundle(&db, &block, &[tx], &[], &[]).expect("save bundle");
+    db::save_block_bundle(&db, &block, &[tx], &[], &[], &[]).expect("save bundle");
 
     // Block reads back with identical hex, and hash lookup is case-insensitive
     // (binary storage normalizes hex case — a bonus over TEXT comparisons).
@@ -427,6 +427,7 @@ fn duplicate_bundle_is_idempotent() {
         std::slice::from_ref(&tx),
         std::slice::from_ref(&transfer),
         &[],
+        &[],
     )
     .expect("first save");
     db::save_block_bundle(
@@ -434,6 +435,7 @@ fn duplicate_bundle_is_idempotent() {
         &block,
         std::slice::from_ref(&tx),
         std::slice::from_ref(&transfer),
+        &[],
         &[],
     )
     .expect("duplicate save");

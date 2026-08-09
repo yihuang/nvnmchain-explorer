@@ -55,6 +55,7 @@ fn precompile_labels() -> &'static HashMap<String, String> {
                 "0x1060000000000000000000000000000000000000",
                 "Storage Credits",
             ),
+            (crate::anchoring::ANCHORING_ADDRESS, "Anchoring"),
         ];
         pairs
             .iter()

@@ -1,5 +1,6 @@
 //! nvnmchain Explorer — blockchain explorer for the nvnm EVM chain.
 
+pub mod anchoring;
 pub mod config;
 pub mod contracts;
 pub mod db;
