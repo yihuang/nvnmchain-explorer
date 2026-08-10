@@ -37,6 +37,13 @@ pub fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// A per-row write through the connection's statement cache. The block path
+/// runs these once per row inside one transaction, where `Connection::execute`
+/// would re-prepare the same SQL every time.
+fn exec_cached(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
+    Ok(conn.prepare_cached(sql)?.execute(params)?)
+}
+
 pub fn init_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("open db {path}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -297,7 +304,8 @@ pub fn save_block_bundle(
     }
     for tx in txs {
         if let Some(addr) = &tx.contract_address {
-            txn.execute(
+            exec_cached(
+                &txn,
                 "INSERT OR IGNORE INTO contract_labels (address, name, abi, is_token, is_precompile, created_at)
                  VALUES (?1, '', '[]', 0, 0, ?2)",
                 params![addr, now_ts()],
@@ -411,7 +419,8 @@ pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
 // ---------------------------------------------------------------------------
 
 fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
-    conn.execute(
+    exec_cached(
+        conn,
         r#"
         INSERT INTO transactions (
             hash, block_number, position, from_addr, to_addr, status,
@@ -558,7 +567,8 @@ pub fn get_address_transaction_count(db: &Db, address: &str) -> i64 {
 
 fn upsert_token_meta(conn: &Connection, meta: &crate::tokens::TokenMeta) -> Result<()> {
     let ts = now_ts();
-    conn.execute(
+    exec_cached(
+        conn,
         r#"
         INSERT INTO token_metadata (address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 0, ?7, ?7)
@@ -666,7 +676,8 @@ pub fn get_token_by_symbol_or_name(db: &Db, q: &str) -> Option<TokenMetadata> {
 /// and `false` when it duplicated an existing (block_number, log_index) —
 /// the unique key that makes re-writing an already-indexed block idempotent.
 fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<bool> {
-    let inserted = conn.execute(
+    let inserted = exec_cached(
+        conn,
         "INSERT OR IGNORE INTO transfer_events (tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
@@ -701,23 +712,24 @@ fn adjust_balance(
         return Ok(());
     }
     let current = conn
-        .query_row(
+        .prepare_cached(
             "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
-            params![token, holder],
-            |r| r.get::<_, String>(0),
-        )
+        )?
+        .query_row(params![token, holder], |r| r.get::<_, String>(0))
         .optional()
         .ok()
         .flatten()
         .unwrap_or_else(|| "0".into());
     let new = bigint(&current) + delta;
     if new.sign() == num_bigint::Sign::NoSign {
-        conn.execute(
+        exec_cached(
+            conn,
             "DELETE FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
             params![token, holder],
         )?;
     } else {
-        conn.execute(
+        exec_cached(
+            conn,
             "INSERT INTO token_balances (token_addr, holder_addr, balance, updated_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(token_addr, holder_addr) DO UPDATE SET
@@ -937,7 +949,8 @@ const ANCHORED_COLS: &str = "tx_hash, block_number, log_index, namespace, key, c
 /// and `false` when it duplicated an existing (block_number, log_index) — a
 /// re-indexed block, whose events must not move the namespace stats again.
 fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<bool> {
-    let inserted = conn.execute(
+    let inserted = exec_cached(
+        conn,
         "INSERT OR IGNORE INTO anchored_events (tx_hash, block_number, log_index, namespace, key,
                                                 commitment, metadata, timestamp, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -962,13 +975,17 @@ fn refresh_anchored_namespace(conn: &Connection, event: &AnchoredEvent) -> Resul
     // The event's own row is already in, so a second row under the pair means
     // the key existed before this anchor. One probe on idx_anchored_ns_key,
     // stopping at the second entry.
-    let key_existed = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM anchored_events
-                       WHERE namespace=?1 AND key=?2 LIMIT 1 OFFSET 1)",
-        params![hex_blob(&event.namespace), hex_blob(&event.key)],
-        |r| r.get::<_, i64>(0),
-    )? != 0;
-    conn.execute(
+    let key_existed =
+        conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM anchored_events
+                           WHERE namespace=?1 AND key=?2 LIMIT 1 OFFSET 1)",
+        )?
+        .query_row(
+            params![hex_blob(&event.namespace), hex_blob(&event.key)],
+            |r| r.get::<_, i64>(0),
+        )? != 0;
+    exec_cached(
+        conn,
         "INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
          VALUES (?1, 1, ?2, ?3, ?4)
          ON CONFLICT(namespace) DO UPDATE SET
