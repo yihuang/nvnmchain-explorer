@@ -577,4 +577,20 @@ fn blob_storage_queries_match_text_params() {
         meta_back.holder_count, 2,
         "token_metadata.holder_count must be refreshed via BLOB key"
     );
+
+    // Startup backfill repairs stale holder counts.
+    {
+        let conn = db::lock(&db);
+        conn.execute(
+            "UPDATE token_metadata SET holder_count=0 WHERE address=?1",
+            rusqlite::params![token],
+        )
+        .expect("stale holder count");
+        db::sync_holder_counts(&conn).expect("sync holder counts");
+    }
+    let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
+    assert_eq!(
+        meta_back.holder_count, 2,
+        "sync_holder_counts must backfill stale counts"
+    );
 }

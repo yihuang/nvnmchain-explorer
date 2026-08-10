@@ -656,6 +656,13 @@ pub async fn run_forever(
             if let Err(e) = db::rebuild_token_balances(&conn) {
                 warn!("token balance rebuild failed: {e:#}");
             }
+        } else if has_balances {
+            // Backfill token_metadata.holder_count (stale rows written
+            // before the BLOB-key fix); cheap and idempotent.
+            let conn = db::lock(&rebuild_db);
+            if let Err(e) = db::sync_holder_counts(&conn) {
+                warn!("holder count sync failed: {e:#}");
+            }
         }
     });
 
