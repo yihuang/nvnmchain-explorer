@@ -479,3 +479,120 @@ fn duplicate_bundle_is_idempotent() {
         .expect("sender balance");
     assert_eq!(sender, "-100", "sender delta applied exactly once");
 }
+
+#[test]
+fn blob_storage_queries_match_text_params() {
+    // Regression: `transfer_events`/`token_metadata` store addresses as raw
+    // bytes (BLOBs), so any query passing a plain TEXT address silently
+    // matched nothing — empty transfers tabs, empty holdings, and holder
+    // counts stuck at 0. All read/update paths must bind `hex_blob`.
+    use nvnmchain_explorer::db::{self, Db};
+    use nvnmchain_explorer::tokens::TokenMeta;
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("blob-queries.db");
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    let db: Db = Arc::new(Mutex::new(conn));
+
+    let raw_block = json!({
+        "number": "0x10",
+        "hash": format!("0x{}", "ab".repeat(32)),
+        "parentHash": format!("0x{}", "cd".repeat(32)),
+        "timestamp": "0x64",
+        "gasUsed": "0x5208",
+        "gasLimit": "0x1c9c380",
+        "miner": format!("0x{}", "22".repeat(20)),
+        "consensusContext": {"epoch": 1, "view": 2, "proposer": format!("0x{}", "11".repeat(32))},
+        "transactions": [{
+            "hash": format!("0x{}", "ff".repeat(32)),
+            "blockNumber": "0x10",
+            "transactionIndex": "0x0",
+            "from": format!("0x{}", "33".repeat(20)),
+            "to": format!("0x{}", "44".repeat(20)),
+            "gas": "0x5208",
+            "gasPrice": "0x4a817c800",
+            "value": "0x1",
+            "nonce": "0x3",
+            "chainId": "0x2b45",
+            "type": "0x76",
+            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
+            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
+        }]
+    });
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    let token = checksum_address(&format!("0x{}", "aa".repeat(20)));
+    let from = checksum_address(&format!("0x{}", "11".repeat(20)));
+    let to = checksum_address(&format!("0x{}", "22".repeat(20)));
+    let transfer = TransferEvent {
+        id: 0,
+        tx_hash: tx.hash.clone(),
+        block_number: block.number,
+        log_index: 0,
+        token_addr: token.clone(),
+        from_addr: from.clone(),
+        to_addr: to.clone(),
+        amount: "1000000".into(),
+        timestamp: block.timestamp,
+        created_at: 0,
+    };
+    let meta = TokenMeta {
+        address: token.clone(),
+        name: "Path USD".into(),
+        symbol: "pathUSD".into(),
+        decimals: 6,
+        currency: "USD".into(),
+        total_supply: "1000000".into(),
+    };
+    db::save_block_bundle(
+        &db,
+        &block,
+        std::slice::from_ref(&tx),
+        std::slice::from_ref(&transfer),
+        std::slice::from_ref(&meta),
+    )
+    .expect("save bundle");
+
+    // Address transfers tab: query binds the address as raw bytes.
+    let addr_transfers = db::get_address_transfers(&db, &to, 1, 25);
+    assert_eq!(addr_transfers.len(), 1, "address transfers must be found");
+
+    // Token transfers list + count agree.
+    let token_transfers = db::get_token_transfers(&db, &token, 1, 25);
+    assert_eq!(token_transfers.len(), 1, "token transfers must be found");
+    assert_eq!(db::get_token_transfer_count(&db, &token), 1);
+
+    // Holdings: balance row exists (TEXT) and metadata resolves (BLOB via
+    // hex_blob IN-clause), so the joined holding is returned.
+    let holdings = db::get_address_holdings(&db, &to);
+    assert_eq!(holdings.len(), 1, "holdings must be resolved");
+    assert_eq!(holdings[0]["symbol"], "pathUSD");
+    assert_eq!(holdings[0]["formatted"], "1");
+
+    // Holder count: live count over token_balances plus the cached
+    // token_metadata.holder_count refreshed with a hex_blob key. Both the
+    // sender (negative balance) and the recipient hold a row, so it's 2.
+    assert_eq!(db::get_token_holder_count(&db, &token), 2);
+    let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
+    assert_eq!(
+        meta_back.holder_count, 2,
+        "token_metadata.holder_count must be refreshed via BLOB key"
+    );
+
+    // Startup backfill repairs stale holder counts.
+    {
+        let conn = db::lock(&db);
+        conn.execute(
+            "UPDATE token_metadata SET holder_count=0 WHERE address=?1",
+            rusqlite::params![token],
+        )
+        .expect("stale holder count");
+        db::sync_holder_counts(&conn).expect("sync holder counts");
+    }
+    let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
+    assert_eq!(
+        meta_back.holder_count, 2,
+        "sync_holder_counts must backfill stale counts"
+    );
+}
