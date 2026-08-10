@@ -149,6 +149,17 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_anchored_ns_key
             ON anchored_events(namespace, key, block_number, log_index);
 
+        -- Per-namespace stats for /anchoring, like token_metadata.holder_count:
+        -- maintained with each inserted anchor and recomputed at startup, so no
+        -- page view aggregates over every anchor ever written.
+        CREATE TABLE IF NOT EXISTS anchored_namespaces (
+            namespace BLOB PRIMARY KEY,
+            anchor_count INTEGER NOT NULL DEFAULT 0,
+            key_count INTEGER NOT NULL DEFAULT 0,
+            last_block INTEGER NOT NULL DEFAULT 0,
+            last_timestamp INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
@@ -280,7 +291,9 @@ pub fn save_block_bundle(
     apply_transfer_balances(&txn, &inserted)?;
     refresh_holder_counts(&txn, &inserted)?;
     for event in anchored {
-        insert_anchored(&txn, event)?;
+        if insert_anchored(&txn, event)? {
+            refresh_anchored_namespace(&txn, event)?;
+        }
     }
     for tx in txs {
         if let Some(addr) = &tx.contract_address {
@@ -920,9 +933,11 @@ pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -
 const ANCHORED_COLS: &str = "tx_hash, block_number, log_index, namespace, key, commitment, \
                              metadata, timestamp, created_at";
 
-/// Insert one `Anchored` log, ignoring a re-indexed block's duplicate.
-fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<()> {
-    conn.execute(
+/// Insert one `Anchored` log. Returns `true` when the row was newly inserted
+/// and `false` when it duplicated an existing (block_number, log_index) — a
+/// re-indexed block, whose events must not move the namespace stats again.
+fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<bool> {
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO anchored_events (tx_hash, block_number, log_index, namespace, key,
                                                 commitment, metadata, timestamp, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -938,12 +953,51 @@ fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<()> {
             event.created_at,
         ],
     )?;
+    Ok(inserted != 0)
+}
+
+/// Fold one freshly-inserted anchor into its namespace's summary row. Runs in
+/// the same transaction as the insert, so the stats never drift from the log.
+fn refresh_anchored_namespace(conn: &Connection, event: &AnchoredEvent) -> Result<()> {
+    // The event's own row is already in, so a second row under the pair means
+    // the key existed before this anchor. One probe on idx_anchored_ns_key,
+    // stopping at the second entry.
+    let key_existed = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM anchored_events
+                       WHERE namespace=?1 AND key=?2 LIMIT 1 OFFSET 1)",
+        params![hex_blob(&event.namespace), hex_blob(&event.key)],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    conn.execute(
+        "INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
+         VALUES (?1, 1, ?2, ?3, ?4)
+         ON CONFLICT(namespace) DO UPDATE SET
+             anchor_count = anchor_count + 1,
+             key_count = key_count + excluded.key_count,
+             last_block = MAX(last_block, excluded.last_block),
+             last_timestamp = MAX(last_timestamp, excluded.last_timestamp)",
+        params![
+            hex_blob(&event.namespace),
+            i64::from(!key_existed),
+            event.block_number,
+            event.timestamp,
+        ],
+    )?;
     Ok(())
 }
 
-pub fn save_anchored(db: &Db, event: &AnchoredEvent) -> Result<()> {
-    let conn = lock(db);
-    insert_anchored(&conn, event)
+/// Recompute every namespace's summary row from the log — idempotent, run once
+/// at startup for databases that predate the table; after that each block
+/// maintains it incrementally.
+pub fn sync_anchored_namespaces(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM anchored_namespaces", [])?;
+    conn.execute(
+        "INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
+         SELECT namespace, COUNT(*), COUNT(DISTINCT key), MAX(block_number), MAX(timestamp)
+         FROM anchored_events GROUP BY namespace",
+        [],
+    )?;
+    Ok(())
 }
 
 fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
@@ -965,13 +1019,8 @@ pub fn get_anchored_namespaces(db: &Db, page: u32, per_page: u32) -> Vec<Value> 
     let conn = lock(db);
     let offset = (page.saturating_sub(1) * per_page) as i64;
     let Ok(mut stmt) = conn.prepare(
-        "SELECT namespace,
-                COUNT(*) AS anchor_count,
-                COUNT(DISTINCT key) AS key_count,
-                MAX(block_number) AS last_block,
-                MAX(timestamp) AS last_timestamp
-         FROM anchored_events
-         GROUP BY namespace
+        "SELECT namespace, anchor_count, key_count, last_block, last_timestamp
+         FROM anchored_namespaces
          ORDER BY anchor_count DESC, last_block DESC
          LIMIT ?1 OFFSET ?2",
     ) else {

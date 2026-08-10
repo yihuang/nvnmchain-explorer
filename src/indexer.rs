@@ -717,6 +717,12 @@ pub async fn run_forever(
                 warn!("holder count sync failed: {e:#}");
             }
         }
+        // Seed the /anchoring summary for databases that predate it; after
+        // this each block maintains it incrementally.
+        let conn = db::lock(&rebuild_db);
+        if let Err(e) = db::sync_anchored_namespaces(&conn) {
+            warn!("anchored namespace sync failed: {e:#}");
+        }
     });
 
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);

@@ -273,7 +273,9 @@ fn namespaces_are_partitioned_by_caller() {
         &tx,
         1,
     );
-    db::save_block_bundle(&db, &block, &[tx], &[], &[mine, theirs], &[]).expect("save bundle");
+    let txs = [tx];
+    let events = [mine, theirs];
+    db::save_block_bundle(&db, &block, &txs, &[], &events, &[]).expect("save bundle");
 
     // Same key, different callers: the writes never collide.
     let other = nvnmchain_explorer::decoder::checksum_address(&other);
@@ -287,9 +289,20 @@ fn namespaces_are_partitioned_by_caller() {
     );
 
     let namespaces = db::get_anchored_namespaces(&db, 1, 25);
-    let listed: Vec<&Value> = namespaces.iter().map(|n| &n["namespace"]).collect();
-    assert!(listed.contains(&&json!(REGISTRY)));
-    assert!(listed.contains(&&json!(other)));
+    for ns in [REGISTRY, other.as_str()] {
+        let entry = namespaces
+            .iter()
+            .find(|n| n["namespace"] == json!(ns))
+            .expect("namespace listed");
+        assert_eq!(entry["anchor_count"], json!(1), "{ns}");
+        assert_eq!(entry["key_count"], json!(1), "{ns}");
+        assert_eq!(entry["last_block"], json!(300), "{ns}");
+    }
+
+    // Re-writing an already-indexed block inserts nothing, so the summary
+    // must not move either.
+    db::save_block_bundle(&db, &block, &txs, &[], &events, &[]).expect("re-save");
+    assert_eq!(db::get_anchored_namespaces(&db, 1, 25), namespaces);
 }
 
 // ---------------------------------------------------------------------------
