@@ -376,12 +376,6 @@ pub fn get_latest_block(db: &Db) -> Option<Block> {
 }
 
 /// Number of indexed block rows (the history-completion metric).
-pub fn get_block_count(db: &Db) -> i64 {
-    let conn = lock(db);
-    conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get::<_, i64>(0))
-        .unwrap_or(0)
-}
-
 /// Record the chain head observed by the indexer (for index-progress display).
 pub fn set_chain_head(db: &Db, head: i64) {
     let conn = lock(db);
@@ -389,12 +383,6 @@ pub fn set_chain_head(db: &Db, head: i64) {
 }
 
 /// The last chain head observed by the indexer; `0` when unknown.
-pub fn get_chain_head(db: &Db) -> i64 {
-    get_kv(db, "chain_head")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-}
-
 /// Lowest stored block height; `None` when the table is empty.
 pub fn get_min_block_number(db: &Db) -> Option<i64> {
     let conn = lock(db);

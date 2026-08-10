@@ -263,6 +263,7 @@ async fn web_api_serves_indexed_data() {
         cfg,
         tera,
         block_events: block_tx,
+        stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
     };
     let app = web::app(state);
 

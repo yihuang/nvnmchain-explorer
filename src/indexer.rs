@@ -6,7 +6,7 @@
 //! SQLite writer, one transaction per block.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -671,12 +671,23 @@ pub async fn run_forever(
     db: Db,
     cfg: IndexerConfig,
     block_events: broadcast::Sender<Value>,
+    stats: Arc<RwLock<Value>>,
     shutdown: watch::Receiver<bool>,
 ) {
     let stats_interval = cfg.stats_interval;
     let stats_db = db.clone();
+    let stats_events = block_events.clone();
     let stats_shutdown = shutdown.clone();
-    tokio::spawn(async move { stats_loop(stats_db, stats_interval, stats_shutdown).await });
+    tokio::spawn(async move {
+        stats_loop(
+            stats_db,
+            stats,
+            stats_events,
+            stats_interval,
+            stats_shutdown,
+        )
+        .await
+    });
 
     // Seed the token-metadata cache and repair balances on legacy databases.
     let known_tokens = Arc::new(Mutex::new(
@@ -785,13 +796,25 @@ pub async fn run_forever(
 
 /// Recompute the home-page stats blob into the `kv` table every interval so
 /// the web layer never has to scan history at request time.
-async fn stats_loop(db: Db, interval: Duration, mut shutdown: watch::Receiver<bool>) {
+async fn stats_loop(
+    db: Db,
+    cell: Arc<RwLock<Value>>,
+    events: broadcast::Sender<Value>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
         if *shutdown.borrow() {
             break;
         }
-        if let Err(e) = compute_and_store_stats(&db) {
-            warn!("stats recompute failed: {e:#}");
+        match compute_and_store_stats(&db) {
+            Ok(stats) => {
+                *cell.write().unwrap_or_else(|e| e.into_inner()) = stats.clone();
+                // Live viewers get the refresh too. Droppable: anyone who
+                // misses one is corrected by the next tick.
+                let _ = events.send(json!({ "stats": stats }));
+            }
+            Err(e) => warn!("stats recompute failed: {e:#}"),
         }
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;
@@ -799,7 +822,7 @@ async fn stats_loop(db: Db, interval: Duration, mut shutdown: watch::Receiver<bo
     }
 }
 
-fn compute_and_store_stats(db: &Db) -> Result<()> {
+fn compute_and_store_stats(db: &Db) -> Result<Value> {
     let conn = db::lock(db);
     let now = db::now_ts();
 
@@ -861,6 +884,22 @@ fn compute_and_store_stats(db: &Db) -> Result<()> {
         r.get::<_, Option<i64>>(0)
     })?;
 
+    // Index progress, so the home page and the stream never recount blocks.
+    // kv is read through `conn` -- a db::get_chain_head(&db) here would
+    // deadlock on the connection lock this function already holds.
+    let chain_head: i64 = conn
+        .query_row("SELECT value FROM kv WHERE key='chain_head'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let index_pct = if chain_head > 0 {
+        (total_blocks as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
     let stats = serde_json::json!({
         "latest_block": latest_block,
         "total_blocks": total_blocks,
@@ -871,8 +910,11 @@ fn compute_and_store_stats(db: &Db) -> Result<()> {
         "avg_block_time_ms": avg_block_time_ms,
         "tps": tps,
         "gas_util_pct": gas_util_pct,
+        "chain_head": chain_head,
+        "index_pct": index_pct,
         "updated_at": now,
     });
+    // Still written to kv: it seeds the in-memory copy across a restart.
     db::set_kv(&conn, "stats", &stats.to_string())?;
-    Ok(())
+    Ok(stats)
 }

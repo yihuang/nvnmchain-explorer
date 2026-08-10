@@ -1,7 +1,7 @@
 //! Axum web application: routes, JSON API, and Tera-rendered HTML.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -37,6 +37,9 @@ pub struct AppState {
     pub tera: Arc<Tera>,
     /// Live stream of indexed blocks, fed by the indexer writer task.
     pub block_events: broadcast::Sender<Value>,
+    /// Home-page stats, published by the indexer's stats task — read here so
+    /// a page view costs no aggregate queries.
+    pub stats: Arc<RwLock<Value>>,
 }
 
 fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
@@ -240,9 +243,11 @@ pub async fn home(
     let recent_blocks = db::get_recent_blocks(&state.db, state.cfg.recent_block_count);
     let recent_txs = db::get_recent_transactions(&state.db, state.cfg.recent_tx_count);
     let latest_num = latest_block.as_ref().map(|b| b.number).unwrap_or(0);
-    let mut stats = db::get_kv(&state.db, "stats")
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(Value::Null);
+    let mut stats = state
+        .stats
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     if let Value::Object(ref mut o) = stats {
         let avg_ms = o
             .get("avg_block_time_ms")
@@ -276,14 +281,17 @@ pub async fn home(
             .collect::<Vec<_>>(),
     );
 
-    // Index progress: how much of the observed chain head is stored.
-    let indexed_count = db::get_block_count(&state.db);
-    let chain_head = db::get_chain_head(&state.db);
-    let index_pct = if chain_head > 0 {
-        ((indexed_count as f64 / chain_head as f64) * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
+    // Index progress rides in the same stats payload, so the tiles and the
+    // bar cost no per-view aggregates either.
+    let indexed_count = stats
+        .get("total_blocks")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let chain_head = stats.get("chain_head").and_then(Value::as_i64).unwrap_or(0);
+    let index_pct = stats
+        .get("index_pct")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let ctx = page_ctx(
         &state,
         json!({
@@ -345,7 +353,15 @@ struct SseState {
 const SSE_MAX_REPLAY: usize = 4096;
 
 fn sse_event(payload: &Value) -> Result<Event, std::convert::Infallible> {
-    Ok(Event::default().event("block").data(payload.to_string()))
+    // Stats refreshes share the block channel; the payload key names the SSE
+    // event. A stats message lost to broadcast lag is not replayed -- the next
+    // tick supersedes it -- so the block replay logic below ignores them.
+    let name = if payload.get("stats").is_some() {
+        "stats"
+    } else {
+        "block"
+    };
+    Ok(Event::default().event(name).data(payload.to_string()))
 }
 
 async fn sse_step(

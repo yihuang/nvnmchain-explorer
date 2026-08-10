@@ -329,6 +329,7 @@ async fn serve() -> (tempfile::TempDir, String) {
         cfg,
         tera: web::build_tera(temp_db().1).expect("templates"),
         block_events: tokio::sync::broadcast::channel(16).0,
+        stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
