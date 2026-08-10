@@ -250,6 +250,12 @@ pub fn save_block_bundle(
             inserted.push(transfer);
         }
     }
+    // Upsert token metadata first so `refresh_holder_counts` below can
+    // UPDATE the holder_count of freshly-seen tokens instead of seeding
+    // them with the INSERT's literal 0.
+    for meta in tokens {
+        upsert_token_meta(&txn, meta)?;
+    }
     apply_transfer_balances(&txn, &inserted)?;
     refresh_holder_counts(&txn, &inserted)?;
     for tx in txs {
@@ -260,9 +266,6 @@ pub fn save_block_bundle(
                 params![addr, now_ts()],
             )?;
         }
-    }
-    for meta in tokens {
-        upsert_token_meta(&txn, meta)?;
     }
     txn.commit().context("commit block transaction")?;
     Ok(())
@@ -712,7 +715,7 @@ fn refresh_holder_counts(conn: &Connection, transfers: &[&TransferEvent]) -> Res
         )?;
         conn.execute(
             "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
-            params![count, now_ts(), t.token_addr],
+            params![count, now_ts(), hex_blob(&t.token_addr)],
         )?;
     }
     Ok(())
@@ -755,7 +758,7 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
         )?;
         conn.execute(
             "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
-            params![count, now_ts(), token],
+            params![count, now_ts(), hex_blob(&token)],
         )?;
     }
     tracing::info!("rebuilt token balances from {n} transfer events");
@@ -784,12 +787,12 @@ pub fn save_transfer(db: &Db, transfer: &TransferEvent) -> Result<()> {
 fn row_to_transfer(row: &rusqlite::Row) -> rusqlite::Result<TransferEvent> {
     Ok(TransferEvent {
         id: row.get(0)?,
-        tx_hash: row.get(1)?,
+        tx_hash: blob_hex(&row.get::<_, Vec<u8>>(1)?),
         block_number: row.get(2)?,
         log_index: row.get(3)?,
-        token_addr: row.get(4)?,
-        from_addr: row.get(5)?,
-        to_addr: row.get(6)?,
+        token_addr: blob_hex(&row.get::<_, Vec<u8>>(4)?),
+        from_addr: blob_hex(&row.get::<_, Vec<u8>>(5)?),
+        to_addr: blob_hex(&row.get::<_, Vec<u8>>(6)?),
         amount: row.get(7)?,
         timestamp: row.get(8)?,
         created_at: row.get(9)?,
@@ -829,13 +832,13 @@ pub fn get_token_transfers(db: &Db, token_addr: &str, page: u32, per_page: u32) 
         let offset = (page.saturating_sub(1) * per_page) as i64;
         let Ok(mut stmt) = conn.prepare(
             "SELECT id, tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at
-             FROM transfer_events WHERE lower(token_addr)=lower(?1)
+             FROM transfer_events WHERE token_addr=?1
              ORDER BY block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3",
         ) else {
             return Vec::new();
         };
         let Ok(rows) = stmt.query_map(
-            params![token_addr, per_page as i64, offset],
+            params![hex_blob(token_addr), per_page as i64, offset],
             row_to_transfer,
         ) else {
             return Vec::new();
@@ -858,13 +861,20 @@ pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -
         let offset = (page.saturating_sub(1) * per_page) as i64;
         let Ok(mut stmt) = conn.prepare(
             "SELECT id, tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at
-             FROM transfer_events WHERE from_addr=?1 OR to_addr=?1
-             ORDER BY block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3",
+             FROM transfer_events WHERE from_addr=?1 OR to_addr=?2
+             ORDER BY block_number DESC, log_index DESC LIMIT ?3 OFFSET ?4",
         ) else {
             return Vec::new();
         };
-        let Ok(rows) = stmt.query_map(params![address, per_page as i64, offset], row_to_transfer)
-        else {
+        let Ok(rows) = stmt.query_map(
+            params![
+                hex_blob(address),
+                hex_blob(address),
+                per_page as i64,
+                offset
+            ],
+            row_to_transfer,
+        ) else {
             return Vec::new();
         };
         rows.filter_map(|r| r.ok()).collect()
@@ -902,7 +912,7 @@ pub fn get_tokens_metadata(
         let Ok(mut stmt) = conn.prepare(&sql) else {
             continue;
         };
-        let params = rusqlite::params_from_iter(chunk.iter().map(|a| a.as_str()));
+        let params = rusqlite::params_from_iter(chunk.iter().map(|a| hex_blob(a)));
         let Ok(rows) = stmt.query_map(params, row_to_token) else {
             continue;
         };
@@ -967,7 +977,10 @@ pub fn get_address_holdings(db: &Db, address: &str) -> Vec<Value> {
     let token_addrs: Vec<String> = balances.iter().map(|(a, _)| a.clone()).collect();
     let metas = get_tokens_metadata(db, &token_addrs);
     for (token_addr, balance) in &balances {
-        if let Some(meta) = metas.get(token_addr) {
+        // `get_tokens_metadata` keys are lowercase hex (blob_hex), while
+        // `token_balances.token_addr` stores EIP-55 checksummed text; match
+        // case-insensitively so the joined metadata is found.
+        if let Some(meta) = metas.get(&token_addr.to_lowercase()) {
             let formatted = crate::tokens::format_token_amount(balance, meta.decimals);
             holdings.push(json!({
                 "token": meta.address,
