@@ -149,6 +149,12 @@ pub fn init_db(path: &str) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Row offset of a 1-based page. Widened before multiplying: `page` comes
+/// straight from the query string, and u32 math overflows at page ~171M.
+fn page_offset(page: u32, per_page: u32) -> i64 {
+    i64::from(page.saturating_sub(1)) * i64::from(per_page)
+}
+
 pub fn lock<'a>(db: &'a Db) -> MutexGuard<'a, Connection> {
     db.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -490,7 +496,7 @@ pub fn get_address_transactions(
     per_page: u32,
 ) -> Vec<Transaction> {
     let conn = lock(db);
-    let offset = (page.saturating_sub(1) * per_page) as i64;
+    let offset = page_offset(page, per_page);
     let Ok(mut stmt) = conn.prepare(&format!(
         "SELECT {TX_COLS} FROM transactions WHERE from_addr=?1 OR to_addr=?1 ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
     )) else {
@@ -576,7 +582,7 @@ pub fn get_token_metadata(db: &Db, address: &str) -> Option<TokenMetadata> {
 
 pub fn get_all_tokens(db: &Db, page: u32, per_page: u32) -> Vec<TokenMetadata> {
     let conn = lock(db);
-    let offset = (page.saturating_sub(1) * per_page) as i64;
+    let offset = page_offset(page, per_page);
     let Ok(mut stmt) = conn.prepare(
         "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at FROM token_metadata ORDER BY holder_count DESC LIMIT ?1 OFFSET ?2",
     ) else {
@@ -829,7 +835,7 @@ fn transfer_to_json(transfer: &TransferEvent, tx: Option<&Transaction>) -> Value
 pub fn get_token_transfers(db: &Db, token_addr: &str, page: u32, per_page: u32) -> Vec<Value> {
     let transfers: Vec<TransferEvent> = {
         let conn = lock(db);
-        let offset = (page.saturating_sub(1) * per_page) as i64;
+        let offset = page_offset(page, per_page);
         let Ok(mut stmt) = conn.prepare(
             "SELECT id, tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at
              FROM transfer_events WHERE token_addr=?1
@@ -858,7 +864,7 @@ pub fn get_token_transfers(db: &Db, token_addr: &str, page: u32, per_page: u32) 
 pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -> Vec<Value> {
     let transfers: Vec<TransferEvent> = {
         let conn = lock(db);
-        let offset = (page.saturating_sub(1) * per_page) as i64;
+        let offset = page_offset(page, per_page);
         let Ok(mut stmt) = conn.prepare(
             "SELECT id, tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at
              FROM transfer_events WHERE from_addr=?1 OR to_addr=?2
