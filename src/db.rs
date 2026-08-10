@@ -195,7 +195,8 @@ pub fn lock<'a>(db: &'a Db) -> MutexGuard<'a, Connection> {
 // ---------------------------------------------------------------------------
 
 pub fn set_kv(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
+    exec_cached(
+        conn,
         "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         params![key, value, now_ts()],
@@ -222,7 +223,8 @@ const BLOCK_COLS: &str =
      extra_data, epoch, view, proposer, miner, tx_count, created_at";
 
 fn upsert_block(conn: &Connection, block: &Block) -> Result<()> {
-    conn.execute(
+    exec_cached(
+        conn,
         r#"
         INSERT INTO blocks (number, hash, parent_hash, timestamp, timestamp_ms, gas_used, gas_limit,
                             base_fee, size, extra_data, epoch, view, proposer,
@@ -757,12 +759,11 @@ fn refresh_holder_counts(conn: &Connection, transfers: &[&TransferEvent]) -> Res
         if !seen.insert(t.token_addr.clone()) {
             continue;
         }
-        let count = conn.query_row(
-            "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
-            params![t.token_addr],
-            |r| r.get::<_, i64>(0),
-        )?;
-        conn.execute(
+        let count = conn
+            .prepare_cached("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1")?
+            .query_row(params![t.token_addr], |r| r.get::<_, i64>(0))?;
+        exec_cached(
+            conn,
             "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
             params![count, now_ts(), hex_blob(&t.token_addr)],
         )?;
