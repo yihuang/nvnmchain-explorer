@@ -342,8 +342,9 @@ pub fn save_block_bundle(
             inserted.push(transfer);
         }
     }
-    // Token metadata first: refresh_holder_counts updates that row, and a token
-    // first seen in this very block would otherwise not exist yet to update.
+    // Upsert token metadata first so `refresh_holder_counts` below can
+    // UPDATE the holder_count of freshly-seen tokens instead of seeding
+    // them with the INSERT's literal 0.
     for meta in tokens {
         upsert_token_meta(&txn, meta)?;
     }
@@ -1012,6 +1013,28 @@ pub fn get_token_holder_count(db: &Db, token_addr: &str) -> i64 {
         "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
         params![token_addr],
     )
+}
+
+/// Recompute `token_metadata.holder_count` for every token that has balance
+/// rows. Cheap (uses the token_balances primary-key index) and idempotent;
+/// run at startup to backfill stale counts written before the BLOB-key fix.
+pub fn sync_holder_counts(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT DISTINCT token_addr FROM token_balances")?;
+    let tokens: Vec<String> = stmt
+        .query_map([], |r| Ok(addr_from_value(r.get_ref(0)?)))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())?;
+    for token in tokens {
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
+            params![token],
+            |r| r.get::<_, i64>(0),
+        )?;
+        conn.execute(
+            "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
+            params![count, now_ts(), hex_blob(&token)],
+        )?;
+    }
+    Ok(())
 }
 
 /// Contract-label lookup (populated at index time for created contracts).
