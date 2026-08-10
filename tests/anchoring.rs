@@ -299,10 +299,16 @@ fn namespaces_are_partitioned_by_caller() {
         assert_eq!(entry["last_block"], json!(300), "{ns}");
     }
 
-    // Re-writing an already-indexed block inserts nothing, so the summary
-    // must not move either.
+    // Re-writing an already-indexed block inserts nothing, so neither the
+    // summary nor the total may move.
     db::save_block_bundle(&db, &block, &txs, &[], &events, &[]).expect("re-save");
     assert_eq!(db::get_anchored_namespaces(&db, 1, 25), namespaces);
+    assert_eq!(db::count_anchored(&db), 2);
+
+    // The startup rebuild must land exactly where the incremental fold did.
+    db::sync_anchored_namespaces(&db::lock(&db)).expect("sync");
+    assert_eq!(db::get_anchored_namespaces(&db, 1, 25), namespaces);
+    assert_eq!(db::count_anchored(&db), 2);
 }
 
 // ---------------------------------------------------------------------------

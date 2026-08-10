@@ -166,6 +166,10 @@ pub fn init_db(path: &str) -> Result<Connection> {
             last_block INTEGER NOT NULL DEFAULT 0,
             last_timestamp INTEGER NOT NULL DEFAULT 0
         );
+        -- The /anchoring listing's exact order, so a page is an index walk
+        -- rather than a sort of every namespace.
+        CREATE INDEX IF NOT EXISTS idx_anchored_ns_order
+            ON anchored_namespaces(anchor_count DESC, last_block DESC, namespace);
 
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
@@ -989,6 +993,15 @@ fn refresh_anchored_namespace(conn: &Connection, event: &AnchoredEvent) -> Resul
             event.timestamp,
         ],
     )?;
+    // Total anchors, without a COUNT over the log: bumped only for fresh
+    // inserts, in the same transaction, so it never drifts.
+    exec_cached(
+        conn,
+        "INSERT INTO kv (key, value, updated_at) VALUES ('anchored_total', '1', ?1)
+         ON CONFLICT(key) DO UPDATE SET
+             value = CAST(value AS INTEGER) + 1, updated_at = excluded.updated_at",
+        params![now_ts()],
+    )?;
     Ok(())
 }
 
@@ -1002,6 +1015,12 @@ pub fn sync_anchored_namespaces(conn: &Connection) -> Result<()> {
          SELECT namespace, COUNT(*), COUNT(DISTINCT key), MAX(block_number), MAX(timestamp)
          FROM anchored_events GROUP BY namespace",
         [],
+    )?;
+    conn.execute(
+        "INSERT INTO kv (key, value, updated_at)
+         VALUES ('anchored_total', (SELECT COUNT(*) FROM anchored_events), ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![now_ts()],
     )?;
     Ok(())
 }
@@ -1027,7 +1046,7 @@ pub fn get_anchored_namespaces(db: &Db, page: u32, per_page: u32) -> Vec<Value> 
     let Ok(mut stmt) = conn.prepare(
         "SELECT namespace, anchor_count, key_count, last_block, last_timestamp
          FROM anchored_namespaces
-         ORDER BY anchor_count DESC, last_block DESC
+         ORDER BY anchor_count DESC, last_block DESC, namespace
          LIMIT ?1 OFFSET ?2",
     ) else {
         return Vec::new();
@@ -1113,12 +1132,12 @@ pub fn get_recent_anchored(db: &Db, limit: usize) -> Vec<AnchoredEvent> {
     rows.filter_map(|r| r.ok()).collect()
 }
 
+/// Total anchors ever indexed — the kv counter the summary fold maintains,
+/// so this is a point read rather than a COUNT over the log.
 pub fn count_anchored(db: &Db) -> i64 {
-    let conn = lock(db);
-    conn.query_row("SELECT COUNT(*) FROM anchored_events", [], |r| {
-        r.get::<_, i64>(0)
-    })
-    .unwrap_or(0)
+    get_kv(db, "anchored_total")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
