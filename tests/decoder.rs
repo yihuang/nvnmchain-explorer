@@ -550,6 +550,7 @@ fn blob_storage_queries_match_text_params() {
         &block,
         std::slice::from_ref(&tx),
         std::slice::from_ref(&transfer),
+        &[],
         std::slice::from_ref(&meta),
     )
     .expect("save bundle");
