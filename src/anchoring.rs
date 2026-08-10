@@ -3,8 +3,14 @@
 //! the only record of history.
 //!
 //! What a payload *means* is deliberately not here: those shapes track a
-//! contract in another repo, so reading them belongs to the indexer that
+//! contract in another repo, so reading them belongs to the decoder that
 //! versions with it (`nvnmchain-anchoring`).
+//!
+//! That split is why this ingests the log itself rather than reading it from a
+//! general indexer: `metadata` is a dynamic `bytes`, and an indexer decoding it
+//! as the head word hands back the ABI offset instead of the payload.
+//! `decoder.rs` dereferences it, so `is_self_verifying` below hashes a payload
+//! rather than `0x…40`.
 
 use crate::decoder::keccak_hex;
 
