@@ -1062,7 +1062,7 @@ pub async fn anchoring_page(
     let ctx = page_ctx(
         &state,
         json!({
-            "namespaces": db::get_anchored_namespaces(&state.db, page, per_page),
+            "namespaces": db::get_anchored_namespaces(&state.db, state.cfg.registry_factory.as_deref(), page, per_page),
             "recent": anchored_rows(&db::get_recent_anchored(&state.db, 10)),
             "total": db::count_anchored(&state.db),
             "page": page,
@@ -1092,10 +1092,17 @@ pub async fn anchoring_namespace_page(
         .max(1);
     let per_page: u32 = 25;
     let keys = db::get_namespace_keys(&state.db, &namespace, page, per_page);
+    // Labelled when the configured factory deployed this namespace.
+    let registry = state
+        .cfg
+        .registry_factory
+        .as_deref()
+        .and_then(|factory| db::get_registry(&state.db, factory, &namespace));
     let ctx = page_ctx(
         &state,
         json!({
             "namespace": namespace,
+            "registry": registry,
             "keys": keys,
             "page": page,
             "per_page": per_page,

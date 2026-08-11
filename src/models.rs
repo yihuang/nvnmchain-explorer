@@ -94,6 +94,26 @@ pub struct Transaction {
     pub created_at: i64,
 }
 
+/// One `RegistryDeployed` log: a registry contract coming into existence. The
+/// emitting factory is recorded rather than filtered at ingest — like transfers,
+/// any factory's log lands here, and reads trust only the configured one.
+///
+/// The event's third string (free-form registry metadata) is deliberately not
+/// a field: no page shows it, and it stays readable in the log.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegistryDeployed {
+    pub factory: String,
+    /// The deployed registry — the namespace its anchors will live in.
+    pub registry: String,
+    pub creator: String,
+    pub name: String,
+    pub description: String,
+    pub block_number: i64,
+    pub log_index: i64,
+    pub timestamp: i64,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenMetadata {
     pub address: String,

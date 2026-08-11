@@ -5,6 +5,9 @@
 <div class="mb-6">
     <p class="text-xs text-dim"><a href="/anchoring" class="text-blue-400 hover:text-blue-300">Anchoring</a> / namespace</p>
     <h1 class="text-xl font-extrabold tracking-tight mono break-all mt-1">{{ namespace }}</h1>
+    {% if registry %}
+    <p class="text-sm mt-1">Registry <span class="font-bold">{{ registry.name }}</span>{% if registry.description %} — {{ registry.description }}{% endif %}</p>
+    {% endif %}
     <p class="text-xs text-dim mt-1">
         <a href="{{ get_address_url(address=namespace) }}" class="text-blue-400 hover:text-blue-300">View as address</a>
     </p>

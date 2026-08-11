@@ -19,7 +19,7 @@ use crate::anchoring::ANCHORING_ADDRESS;
 use crate::config::Settings;
 use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event, flatten_trace};
-use crate::models::{AnchoredEvent, Block, Transaction, TransferEvent};
+use crate::models::{AnchoredEvent, Block, RegistryDeployed, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::tokens::{fetch_token_metadata, TokenMeta};
@@ -54,6 +54,7 @@ pub struct BlockBundle {
     pub transfers: Vec<TransferEvent>,
     pub anchored: Vec<AnchoredEvent>,
     pub tokens: Vec<TokenMeta>,
+    pub registries: Vec<RegistryDeployed>,
 }
 
 /// Fetch a block and everything attached to it: transactions, receipts
@@ -142,6 +143,7 @@ pub async fn fetch_block_bundle_with_cache(
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
     let mut anchored = Vec::new();
+    let mut registries = Vec::new();
     let mut transfer_tokens: HashSet<String> = HashSet::new();
     // Running log index across the whole block. Receipts normally carry a
     // unique `logIndex`; when one is missing or mangled the counter fills in
@@ -174,6 +176,7 @@ pub async fn fetch_block_bundle_with_cache(
                 receipt,
                 &mut transfers,
                 &mut anchored,
+                &mut registries,
                 &mut transfer_tokens,
                 &mut next_log_index,
             );
@@ -221,6 +224,7 @@ pub async fn fetch_block_bundle_with_cache(
         transfers,
         anchored,
         tokens,
+        registries,
     }))
 }
 
@@ -229,6 +233,7 @@ fn apply_receipt(
     receipt: &Value,
     transfers: &mut Vec<TransferEvent>,
     anchored: &mut Vec<AnchoredEvent>,
+    registries: &mut Vec<RegistryDeployed>,
     transfer_tokens: &mut HashSet<String>,
     next_log_index: &mut u64,
 ) {
@@ -294,6 +299,14 @@ fn apply_receipt(
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
 
+        // Before the named-event decode, which does not know RegistryDeployed:
+        // the parser matches by topic itself, and the emitting factory rides in
+        // the row — reads decide which factory to trust, the way transfer rows
+        // record their token.
+        if let Some(event) = registry_deployed(log, tx, log_index) {
+            registries.push(event);
+            continue;
+        }
         let Some(decoded) = decode_event(log) else {
             continue;
         };
@@ -398,6 +411,41 @@ pub fn anchored_event(
     })
 }
 
+/// One `RegistryDeployed` log as a storable row, or `None` when it does not
+/// carry its addresses. Strings decode leniently — an empty name labels as
+/// empty rather than dropping the registry from the listing.
+pub fn registry_deployed(
+    log: &Value,
+    tx: &Transaction,
+    log_index: i64,
+) -> Option<RegistryDeployed> {
+    let topics = log.get("topics")?.as_array()?;
+    if topics.first()?.as_str()? != crate::decoder::REGISTRY_DEPLOYED_TOPIC {
+        return None;
+    }
+    let data = log.get("data").and_then(Value::as_str).unwrap_or("0x");
+    Some(RegistryDeployed {
+        factory: checksum_address(log.get("address")?.as_str()?),
+        registry: topic_address(topics.get(1)?)?,
+        creator: topic_address(topics.get(2)?)?,
+        name: crate::decoder::string_from_data(data, 0),
+        description: crate::decoder::string_from_data(data, 1),
+        block_number: tx.block_number,
+        log_index,
+        timestamp: tx.timestamp,
+        created_at: db::now_ts(),
+    })
+}
+
+/// The address right-aligned in an indexed topic, or `None` off a 32-byte word.
+fn topic_address(topic: &Value) -> Option<String> {
+    let hexed = topic.as_str()?.strip_prefix("0x").unwrap_or_default();
+    if hexed.len() != 64 {
+        return None;
+    }
+    Some(checksum_address(&hexed[24..]))
+}
+
 /// Fetch + persist one block (used by tests and simple callers).
 pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> {
     let Some(bundle) = fetch_block_bundle(rpc, block_num).await? else {
@@ -410,6 +458,7 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
         &bundle.transfers,
         &bundle.anchored,
         &bundle.tokens,
+        &bundle.registries,
     )?;
     Ok(())
 }
@@ -757,6 +806,7 @@ pub async fn run_forever(
                 &bundle.transfers,
                 &bundle.anchored,
                 &bundle.tokens,
+                &bundle.registries,
             ) {
                 warn!("db write failed for block {}: {e:#}", bundle.block.number);
                 continue;

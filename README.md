@@ -161,6 +161,11 @@ registry ones) and the key pages link out to it.
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 
+Set `REGISTRY_FACTORY` to the deployed `RegistryFactory` and namespaces it
+deployed are labelled with their registry's name — deployments are indexed
+regardless, so setting it later needs no re-sync; unset, nothing is trusted as
+a registry.
+
 All data endpoints accept `?format=json` or `Accept: application/json`.
 
 The home page subscribes to `/api/events` with `EventSource` and updates the

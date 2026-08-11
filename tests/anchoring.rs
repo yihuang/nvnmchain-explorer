@@ -15,8 +15,9 @@ use nvnmchain_explorer::indexer::anchored_event;
 use nvnmchain_explorer::models::{AnchoredEvent, Block, Transaction};
 use serde_json::{json, Value};
 
-/// The `AnchoringRegistry` proxy that emitted the fixtures — its address is the
-/// namespace, since the precompile partitions by caller.
+/// The registry contract that emitted the fixtures — its address is the namespace,
+/// since the precompile partitions by caller. One deployment per registry, so this
+/// address is the registry rather than a proxy fronting many of them.
 const REGISTRY: &str = "0x44DA54d3f5416A9Ae699d54EcB83c3043c41319E";
 
 /// The explorer stores what was anchored without reading it, so the tests need
@@ -155,8 +156,16 @@ fn index_anchor(
     let tx = test_tx(&block);
     let log = anchored_log(REGISTRY, key, commitment, metadata);
     let event = event_from_log(&log, &tx, 0);
-    db::save_block_bundle(db, &block, &[tx], &[], std::slice::from_ref(&event), &[])
-        .expect("save bundle");
+    db::save_block_bundle(
+        db,
+        &block,
+        &[tx],
+        &[],
+        std::slice::from_ref(&event),
+        &[],
+        &[],
+    )
+    .expect("save bundle");
     event
 }
 
@@ -275,7 +284,7 @@ fn namespaces_are_partitioned_by_caller() {
     );
     let txs = [tx];
     let events = [mine, theirs];
-    db::save_block_bundle(&db, &block, &txs, &[], &events, &[]).expect("save bundle");
+    db::save_block_bundle(&db, &block, &txs, &[], &events, &[], &[]).expect("save bundle");
 
     // Same key, different callers: the writes never collide.
     let other = nvnmchain_explorer::decoder::checksum_address(&other);
@@ -288,7 +297,7 @@ fn namespaces_are_partitioned_by_caller() {
         format!("0x{}", "08".repeat(32))
     );
 
-    let namespaces = db::get_anchored_namespaces(&db, 1, 25);
+    let namespaces = db::get_anchored_namespaces(&db, None, 1, 25);
     for ns in [REGISTRY, other.as_str()] {
         let entry = namespaces
             .iter()
@@ -301,14 +310,108 @@ fn namespaces_are_partitioned_by_caller() {
 
     // Re-writing an already-indexed block inserts nothing, so neither the
     // summary nor the total may move.
-    db::save_block_bundle(&db, &block, &txs, &[], &events, &[]).expect("re-save");
-    assert_eq!(db::get_anchored_namespaces(&db, 1, 25), namespaces);
+    db::save_block_bundle(&db, &block, &txs, &[], &events, &[], &[]).expect("re-save");
+    assert_eq!(db::get_anchored_namespaces(&db, None, 1, 25), namespaces);
     assert_eq!(db::count_anchored(&db), 2);
 
     // The startup rebuild must land exactly where the incremental fold did.
     db::sync_anchored_namespaces(&db::lock(&db)).expect("sync");
-    assert_eq!(db::get_anchored_namespaces(&db, 1, 25), namespaces);
+    assert_eq!(db::get_anchored_namespaces(&db, None, 1, 25), namespaces);
     assert_eq!(db::count_anchored(&db), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Registry labelling
+// ---------------------------------------------------------------------------
+
+const FACTORY: &str = "0x00000000000000000000000000000000000FAC70";
+
+/// A `RegistryDeployed` log as the factory emits it: registry, creator and index
+/// in the topics, the three strings ABI-encoded in `data`.
+fn registry_deployed_log(factory: &str, registry: &str, name: &str) -> Value {
+    // abi.encode(string, string, string): three offset words, then each tail as
+    // a length word and right-padded bytes.
+    let parts: [&[u8]; 3] = [name.as_bytes(), b"docs about docs", b"{}"];
+    let word = |n: usize| format!("{n:064x}");
+    let mut head = String::from("0x");
+    let mut tail = String::new();
+    for part in parts {
+        head.push_str(&word(3 * 32 + tail.len() / 2));
+        tail.push_str(&word(part.len()));
+        tail.push_str(&hex::encode(part));
+        tail.push_str(&"0".repeat(tail.len().next_multiple_of(64) - tail.len()));
+    }
+    let data = head + &tail;
+    json!({
+        "address": factory,
+        "topics": [
+            nvnmchain_explorer::decoder::REGISTRY_DEPLOYED_TOPIC,
+            format!("0x{}{}", "00".repeat(12), registry.trim_start_matches("0x").to_lowercase()),
+            format!("0x{}{}", "00".repeat(12), "33".repeat(20)),
+            format!("0x{:064x}", 0),
+        ],
+        "data": data,
+        "logIndex": "0x0",
+    })
+}
+
+#[test]
+fn registry_deployed_topic_matches_the_signature() {
+    assert_eq!(
+        keccak_hex(b"RegistryDeployed(address,address,uint256,string,string,string)"),
+        nvnmchain_explorer::decoder::REGISTRY_DEPLOYED_TOPIC
+    );
+}
+
+#[test]
+fn a_deployment_labels_its_namespace_for_the_configured_factory_only() {
+    let (_dir, db) = temp_db();
+    let block = test_block(400);
+    let tx = test_tx(&block);
+
+    // The registry anchors (so it appears among namespaces)...
+    let key = format!("0x{}", "77".repeat(32));
+    let anchor = event_from_log(
+        &anchored_log(REGISTRY, &key, &format!("0x{}", "09".repeat(32)), "0x"),
+        &tx,
+        0,
+    );
+    // ...and its factory announced it.
+    let deployed = nvnmchain_explorer::indexer::registry_deployed(
+        &registry_deployed_log(FACTORY, REGISTRY, "docs"),
+        &tx,
+        1,
+    )
+    .expect("deployment parses");
+    assert_eq!(deployed.registry, REGISTRY);
+    assert_eq!(deployed.name, "docs");
+    assert_eq!(deployed.description, "docs about docs");
+
+    let txs = [tx];
+    db::save_block_bundle(&db, &block, &txs, &[], &[anchor], &[], &[deployed])
+        .expect("save bundle");
+
+    // Labelled for the factory that deployed it, bare for anyone else.
+    let labelled = db::get_anchored_namespaces(&db, Some(FACTORY), 1, 25);
+    let row = labelled
+        .iter()
+        .find(|n| n["namespace"] == json!(REGISTRY))
+        .expect("listed");
+    assert_eq!(row["name"], json!("docs"));
+
+    let other = format!("0x{}", "44".repeat(20));
+    for factory in [None, Some(other.as_str())] {
+        let bare = db::get_anchored_namespaces(&db, factory, 1, 25);
+        let row = bare
+            .iter()
+            .find(|n| n["namespace"] == json!(REGISTRY))
+            .expect("listed");
+        assert_eq!(row["name"], json!(null), "{factory:?} must not label");
+    }
+
+    // The namespace page's header row, same trust rule.
+    assert!(db::get_registry(&db, FACTORY, REGISTRY).is_some());
+    assert!(db::get_registry(&db, &other, REGISTRY).is_none());
 }
 
 // ---------------------------------------------------------------------------

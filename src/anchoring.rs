@@ -4,7 +4,9 @@
 //!
 //! What a payload *means* is deliberately not here: those shapes track a
 //! contract in another repo, so reading them belongs to the decoder that
-//! versions with it (`nvnmchain-anchoring`).
+//! versions with it (`nvnmchain-anchoring`). A payload is only meaningful with
+//! its namespace beside it — one contract per registry, so the same commitment
+//! under two namespaces is two different records.
 //!
 //! That split is why this ingests the log itself rather than reading it from a
 //! general indexer: `metadata` is a dynamic `bytes`, and an indexer decoding it

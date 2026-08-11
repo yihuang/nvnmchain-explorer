@@ -8,7 +8,9 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use crate::models::{AnchoredEvent, Block, TokenMetadata, Transaction, TransferEvent};
+use crate::models::{
+    AnchoredEvent, Block, RegistryDeployed, TokenMetadata, Transaction, TransferEvent,
+};
 
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -171,6 +173,21 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_anchored_ns_order
             ON anchored_namespaces(anchor_count DESC, last_block DESC, namespace);
 
+        -- RegistryDeployed rows, factory recorded rather than filtered: reads
+        -- trust only the configured factory, the way transfer rows carry their
+        -- token. One row per registry -- a contract deploys once.
+        CREATE TABLE IF NOT EXISTS registries (
+            address BLOB PRIMARY KEY,
+            factory BLOB NOT NULL,
+            creator BLOB NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            block_number INTEGER NOT NULL,
+            log_index INTEGER NOT NULL DEFAULT 0,
+            timestamp INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
@@ -279,6 +296,7 @@ pub fn save_block_bundle(
     transfers: &[TransferEvent],
     anchored: &[AnchoredEvent],
     tokens: &[crate::tokens::TokenMeta],
+    registries: &[RegistryDeployed],
 ) -> Result<()> {
     let mut conn = lock(db);
     let txn = conn.transaction().context("begin block transaction")?;
@@ -307,6 +325,27 @@ pub fn save_block_bundle(
         if insert_anchored(&txn, event)? {
             refresh_anchored_namespace(&txn, event)?;
         }
+    }
+    for event in registries {
+        // OR REPLACE: a re-indexed block rewrites the same row, and a registry
+        // address deploys exactly once.
+        exec_cached(
+            &txn,
+            "INSERT OR REPLACE INTO registries (address, factory, creator, name, description,
+                                                block_number, log_index, timestamp, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                hex_blob(&event.registry),
+                hex_blob(&event.factory),
+                hex_blob(&event.creator),
+                event.name,
+                event.description,
+                event.block_number,
+                event.log_index,
+                event.timestamp,
+                event.created_at,
+            ],
+        )?;
     }
     for tx in txs {
         if let Some(addr) = &tx.contract_address {
@@ -1039,24 +1078,55 @@ fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
     })
 }
 
-/// Namespaces that have anchored anything, busiest first.
-pub fn get_anchored_namespaces(db: &Db, page: u32, per_page: u32) -> Vec<Value> {
+/// The configured factory's registry at `namespace`, if that is what it is.
+pub fn get_registry(db: &Db, factory: &str, namespace: &str) -> Option<Value> {
+    let conn = lock(db);
+    conn.query_row(
+        "SELECT name, description, creator, block_number FROM registries
+         WHERE address=?1 AND factory=?2",
+        params![hex_blob(namespace), hex_blob(factory)],
+        |r| {
+            Ok(json!({
+                "name": r.get::<_, String>(0)?,
+                "description": r.get::<_, String>(1)?,
+                "creator": crate::decoder::checksum_address(&blob_hex(&r.get::<_, Vec<u8>>(2)?)),
+                "block_number": r.get::<_, i64>(3)?,
+            }))
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Namespaces that have anchored anything, busiest first. `factory` labels the
+/// ones that are its registries; unset, nothing is labelled.
+pub fn get_anchored_namespaces(
+    db: &Db,
+    factory: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Vec<Value> {
     let conn = lock(db);
     let offset = (page.saturating_sub(1) * per_page) as i64;
     let Ok(mut stmt) = conn.prepare(
-        "SELECT namespace, anchor_count, key_count, last_block, last_timestamp
-         FROM anchored_namespaces
-         ORDER BY anchor_count DESC, last_block DESC, namespace
+        "SELECT n.namespace, n.anchor_count, n.key_count, n.last_block, n.last_timestamp,
+                r.name
+         FROM anchored_namespaces n
+         LEFT JOIN registries r ON r.address = n.namespace AND r.factory = ?3
+         ORDER BY n.anchor_count DESC, n.last_block DESC, n.namespace
          LIMIT ?1 OFFSET ?2",
     ) else {
         return Vec::new();
     };
-    let Ok(rows) = stmt.query_map(params![per_page as i64, offset], |r| {
+    let factory_blob = factory.map(hex_blob).unwrap_or_default();
+    let Ok(rows) = stmt.query_map(params![per_page as i64, offset, factory_blob], |r| {
         Ok(json!({
             "namespace": crate::decoder::checksum_address(&blob_hex(&r.get::<_, Vec<u8>>(0)?)),
             "anchor_count": r.get::<_, i64>(1)?,
             "key_count": r.get::<_, i64>(2)?,
             "last_block": r.get::<_, i64>(3)?,
+            "name": r.get::<_, Option<String>>(5)?,
             "last_timestamp": r.get::<_, i64>(4)?,
         }))
     }) else {

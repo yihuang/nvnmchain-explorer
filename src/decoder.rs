@@ -721,6 +721,10 @@ pub const TRANSFER_WITH_MEMO_TOPIC: &str =
     "0xab2461e5dc8495f413774182e5eb0e9f0f30a81bf32c4b7a4a1d70c3c4e2f0a";
 pub const APPROVAL_TOPIC: &str =
     "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+/// `RegistryDeployed(address,address,uint256,string,string,string)` — the
+/// factory announcing a registry. Asserted against its signature in the tests.
+pub const REGISTRY_DEPLOYED_TOPIC: &str =
+    "0xf33cd62e56db2a62196bdce3d106fac4573aa29a5f84e4e5ae2f50555ba9928f";
 
 fn address_from_topic(topic: &str) -> String {
     let hexed = topic.strip_prefix("0x").unwrap_or(topic);
@@ -732,6 +736,26 @@ fn uint256_from_data(data: &str, offset: usize) -> String {
     let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
     let chunk = bytes.get(offset * 32..offset * 32 + 32).unwrap_or(&[]);
     big_from_word(chunk).to_string()
+}
+
+/// An ABI `string` argument out of the data section: the word at `slot` is the
+/// offset of its tail, which starts with a length. Empty on any malformed shape.
+pub fn string_from_data(data: &str, slot: usize) -> String {
+    let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
+    let word = |at: usize| -> Option<usize> {
+        let w = bytes.get(at..at + 32)?;
+        if w[..24].iter().any(|b| *b != 0) {
+            return None;
+        }
+        Some(u64::from_be_bytes(w[24..].try_into().ok()?) as usize)
+    };
+    let read = || -> Option<String> {
+        let tail = word(slot * 32)?;
+        let len = word(tail)?;
+        let text = bytes.get(tail + 32..tail + 32 + len)?;
+        Some(String::from_utf8_lossy(text).into_owned())
+    };
+    read().unwrap_or_default()
 }
 
 fn bytes32_from_data(data: &str, offset: usize) -> String {

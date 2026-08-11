@@ -114,6 +114,7 @@ async fn backfill_throughput() {
                         &bundle.transfers,
                         &bundle.anchored,
                         &bundle.tokens,
+                        &bundle.registries,
                     );
                 }
             });
@@ -252,6 +253,7 @@ async fn web_api_serves_indexed_data() {
         batch_size: 5,
         index_concurrency: 8,
         native_symbol: "OM".into(),
+        registry_factory: None,
         anchoring_url: None,
         stats_interval_seconds: 5.0,
     };

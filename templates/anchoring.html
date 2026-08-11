@@ -19,7 +19,7 @@
         {% for ns in namespaces %}
         <div class="t-row flex text-xs items-center">
             <div class="flex-1 px-3 py-3 mono truncate">
-                <a href="/anchoring/{{ ns.namespace }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=ns.namespace, prefix=10, suffix=6) }}</a>
+                <a href="/anchoring/{{ ns.namespace }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=ns.namespace, prefix=10, suffix=6) }}</a>{% if ns.name %} <span class="text-xs text-dim" title="deployed by the configured RegistryFactory">{{ ns.name }}</span>{% endif %}
             </div>
             <div class="w-24 px-3 py-3 text-right text-dim">{{ ns.key_count }}</div>
             <div class="w-28 px-3 py-3 text-right text-dim">{{ ns.anchor_count }}</div>
