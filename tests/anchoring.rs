@@ -550,3 +550,33 @@ async fn malformed_namespace_and_unknown_key_are_rejected() {
         .expect("missing key");
     assert_eq!(missing.status(), 404);
 }
+
+/// The layout, rendered with whatever `page_ctx` would have put in it.
+fn nav(anchored_total: i64) -> String {
+    let (_dir, db) = temp_db();
+    let tera = nvnmchain_explorer::web::build_tera(db).expect("templates load");
+    let ctx = tera::Context::from_serialize(json!({
+        "native_symbol": "PATH",
+        "anchoring_url": Value::Null,
+        "anchored_total": anchored_total,
+        "latest_block": Value::Null,
+        "query": "",
+    }))
+    .expect("context");
+    tera.render("base.html", &ctx).expect("base.html renders")
+}
+
+#[test]
+fn the_anchoring_tab_waits_for_the_first_anchor() {
+    // A chain that has never anchored gets no menu entry for it. The routes stay
+    // reachable either way -- a link from elsewhere still resolves, and would
+    // start 404ing the day someone anchored if this hid them instead.
+    assert!(
+        !nav(0).contains(r#"href="/anchoring""#),
+        "nav on an unused chain"
+    );
+    assert!(
+        nav(1).contains(r#"href="/anchoring""#),
+        "nav once something is anchored"
+    );
+}

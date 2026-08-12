@@ -240,7 +240,8 @@
                         <a href="/" class="nav-link">Home</a>
                         <a href="/blocks" class="nav-link">Blocks</a>
                         <a href="/tokens" class="nav-link">Tokens</a>
-                        <a href="/anchoring" class="nav-link">Anchoring</a>
+                        {# Hidden until the chain anchors something; the routes answer either way. #}
+                        {% if anchored_total > 0 %}<a href="/anchoring" class="nav-link">Anchoring</a>{% endif %}
                     </div>
                 </div>
                 <div class="flex items-center gap-3">

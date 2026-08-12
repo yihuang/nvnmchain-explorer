@@ -154,7 +154,10 @@ The indexer is built for a sub-second chain:
 | `/anchoring/{namespace}/{key}` | Every revision of one key, newest first |
 
 These show the commitment log itself: what was anchored, by whom, in what
-order. What a payload *means* belongs to the application that wrote it — set
+order. The nav entry appears once the chain has anchored something, though the
+routes answer either way.
+
+What a payload *means* belongs to the application that wrote it — set
 `ANCHORING_URL` to the base URL of whatever reads those envelopes
 ([nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) `serve`
 decodes the registry ones) and each key page links to

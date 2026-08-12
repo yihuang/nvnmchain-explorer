@@ -101,6 +101,11 @@ fn page_ctx(state: &AppState, extra: Value) -> Value {
     );
     map.insert("native_symbol".into(), json!(state.cfg.native_symbol));
     map.insert("anchoring_url".into(), json!(state.cfg.anchoring_url));
+    // A kv read, not a COUNT: the indexer keeps the total.
+    map.insert(
+        "anchored_total".into(),
+        json!(db::count_anchored(&state.db)),
+    );
     if let Value::Object(o) = extra {
         for (k, v) in o {
             map.insert(k, v);
