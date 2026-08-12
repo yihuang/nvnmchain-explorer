@@ -155,9 +155,11 @@ The indexer is built for a sub-second chain:
 
 These show the commitment log itself: what was anchored, by whom, in what
 order. What a payload *means* belongs to the application that wrote it — set
-`ANCHORING_URL` to whatever reads those envelopes
-([nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) decodes the
-registry ones) and the key pages link out to it.
+`ANCHORING_URL` to the base URL of whatever reads those envelopes
+([nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) `serve`
+decodes the registry ones) and each key page links to
+`{ANCHORING_URL}/registries/{namespace}/records` — that namespace's records,
+decoded.
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 
