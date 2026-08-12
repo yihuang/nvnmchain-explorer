@@ -721,10 +721,10 @@ pub const TRANSFER_WITH_MEMO_TOPIC: &str =
     "0xab2461e5dc8495f413774182e5eb0e9f0f30a81bf32c4b7a4a1d70c3c4e2f0a";
 pub const APPROVAL_TOPIC: &str =
     "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
-/// `RegistryDeployed(address,address,uint256,string,string,string)` — the
-/// factory announcing a registry. Asserted against its signature in the tests.
+/// `RegistryDeployed(address,address,string,string,string)` — the factory
+/// announcing a registry. Asserted against its signature in the tests.
 pub const REGISTRY_DEPLOYED_TOPIC: &str =
-    "0xf33cd62e56db2a62196bdce3d106fac4573aa29a5f84e4e5ae2f50555ba9928f";
+    "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576";
 
 fn address_from_topic(topic: &str) -> String {
     let hexed = topic.strip_prefix("0x").unwrap_or(topic);

@@ -348,7 +348,6 @@ fn registry_deployed_log(factory: &str, registry: &str, name: &str) -> Value {
             nvnmchain_explorer::decoder::REGISTRY_DEPLOYED_TOPIC,
             format!("0x{}{}", "00".repeat(12), registry.trim_start_matches("0x").to_lowercase()),
             format!("0x{}{}", "00".repeat(12), "33".repeat(20)),
-            format!("0x{:064x}", 0),
         ],
         "data": data,
         "logIndex": "0x0",
@@ -358,7 +357,7 @@ fn registry_deployed_log(factory: &str, registry: &str, name: &str) -> Value {
 #[test]
 fn registry_deployed_topic_matches_the_signature() {
     assert_eq!(
-        keccak_hex(b"RegistryDeployed(address,address,uint256,string,string,string)"),
+        keccak_hex(b"RegistryDeployed(address,address,string,string,string)"),
         nvnmchain_explorer::decoder::REGISTRY_DEPLOYED_TOPIC
     );
 }
