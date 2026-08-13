@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@v1.5
+        uses: superfly/flyctl-actions/setup-flyctl@1.6
 
       - name: Deploy
         run: fly deploy --remote-only
