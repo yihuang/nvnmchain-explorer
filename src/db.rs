@@ -40,6 +40,10 @@ pub fn now_ts() -> i64 {
 pub fn init_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("open db {path}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // NORMAL fsyncs on checkpoint instead of per commit (WAL's FULL default).
+    // A power loss can lose the last few commits but never corrupts, and the
+    // index is derived data: the next start re-fetches the tail from the chain.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(
