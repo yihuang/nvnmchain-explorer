@@ -6,8 +6,10 @@
 app = 'nvnmchain-explorer'
 primary_region = 'sin'
 
+# Built from the repo Dockerfile; CI deploys it automatically on main push
+# (.github/workflows/docker.yml -> fly deploy --remote-only).
 [build]
-  image = 'ghcr.io/yihuang/nvnmchain-explorer:latest'
+  dockerfile = 'Dockerfile'
 
 [env]
   DB_PATH = '/data/explorer.db'
