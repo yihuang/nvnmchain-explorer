@@ -2,7 +2,7 @@ use nvnmchain_explorer::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
     flatten_trace, TRANSFER_TOPIC,
 };
-use nvnmchain_explorer::models::{Transaction, TransferEvent};
+use nvnmchain_explorer::models::{BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::format_token_amount;
 use serde_json::json;
@@ -334,7 +334,13 @@ fn blob_hex_round_trip() {
     let rlp = include_str!("../fixtures/tx_664125.rlp").trim();
     let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
     tx.raw = Some(rlp.to_string());
-    db::save_block_bundle(&db, &block, &[tx], &[], &[]).expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![],
+        tokens: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     // Block reads back with identical hex, and hash lookup is case-insensitive
     // (binary storage normalizes hex case — a bonus over TEXT comparisons).
@@ -421,22 +427,14 @@ fn duplicate_bundle_is_idempotent() {
 
     // The same block written twice (what the indexer's concurrent fetch/retry
     // races can produce). Blocks and txs upsert; transfers must dedupe.
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        &[],
-    )
-    .expect("first save");
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        &[],
-    )
-    .expect("duplicate save");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![transfer],
+        tokens: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("first save");
+    db::save_block_bundle(&db, &bundle).expect("duplicate save");
 
     let conn = db::lock(&db);
     let count: i64 = conn
@@ -543,14 +541,13 @@ fn blob_storage_queries_match_text_params() {
         currency: "USD".into(),
         total_supply: "1000000".into(),
     };
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        std::slice::from_ref(&meta),
-    )
-    .expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![transfer],
+        tokens: vec![meta],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     // Address transfers tab: query binds the address as raw bytes.
     let addr_transfers = db::get_address_transfers(&db, &to, 1, 25);
