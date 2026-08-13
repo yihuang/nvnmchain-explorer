@@ -18,6 +18,7 @@ use num_bigint::BigInt;
 use serde_json::{json, Value};
 use tera::Tera;
 use tokio::sync::broadcast;
+use tower_http::cors::CorsLayer;
 
 use crate::config::Settings;
 use crate::contracts::{identify_address, is_contract};
@@ -1344,5 +1345,8 @@ pub fn app(state: AppState) -> Router {
         .route("/token/{address}", get(token_page))
         .route("/tokens", get(tokens_page))
         .route("/search", get(search_page))
+        // Public explorer: allow cross-origin reads from any site (the wallet
+        // is hosted on a different origin and needs `?format=json`).
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
