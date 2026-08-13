@@ -942,10 +942,12 @@ pub async fn token_page(
         }
     };
 
+    // The token page only has a Transfers tab (token.html), so default to it
+    // instead of "transactions" — otherwise the home page renders an empty list.
     let tab = query
         .get("tab")
         .cloned()
-        .unwrap_or_else(|| "transactions".into());
+        .unwrap_or_else(|| "transfers".into());
     let page: u32 = query
         .get("page")
         .and_then(|p| p.parse().ok())
