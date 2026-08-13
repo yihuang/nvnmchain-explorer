@@ -4,7 +4,9 @@ use nvnmchain_explorer::decoder::{
 };
 use nvnmchain_explorer::models::{Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
-use nvnmchain_explorer::tokens::format_token_amount;
+use nvnmchain_explorer::tokens::{
+    decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text,
+};
 use serde_json::json;
 
 fn transfer_calldata(to: &str, amount: u128) -> String {
@@ -106,6 +108,66 @@ fn flatten_trace_nested() {
     assert_eq!(flat[0]["children"], json!([1, 2]));
     assert_eq!(flat[1]["gas"], "21000");
     assert_eq!(flat[2]["value"], "1");
+}
+
+/// ABI-encode a `string` return value the standard dynamic way:
+/// word 0 = offset (0x20), word 1 = length, word 2 = UTF-8 payload padded.
+fn abi_string(s: &str) -> String {
+    let payload = s.as_bytes();
+    let mut words: Vec<u8> = Vec::new();
+    let mut offset_word = [0u8; 32];
+    offset_word[24..32].copy_from_slice(&32u64.to_be_bytes()); // offset = 32
+    words.extend_from_slice(&offset_word);
+    let mut len_word = [0u8; 32];
+    len_word[24..32].copy_from_slice(&(payload.len() as u64).to_be_bytes()); // length
+    words.extend_from_slice(&len_word);
+    words.extend_from_slice(payload);
+    let padded = payload.len().div_ceil(32) * 32;
+    words.resize(64 + padded, 0);
+    format!("0x{}", hex::encode(&words))
+}
+
+#[test]
+fn decode_string_result_dynamic_encoding() {
+    // Regression: the real `name()`/`symbol()` responses for a TIP-20 token
+    // (e.g. 0x20C0…e37D → "TestUSD") use the offset-indirection form. The
+    // old decoder read the offset word (32) as the length and returned the
+    // raw length word (31 NULs + 0x07) instead of the payload.
+    assert_eq!(decode_string_result(&abi_string("TestUSD")), "TestUSD");
+    assert_eq!(decode_string_result(&abi_string("TESTUSD")), "TESTUSD");
+    assert_eq!(decode_string_result(&abi_string("")), "");
+    // A string long enough to span multiple words.
+    let long = "pathUSD-pathUSD-pathUSD-pathUSD-pathUSD-pathUSD";
+    assert_eq!(decode_string_result(&abi_string(long)), long);
+
+    // Non-standard in-place short string (length in word 0) still decodes.
+    let mut in_place = vec![0u8; 64];
+    in_place[31] = 7;
+    in_place[32..39].copy_from_slice(b"TestUSD");
+    assert_eq!(
+        decode_string_result(&format!("0x{}", hex::encode(&in_place))),
+        "TestUSD"
+    );
+
+    // Empty / malformed inputs degrade to an empty string.
+    assert_eq!(decode_string_result(""), "");
+    assert_eq!(decode_string_result("0x"), "");
+    assert_eq!(decode_string_result("0x12"), "");
+}
+
+#[test]
+fn sanitize_metadata_text_rejects_control_chars() {
+    // The pre-fix decoder produced this exact garbage for a 7-char name:
+    // 31 NUL bytes followed by the length byte 0x07.
+    let garbage = "\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{7}";
+    assert!(has_control_chars(garbage));
+    assert_eq!(sanitize_metadata_text(garbage), "");
+
+    // Legit metadata passes through (trailing NUL padding trimmed).
+    assert!(!has_control_chars("TestUSD"));
+    assert_eq!(sanitize_metadata_text("TestUSD"), "TestUSD");
+    assert_eq!(sanitize_metadata_text("TestUSD\u{0}\u{0}"), "TestUSD");
+    assert_eq!(sanitize_metadata_text(""), "");
 }
 
 #[test]

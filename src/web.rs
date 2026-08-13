@@ -27,7 +27,9 @@ use crate::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
 };
 use crate::rpc::ChainRpc;
-use crate::tokens::{fetch_token_metadata, format_token_amount, format_token_amount_with_symbol};
+use crate::tokens::{
+    fetch_token_metadata, format_token_amount, format_token_amount_with_symbol, has_control_chars,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -915,9 +917,11 @@ pub async fn token_page(
         };
     }
 
+    // A corrupt row (NUL/control chars from the pre-fix decoder) is treated
+    // as missing so the page re-fetches clean metadata on the spot.
     let meta = match db::get_token_metadata(&state.db, &checksummed) {
-        Some(m) => m,
-        None => {
+        Some(m) if !has_control_chars(&m.name) && !has_control_chars(&m.symbol) => m,
+        _ => {
             let fetched = fetch_token_metadata(&state.rpc, &checksummed).await;
             let _ = db::save_token_metadata(&state.db, &fetched);
             db::get_token_metadata(&state.db, &checksummed).unwrap_or_else(|| {
