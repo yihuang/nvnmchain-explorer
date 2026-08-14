@@ -131,3 +131,13 @@ pub struct TransferEvent {
     pub timestamp: i64,
     pub created_at: i64,
 }
+
+/// One block and everything indexed alongside it: its transactions, the
+/// transfers their receipts carried, and metadata for newly seen tokens.
+#[derive(Debug, Clone)]
+pub struct BlockBundle {
+    pub block: Block,
+    pub txs: Vec<Transaction>,
+    pub transfers: Vec<TransferEvent>,
+    pub tokens: Vec<crate::tokens::TokenMeta>,
+}

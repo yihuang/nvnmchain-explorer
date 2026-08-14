@@ -3,9 +3,11 @@ use nvnmchain_explorer::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
     flatten_trace, TRANSFER_TOPIC,
 };
-use nvnmchain_explorer::models::{Transaction, TransferEvent};
+use nvnmchain_explorer::models::{BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
-use nvnmchain_explorer::tokens::format_token_amount;
+use nvnmchain_explorer::tokens::{
+    decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text,
+};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
@@ -173,6 +175,66 @@ fn flatten_trace_nested() {
     assert_eq!(flat[0]["children"], json!([1, 2]));
     assert_eq!(flat[1]["gas"], "21000");
     assert_eq!(flat[2]["value"], "1");
+}
+
+/// ABI-encode a `string` return value the standard dynamic way:
+/// word 0 = offset (0x20), word 1 = length, word 2 = UTF-8 payload padded.
+fn abi_string(s: &str) -> String {
+    let payload = s.as_bytes();
+    let mut words: Vec<u8> = Vec::new();
+    let mut offset_word = [0u8; 32];
+    offset_word[24..32].copy_from_slice(&32u64.to_be_bytes()); // offset = 32
+    words.extend_from_slice(&offset_word);
+    let mut len_word = [0u8; 32];
+    len_word[24..32].copy_from_slice(&(payload.len() as u64).to_be_bytes()); // length
+    words.extend_from_slice(&len_word);
+    words.extend_from_slice(payload);
+    let padded = payload.len().div_ceil(32) * 32;
+    words.resize(64 + padded, 0);
+    format!("0x{}", hex::encode(&words))
+}
+
+#[test]
+fn decode_string_result_dynamic_encoding() {
+    // Regression: the real `name()`/`symbol()` responses for a TIP-20 token
+    // (e.g. 0x20C0…e37D → "TestUSD") use the offset-indirection form. The
+    // old decoder read the offset word (32) as the length and returned the
+    // raw length word (31 NULs + 0x07) instead of the payload.
+    assert_eq!(decode_string_result(&abi_string("TestUSD")), "TestUSD");
+    assert_eq!(decode_string_result(&abi_string("TESTUSD")), "TESTUSD");
+    assert_eq!(decode_string_result(&abi_string("")), "");
+    // A string long enough to span multiple words.
+    let long = "pathUSD-pathUSD-pathUSD-pathUSD-pathUSD-pathUSD";
+    assert_eq!(decode_string_result(&abi_string(long)), long);
+
+    // Non-standard in-place short string (length in word 0) still decodes.
+    let mut in_place = vec![0u8; 64];
+    in_place[31] = 7;
+    in_place[32..39].copy_from_slice(b"TestUSD");
+    assert_eq!(
+        decode_string_result(&format!("0x{}", hex::encode(&in_place))),
+        "TestUSD"
+    );
+
+    // Empty / malformed inputs degrade to an empty string.
+    assert_eq!(decode_string_result(""), "");
+    assert_eq!(decode_string_result("0x"), "");
+    assert_eq!(decode_string_result("0x12"), "");
+}
+
+#[test]
+fn sanitize_metadata_text_rejects_control_chars() {
+    // The pre-fix decoder produced this exact garbage for a 7-char name:
+    // 31 NUL bytes followed by the length byte 0x07.
+    let garbage = "\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{7}";
+    assert!(has_control_chars(garbage));
+    assert_eq!(sanitize_metadata_text(garbage), "");
+
+    // Legit metadata passes through (trailing NUL padding trimmed).
+    assert!(!has_control_chars("TestUSD"));
+    assert_eq!(sanitize_metadata_text("TestUSD"), "TestUSD");
+    assert_eq!(sanitize_metadata_text("TestUSD\u{0}\u{0}"), "TestUSD");
+    assert_eq!(sanitize_metadata_text(""), "");
 }
 
 #[test]
@@ -376,7 +438,13 @@ fn blob_hex_round_trip() {
     let rlp = include_str!("../fixtures/tx_664125.rlp").trim();
     let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
     tx.raw = Some(rlp.to_string());
-    db::save_block_bundle(&db, &block, &[tx], &[], &[]).expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![],
+        tokens: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     // Block reads back with identical hex, and hash lookup is case-insensitive
     // (binary storage normalizes hex case — a bonus over TEXT comparisons).
@@ -419,22 +487,14 @@ fn duplicate_bundle_is_idempotent() {
 
     // The same block written twice (what the indexer's concurrent fetch/retry
     // races can produce). Blocks and txs upsert; transfers must dedupe.
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        &[],
-    )
-    .expect("first save");
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        &[],
-    )
-    .expect("duplicate save");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![transfer],
+        tokens: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("first save");
+    db::save_block_bundle(&db, &bundle).expect("duplicate save");
 
     let conn = db::lock(&db);
     let count: i64 = conn
@@ -496,14 +556,13 @@ fn indexed_transfer_reads_back_through_every_listing() {
         currency: "USD".into(),
         total_supply: "1000".into(),
     };
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        std::slice::from_ref(&meta),
-    )
-    .expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx.clone()],
+        transfers: vec![transfer],
+        tokens: vec![meta],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     let by_token = db::get_token_transfers(&db, &token, 1, 25);
     assert_eq!(by_token.len(), 1, "token transfers");
@@ -611,14 +670,13 @@ fn blob_storage_queries_match_text_params() {
         currency: "USD".into(),
         total_supply: "1000000".into(),
     };
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        std::slice::from_ref(&meta),
-    )
-    .expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![transfer],
+        tokens: vec![meta],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     // Address transfers tab: query binds the address as raw bytes.
     let addr_transfers = db::get_address_transfers(&db, &to, 1, 25);
@@ -661,4 +719,27 @@ fn blob_storage_queries_match_text_params() {
         meta_back.holder_count, 2,
         "sync_holder_counts must backfill stale counts"
     );
+}
+
+#[test]
+fn huge_page_numbers_do_not_panic() {
+    use nvnmchain_explorer::db::{self, Db};
+    use std::sync::{Arc, Mutex};
+
+    // `page` is user input; u32 offset math overflowed (a panic under
+    // debug assertions, a garbage offset in release).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pages.db");
+    let db: Db = Arc::new(Mutex::new(
+        db::init_db(path.to_str().unwrap()).expect("init_db"),
+    ));
+
+    assert!(
+        db::get_address_transactions(&db, &format!("0x{}", "11".repeat(20)), u32::MAX, 25)
+            .is_empty()
+    );
+    assert!(
+        db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
+    );
+    assert!(db::get_all_tokens(&db, u32::MAX, 25).is_empty());
 }

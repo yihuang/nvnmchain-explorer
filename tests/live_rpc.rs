@@ -107,13 +107,7 @@ async fn backfill_throughput() {
             let num = next;
             set.spawn(async move {
                 if let Ok(Some(bundle)) = fetch_block_bundle(&rpc, num).await {
-                    let _ = db::save_block_bundle(
-                        &db,
-                        &bundle.block,
-                        &bundle.txs,
-                        &bundle.transfers,
-                        &bundle.tokens,
-                    );
+                    let _ = db::save_block_bundle(&db, &bundle);
                 }
             });
             next += 1;
@@ -261,6 +255,7 @@ async fn web_api_serves_indexed_data() {
         cfg,
         tera,
         block_events: block_tx,
+        shutdown: tokio::sync::watch::channel(false).1,
     };
     let app = web::app(state);
 

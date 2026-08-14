@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["cors"] }
 
 # Tempo tx types: RLP-decode the typed 0x76 transaction
 # (https://tempo.xyz/developers/docs/sdk/rust)
