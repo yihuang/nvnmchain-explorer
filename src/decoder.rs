@@ -873,7 +873,10 @@ mod tests {
         let data = abi_encode(&[Token::Bytes(vec![0xde, 0xad, 0xbe, 0xef])]);
         assert_eq!(decode_abi_args(&["bytes"], &data), vec!["0xdeadbeef"]);
         let data = abi_encode(&[Token::FixedBytes(vec![0xaa; 8])]);
-        assert_eq!(decode_abi_args(&["bytes8"], &data), vec!["0xaaaaaaaaaaaaaaaa"]);
+        assert_eq!(
+            decode_abi_args(&["bytes8"], &data),
+            vec!["0xaaaaaaaaaaaaaaaa"]
+        );
     }
 
     #[test]
@@ -928,16 +931,21 @@ mod tests {
         // `authorizeKey(address,uint8,tuple)` parses via HumanReadableParser
         // (bare `tuple` lexes as an empty tuple) instead of falling through
         // to the unknown-selector branch.
-        let call = decode_function_call(
-            "0x0b63140000000000000000000000000000000000000000000000000000000000000000"
-            "0000000000000000000000000000000000000000000000000000000000000001",
-        )
+        // args: address(0), uint8(1), tuple offset -> 0x60 (points past the 3-word head).
+        let call = decode_function_call(concat!(
+            "0x0b631400",
+            "0000000000000000000000000000000000000000000000000000000000000000", // address
+            "0000000000000000000000000000000000000000000000000000000000000001", // uint8
+            "0000000000000000000000000000000000000000000000000000000000000060", // tuple offset
+        ))
         .expect("decoded");
         assert_eq!(call.name.as_deref(), Some("authorizeKey"));
         assert_eq!(call.params.len(), 3);
         assert_eq!(call.params[0].ty, "address");
         assert_eq!(call.params[1].ty, "uint8");
         assert_eq!(call.params[1].value, "1");
-        assert_eq!(call.params[2].ty, "tuple");
+        // A bare `tuple` lexes as an empty tuple, rendered canonically as `()`.
+        assert_eq!(call.params[2].ty, "()");
+        assert_eq!(call.params[2].value, "()");
     }
 }
