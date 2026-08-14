@@ -421,7 +421,11 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
             .enumerate()
             .map(|(i, (t, n))| DecodedParam {
                 ty: t.clone(),
-                name: if n.is_empty() { format!("arg{i}") } else { n.clone() },
+                name: if n.is_empty() {
+                    format!("arg{i}")
+                } else {
+                    n.clone()
+                },
                 value: values.get(i).cloned().unwrap_or_default(),
                 indexed: false,
             })
