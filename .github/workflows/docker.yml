@@ -44,7 +44,7 @@ jobs:
         id: meta
         shell: bash
         run: |
-          IMAGE="ghcr.io/${{ github.repository }}"
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           SHORT_SHA="${GITHUB_SHA::7}"
           TAGS="${IMAGE}:latest,${IMAGE}:sha-${SHORT_SHA}"
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
@@ -73,6 +73,7 @@ jobs:
   deploy-to-fly:
     name: Deploy to Fly.io
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'yihuang'
     steps:
       - uses: actions/checkout@v5
 
