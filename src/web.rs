@@ -18,6 +18,7 @@ use num_bigint::BigInt;
 use serde_json::{json, Value};
 use tera::Tera;
 use tokio::sync::{broadcast, watch};
+use tower_http::cors::CorsLayer;
 
 use crate::config::Settings;
 use crate::contracts::{identify_address, is_contract};
@@ -26,7 +27,9 @@ use crate::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
 };
 use crate::rpc::ChainRpc;
-use crate::tokens::{fetch_token_metadata, format_token_amount, format_token_amount_with_symbol};
+use crate::tokens::{
+    fetch_token_metadata, format_token_amount, format_token_amount_with_symbol, has_control_chars,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -929,9 +932,11 @@ pub async fn token_page(
         };
     }
 
+    // A corrupt row (NUL/control chars from the pre-fix decoder) is treated
+    // as missing so the page re-fetches clean metadata on the spot.
     let meta = match db::get_token_metadata(&state.db, &checksummed) {
-        Some(m) => m,
-        None => {
+        Some(m) if !has_control_chars(&m.name) && !has_control_chars(&m.symbol) => m,
+        _ => {
             let fetched = fetch_token_metadata(&state.rpc, &checksummed).await;
             let _ = db::save_token_metadata(&state.db, &fetched);
             db::get_token_metadata(&state.db, &checksummed).unwrap_or_else(|| {
@@ -952,10 +957,12 @@ pub async fn token_page(
         }
     };
 
+    // The token page only has a Transfers tab (token.html), so default to it
+    // instead of "transactions" — otherwise the home page renders an empty list.
     let tab = query
         .get("tab")
         .cloned()
-        .unwrap_or_else(|| "transactions".into());
+        .unwrap_or_else(|| "transfers".into());
     let page: u32 = query
         .get("page")
         .and_then(|p| p.parse().ok())
@@ -1359,5 +1366,8 @@ pub fn app(state: AppState) -> Router {
         .route("/token/{address}", get(token_page))
         .route("/tokens", get(tokens_page))
         .route("/search", get(search_page))
+        // Public explorer: allow cross-origin reads from any site (the wallet
+        // is hosted on a different origin and needs `?format=json`).
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }

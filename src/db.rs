@@ -588,6 +588,21 @@ pub fn get_all_tokens(db: &Db, page: u32, per_page: u32) -> Vec<TokenMetadata> {
     rows.filter_map(|r| r.ok()).collect()
 }
 
+/// Every stored token-metadata row (unpaginated), used by the startup repair
+/// that re-fetches values written before the ABI string-decoder fix.
+pub fn get_all_token_metas(db: &Db) -> Vec<TokenMetadata> {
+    let conn = lock(db);
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at FROM token_metadata",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], row_to_token) else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
 pub fn get_token_count(db: &Db) -> i64 {
     let conn = lock(db);
     conn.query_row("SELECT COUNT(*) FROM token_metadata", [], |r| {

@@ -58,10 +58,13 @@ fly deploy
 The app listens on port 8080 and is served at `https://nvnmchain-explorer.fly.dev`
 (TLS automatic). Keep the machine always-on — `auto_stop_machines = false` is
 already set in `fly.toml` because the indexer runs inside the web process.
-Upgrades are a `git push` + `fly deploy`; SQLite data lives on the volume and
-survives redeploys.
+Merging to `main` deploys automatically — CI builds the image on Fly's remote
+builder and rolls it out (see `.github/workflows/docker.yml`). For a manual
+redeploy run `fly deploy` (the token for CI lives in the repo secret
+`FLY_API_TOKEN`, created with `fly tokens create deploy -x 2160h`). SQLite
+data lives on the volume and survives redeploys.
 
-CI builds the image on every `main` push and publishes it to
+CI also publishes the image to
 `ghcr.io/yihuang/nvnmchain-explorer` (`latest` + `sha-<commit>` tags, and a
 `<tag>` tag for `v*` releases). Managed platforms can run that image directly
 instead of building from source.

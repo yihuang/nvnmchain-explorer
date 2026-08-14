@@ -361,6 +361,30 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
     Ok(())
 }
 
+/// Re-fetch metadata for tokens whose stored name/symbol carry control
+/// characters — the signature of the pre-fix ABI string decoder. Run once at
+/// startup so the deployed database self-heals without manual intervention.
+async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
+    let corrupt: Vec<String> = db::get_all_token_metas(db)
+        .into_iter()
+        .filter(|m| {
+            crate::tokens::has_control_chars(&m.name) || crate::tokens::has_control_chars(&m.symbol)
+        })
+        .map(|m| m.address)
+        .collect();
+    if corrupt.is_empty() {
+        return Ok(());
+    }
+    info!("repairing {} token metadata row(s)", corrupt.len());
+    for addr in corrupt {
+        let meta = fetch_token_metadata(rpc, &addr).await;
+        if let Err(e) = db::save_token_metadata(db, &meta) {
+            warn!("failed to repair token metadata for {addr}: {e:#}");
+        }
+    }
+    Ok(())
+}
+
 /// Sleep for `dur` unless shutdown was requested, in which case return
 /// immediately with `true`. Lets background loops stop promptly on Ctrl+C.
 async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, dur: Duration) -> bool {
@@ -629,6 +653,16 @@ pub async fn run_forever(
     let known_tokens = Arc::new(Mutex::new(
         db::get_all_token_addresses(&db).into_iter().collect(),
     ));
+    // Re-fetch token metadata that was stored by the pre-fix ABI string
+    // decoder (its name/symbol are NUL-padded control-char garbage). Cheap
+    // and best-effort: only rows with control characters are refetched.
+    let repair_rpc = rpc.clone();
+    let repair_db = db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = repair_token_metadata(&repair_rpc, &repair_db).await {
+            warn!("token metadata repair failed: {e:#}");
+        }
+    });
     let rebuild_db = db.clone();
     tokio::spawn(async move {
         let conn = db::lock(&rebuild_db);
