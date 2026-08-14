@@ -1,6 +1,7 @@
 //! Axum web application: routes, JSON API, and Tera-rendered HTML.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ use crate::contracts::{identify_address, is_contract};
 use crate::db::{self, Db};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
+    flatten_trace,
 };
 use crate::rpc::ChainRpc;
 use crate::tokens::{
@@ -601,6 +603,73 @@ pub async fn blocks_page(
     html_or_json(&state, &headers, &query, "blocks.html", &ctx)
 }
 
+/// Tripped when the node turns out to have no `debug_` namespace. Indexing
+/// stopped tracing to keep up with the chain, so call trees are pulled per view
+/// instead — on a node that cannot trace at all, that would be a doomed round
+/// trip on every transaction page. One probe per process, then; a restart tries
+/// again, so enabling tracing on the node needs no redeploy here.
+static TRACING_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// A page view must not wait on the RPC's full 30s budget for a call tree
+/// nothing else on the page needs.
+const TRACE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether an RPC error means the node cannot trace *anything*, as opposed to
+/// having nothing to say about one transaction. Only the former is worth
+/// remembering: one pruned or unknown transaction must not disable call trees
+/// for every other transaction the explorer serves.
+fn is_method_unsupported(err: &anyhow::Error) -> bool {
+    let Some(rpc) = err.downcast_ref::<crate::rpc::RpcError>() else {
+        return false;
+    };
+    let message = rpc.message.to_lowercase();
+    rpc.code == -32601
+        || message.contains("method not found")
+        || message.contains("does not exist")
+        || message.contains("not available")
+}
+
+/// The call trace for a transaction indexed without one. Cached back onto the
+/// row, so only the first view of a transaction pays for it.
+async fn fetch_missing_trace(
+    state: &AppState,
+    tx: &crate::models::Transaction,
+) -> Option<Vec<Value>> {
+    if TRACING_UNAVAILABLE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let fetched = tokio::time::timeout(
+        TRACE_FETCH_TIMEOUT,
+        state.rpc.try_debug_trace_transaction(&tx.hash),
+    )
+    .await;
+    let raw = match fetched {
+        Ok(Ok(raw)) => raw,
+        Ok(Err(e)) => {
+            if is_method_unsupported(&e) {
+                tracing::warn!("node cannot trace ({e}); call trees stay top-level");
+                TRACING_UNAVAILABLE.store(true, Ordering::Relaxed);
+            }
+            return None;
+        }
+        // A slow node is not an untraceable one — keep trying on later views.
+        Err(_) => {
+            tracing::warn!("trace fetch for {} timed out", tx.hash);
+            return None;
+        }
+    };
+    let flat = flatten_trace(&raw);
+    if flat.is_empty() {
+        return None;
+    }
+    let mut cached = tx.clone();
+    cached.trace_data = serde_json::to_string(&flat).ok();
+    if let Err(e) = db::save_transaction(&state.db, &cached) {
+        tracing::warn!("caching trace for {} failed: {e:#}", tx.hash);
+    }
+    Some(flat)
+}
+
 pub async fn tx_page(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
@@ -614,10 +683,16 @@ pub async fn tx_page(
         .receipt_data
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok());
-    let trace: Option<Vec<Value>> = tx
+    // Fetched before `to_addr` is derived below: the cache write stores the row
+    // as indexed, not as rendered.
+    let trace: Option<Vec<Value>> = match tx
         .trace_data
         .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok());
+        .and_then(|s| serde_json::from_str(s).ok())
+    {
+        Some(trace) => Some(trace),
+        None => fetch_missing_trace(&state, &tx).await,
+    };
     let block = db::get_block_by_number(&state.db, tx.block_number);
 
     // Tempo-style txs carry their destination in `calls[0].to`; fall back to
