@@ -15,7 +15,6 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 
-use crate::anchoring::{normalize_hex, ANCHORED_SIGNATURE, ANCHORED_TOPIC};
 use crate::models::Transaction;
 
 // ---------------------------------------------------------------------------
@@ -127,7 +126,7 @@ pub fn keccak_hex(input: &[u8]) -> String {
 pub fn checksum_address(addr: &str) -> String {
     let lower = addr.trim().to_lowercase();
     let lower = lower.strip_prefix("0x").unwrap_or(&lower);
-    if lower.len() != 40 || !lower.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_address(lower) {
         return addr.trim().to_string();
     }
     let hash = keccak256(lower.as_bytes());
@@ -540,10 +539,23 @@ pub const TRANSFER_WITH_MEMO_TOPIC: &str =
     "0xab2461e5dc8495f413774182e5eb0e9f0f30a81bf32c4b7a4a1d70c3c4e2f0a";
 pub const APPROVAL_TOPIC: &str =
     "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+pub const ANCHORED_SIGNATURE: &str = "Anchored(address,bytes32,bytes32,bytes)";
+/// `keccak256(ANCHORED_SIGNATURE)` — asserted in the tests so it cannot drift.
+pub const ANCHORED_TOPIC: &str =
+    "0x778db4d46fc7a84c4e5105dcb250cb47092b78648868d3efaf18e1205b25801d";
 /// `RegistryDeployed(address,address,string,string,string)` — the factory
 /// announcing a registry. Asserted against its signature in the tests.
 pub const REGISTRY_DEPLOYED_TOPIC: &str =
     "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576";
+
+/// Lowercase `0x…` form, so hex from the chain and hex we derive compare equal.
+pub fn normalize_hex(value: &str) -> String {
+    let value = value.trim();
+    format!(
+        "0x{}",
+        value.strip_prefix("0x").unwrap_or(value).to_lowercase()
+    )
+}
 
 /// Whether `addr` is 20 hex-encoded bytes — the shape, not the checksum.
 pub fn is_valid_address(addr: &str) -> bool {
@@ -608,15 +620,11 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
     match topic0.as_str() {
         TRANSFER_TOPIC => {
             if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("Transfer".into()),
-                    signature: Some("Transfer(address,address,uint256)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
+                return Some(make(
+                    "Transfer",
+                    "Transfer(address,address,uint256)",
+                    Vec::new(),
+                ));
             }
             let from = topics[1].as_str().unwrap_or("");
             let to = topics[2].as_str().unwrap_or("");
@@ -647,15 +655,11 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
         }
         TRANSFER_WITH_MEMO_TOPIC => {
             if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("TransferWithMemo".into()),
-                    signature: Some("TransferWithMemo(address,address,uint256,bytes32)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
+                return Some(make(
+                    "TransferWithMemo",
+                    "TransferWithMemo(address,address,uint256,bytes32)",
+                    Vec::new(),
+                ));
             }
             let from = topics[1].as_str().unwrap_or("");
             let to = topics[2].as_str().unwrap_or("");
@@ -692,15 +696,11 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
         }
         APPROVAL_TOPIC => {
             if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("Approval".into()),
-                    signature: Some("Approval(address,address,uint256)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
+                return Some(make(
+                    "Approval",
+                    "Approval(address,address,uint256)",
+                    Vec::new(),
+                ));
             }
             let owner = topics[1].as_str().unwrap_or("");
             let spender = topics[2].as_str().unwrap_or("");
@@ -733,15 +733,11 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
             const REGISTRY_DEPLOYED_SIGNATURE: &str =
                 "RegistryDeployed(address,address,string,string,string)";
             if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("RegistryDeployed".into()),
-                    signature: Some(REGISTRY_DEPLOYED_SIGNATURE.into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
+                return Some(make(
+                    "RegistryDeployed",
+                    REGISTRY_DEPLOYED_SIGNATURE,
+                    Vec::new(),
+                ));
             }
             // The two addresses are indexed; `data` is the three strings.
             let raw = hex::decode(data.strip_prefix("0x").unwrap_or(&data)).unwrap_or_default();
@@ -786,15 +782,7 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
         }
         ANCHORED_TOPIC => {
             if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("Anchored".into()),
-                    signature: Some(ANCHORED_SIGNATURE.into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
+                return Some(make("Anchored", ANCHORED_SIGNATURE, Vec::new()));
             }
             // data is `abi.encode(bytes32 commitment, bytes metadata)`; the
             // caller and key are indexed, so they arrive as topics.

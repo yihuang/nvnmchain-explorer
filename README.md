@@ -139,6 +139,8 @@ The indexer is built for a sub-second chain:
 | `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
 | `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
+| `ANCHORING_URL` | unset | Base URL of the app that decodes anchored payloads ([Anchoring](#anchoring)) |
+| `REGISTRY_FACTORY` | unset | `RegistryFactory` whose deployments label namespaces ([Anchoring](#anchoring)) |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -155,24 +157,8 @@ The indexer is built for a sub-second chain:
 | `/anchoring` | Namespaces that have anchored, plus the latest commitments |
 | `/anchoring/{namespace}` | A namespace's keys, each at its head commitment |
 | `/anchoring/{namespace}/{key}` | Every revision of one key, newest first |
-
-These show the commitment log itself: what was anchored, by whom, in what
-order. The nav entry appears once the chain has anchored something, though the
-routes answer either way.
-
-What a payload *means* belongs to the application that wrote it — set
-`ANCHORING_URL` to the base URL of whatever reads those envelopes
-([nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) `serve`
-decodes the registry ones) and each key page links to
-`{ANCHORING_URL}/registries/{namespace}/records` — that namespace's records,
-decoded.
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
-
-Set `REGISTRY_FACTORY` to the deployed `RegistryFactory` and namespaces it
-deployed are labelled with their registry's name — deployments are indexed
-regardless, so setting it later needs no re-sync; unset, nothing is trusted as
-a registry.
 
 All data endpoints accept `?format=json` or `Accept: application/json`.
 
@@ -181,6 +167,21 @@ latest-blocks panel, the latest-block stat, and the block-time stat in real
 time as blocks land — no client polling. The feed is in-process: run a single
 instance (as the deploy configs do) so the indexer and the web server share
 the same broadcast channel.
+
+### Anchoring
+
+The anchoring pages show the commitment log itself: what was anchored, by whom,
+in what order. The nav entry appears once the chain has anchored something; the
+routes answer either way.
+
+What a payload *means* belongs to the application that wrote it. Set
+`ANCHORING_URL` to whatever reads those envelopes — for the registry ones,
+[nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) `serve` —
+and each key page links out to `{ANCHORING_URL}/registries/{namespace}/records`.
+
+Set `REGISTRY_FACTORY` to the deployed `RegistryFactory` to label the namespaces
+it deployed with their registry name. Deployments are indexed either way, so
+setting it later needs no re-sync; unset, nothing is trusted as a registry.
 
 ## Indexer
 

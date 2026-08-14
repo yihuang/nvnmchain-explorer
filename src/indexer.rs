@@ -289,6 +289,18 @@ fn apply_receipt(
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
 
+        // Only the precompile's own log carries a trustworthy namespace: the
+        // caller it records is the sender it saw, which a contract emitting the
+        // same signature could claim to be anyone. Rejected before decoding, so
+        // an impostor's payload is never worth decoding.
+        let topic0 = log.pointer("/topics/0").and_then(Value::as_str);
+        let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
+        if topic0 == Some(crate::decoder::ANCHORED_TOPIC)
+            && !emitter.eq_ignore_ascii_case(ANCHORING_ADDRESS)
+        {
+            continue;
+        }
+
         let Some(decoded) = decode_event(log) else {
             continue;
         };
@@ -298,22 +310,15 @@ fn apply_receipt(
         if decoded.topic0 == crate::decoder::REGISTRY_DEPLOYED_TOPIC {
             // The emitting factory rides in the row — reads decide which
             // factory to trust, the way transfer rows record their token.
-            if let Some(event) = registry_deployed(&decoded, tx, log_index) {
+            if let Some(event) = registry_deployed(&decoded, tx) {
                 registries.push(event);
             }
             continue;
         }
-        if decoded.topic0 == crate::anchoring::ANCHORED_TOPIC {
-            // Only the precompile's own log carries a trustworthy namespace:
-            // the caller it records is the sender it saw, which a contract
-            // emitting the same signature could claim to be anyone. Compared
-            // case-insensitively: the gate must not turn on how either address
-            // happens to be spelled.
-            if decoded.contract.eq_ignore_ascii_case(ANCHORING_ADDRESS) {
-                match anchored_event(&decoded, tx, log_index) {
-                    Some(event) => anchored.push(event),
-                    None => warn!("undecodable Anchored log {log_index} in {}", tx.hash),
-                }
+        if decoded.topic0 == crate::decoder::ANCHORED_TOPIC {
+            match anchored_event(&decoded, tx, log_index) {
+                Some(event) => anchored.push(event),
+                None => warn!("undecodable Anchored log {log_index} in {}", tx.hash),
             }
             continue;
         }
@@ -372,6 +377,15 @@ fn apply_receipt(
     }
 }
 
+/// One decoded argument of a log, by the name `decode_event` gave it.
+fn param<'a>(decoded: &'a crate::decoder::DecodedEvent, name: &str) -> Option<&'a str> {
+    decoded
+        .params
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.value.as_str())
+}
+
 /// One decoded `Anchored` log as a storable row, or `None` when the log does
 /// not carry a whole commitment — the precompile keeps only the head, so a row
 /// here is the only record that this revision ever existed.
@@ -380,13 +394,7 @@ pub fn anchored_event(
     tx: &Transaction,
     log_index: i64,
 ) -> Option<AnchoredEvent> {
-    let arg = |name: &str| {
-        decoded
-            .params
-            .iter()
-            .find(|p| p.name == name)
-            .map(|p| p.value.as_str())
-    };
+    let arg = |name: &str| param(decoded, name);
     let (key, commitment) = (arg("key")?, arg("commitment")?);
     // `0x` + 64 hex digits. A truncated log decodes to a short or empty value,
     // which would store a head the chain never wrote.
@@ -414,15 +422,8 @@ pub fn anchored_event(
 pub fn registry_deployed(
     decoded: &crate::decoder::DecodedEvent,
     tx: &Transaction,
-    log_index: i64,
 ) -> Option<RegistryDeployed> {
-    let arg = |name: &str| {
-        decoded
-            .params
-            .iter()
-            .find(|p| p.name == name)
-            .map(|p| p.value.clone())
-    };
+    let arg = |name: &str| param(decoded, name).map(str::to_string);
     let address = |name: &str| arg(name).filter(|a| crate::decoder::is_valid_address(a));
     let factory = checksum_address(&decoded.contract);
     if !crate::decoder::is_valid_address(&factory) {
@@ -435,8 +436,6 @@ pub fn registry_deployed(
         name: arg("name").unwrap_or_default(),
         description: arg("description").unwrap_or_default(),
         block_number: tx.block_number,
-        log_index,
-        timestamp: tx.timestamp,
         created_at: db::now_ts(),
     })
 }
@@ -966,8 +965,8 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
     })?;
 
     // Index progress, so the home page and the stream never recount blocks.
-    // kv is read through `conn` -- a db::get_chain_head(&db) here would
-    // deadlock on the connection lock this function already holds.
+    // Read through `conn`: a helper taking `&Db` would deadlock on the
+    // connection lock this function already holds.
     let chain_head: i64 = conn
         .query_row("SELECT value FROM kv WHERE key='chain_head'", [], |r| {
             r.get::<_, String>(0)
@@ -982,13 +981,14 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
     };
     // Rides along so the nav's anchoring gate is a memory read on every page
     // view rather than a query. One tick of lag on the tab appearing.
-    let anchored_total: i64 = conn
+    let has_anchors: bool = conn
         .query_row(
-            "SELECT COALESCE(SUM(anchor_count), 0) FROM anchored_namespaces",
+            "SELECT EXISTS(SELECT 1 FROM anchored_namespaces LIMIT 1)",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0),
         )
-        .unwrap_or(0);
+        .unwrap_or(0)
+        != 0;
 
     let stats = serde_json::json!({
         "latest_block": latest_block,
@@ -1002,7 +1002,7 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         "gas_util_pct": gas_util_pct,
         "chain_head": chain_head,
         "index_pct": index_pct,
-        "anchored_total": anchored_total,
+        "has_anchors": has_anchors,
         "updated_at": now,
     });
     // Still written to kv: it seeds the in-memory copy across a restart.
@@ -1020,7 +1020,7 @@ mod tests {
         json!({
             "address": emitter,
             "topics": [
-                crate::anchoring::ANCHORED_TOPIC,
+                crate::decoder::ANCHORED_TOPIC,
                 format!("0x{}{}", "00".repeat(12), caller),
                 format!("0x{}", "11".repeat(32)),
             ],
@@ -1076,7 +1076,10 @@ mod tests {
 
         let impostor = format!("0x{}", "cc".repeat(20));
         let (_, anchored) = tx_with_logs(vec![anchored_log(&impostor, &caller)]);
-        assert!(anchored.is_empty(), "a claimed namespace is not a namespace");
+        assert!(
+            anchored.is_empty(),
+            "a claimed namespace is not a namespace"
+        );
     }
 
     #[test]

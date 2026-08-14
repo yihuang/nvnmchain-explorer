@@ -292,8 +292,6 @@ pub fn init_db(path: &str) -> Result<Connection> {
             name TEXT NOT NULL DEFAULT '',
             description TEXT NOT NULL DEFAULT '',
             block_number INTEGER NOT NULL,
-            log_index INTEGER NOT NULL DEFAULT 0,
-            timestamp INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (address, factory)
         );
@@ -457,8 +455,8 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
         exec_cached(
             txn,
             "INSERT OR REPLACE INTO registries (address, factory, creator, name, description,
-                                                block_number, log_index, timestamp, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                                block_number, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 hex_blob(&event.registry),
                 hex_blob(&event.factory),
@@ -466,8 +464,6 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
                 event.name,
                 event.description,
                 event.block_number,
-                event.log_index,
-                event.timestamp,
                 event.created_at,
             ],
         )?;
@@ -1125,8 +1121,7 @@ fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<bool> {
 /// the same transaction as the insert, so the stats never drift from the log.
 fn refresh_anchored_namespace(conn: &Connection, event: &AnchoredEvent) -> Result<()> {
     // The event's own row is already in, so a second row under the pair means
-    // the key existed before this anchor. One probe on idx_anchored_ns_key,
-    // stopping at the second entry.
+    // the key existed before this anchor.
     let key_existed =
         conn.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM anchored_events
@@ -1174,13 +1169,14 @@ pub fn sync_anchored_namespaces(conn: &Connection) -> Result<()> {
 /// Whether the summary table needs the rebuild above: anchors on record but no
 /// summary rows to show for them (a database that predates the table).
 pub fn anchored_summary_is_stale(conn: &Connection) -> bool {
-    let exists = |sql: &str| {
-        conn.query_row(sql, [], |r| r.get::<_, i64>(0))
-            .map(|n| n != 0)
-            .unwrap_or(false)
-    };
-    exists("SELECT EXISTS(SELECT 1 FROM anchored_events LIMIT 1)")
-        && !exists("SELECT EXISTS(SELECT 1 FROM anchored_namespaces LIMIT 1)")
+    let exists = |what, sql| query_count(conn, what, sql, []) != 0;
+    exists(
+        "anchored_summary_is_stale events",
+        "SELECT EXISTS(SELECT 1 FROM anchored_events LIMIT 1)",
+    ) && !exists(
+        "anchored_summary_is_stale namespaces",
+        "SELECT EXISTS(SELECT 1 FROM anchored_namespaces LIMIT 1)",
+    )
 }
 
 fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
@@ -1188,7 +1184,7 @@ fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
         tx_hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),
         block_number: row.get(1)?,
         log_index: row.get(2)?,
-        namespace: crate::decoder::checksum_address(&blob_hex(&row.get::<_, Vec<u8>>(3)?)),
+        namespace: blob_addr(&row.get::<_, Vec<u8>>(3)?),
         key: blob_hex(&row.get::<_, Vec<u8>>(4)?),
         commitment: blob_hex(&row.get::<_, Vec<u8>>(5)?),
         metadata: blob_hex(&row.get::<_, Vec<u8>>(6)?),
@@ -1209,7 +1205,7 @@ pub fn get_registry(db: &Db, factory: &str, namespace: &str) -> Option<Value> {
             Ok(json!({
                 "name": r.get::<_, String>(0)?,
                 "description": r.get::<_, String>(1)?,
-                "creator": crate::decoder::checksum_address(&blob_hex(&r.get::<_, Vec<u8>>(2)?)),
+                "creator": blob_addr(&r.get::<_, Vec<u8>>(2)?),
                 "block_number": r.get::<_, i64>(3)?,
             }))
         },
@@ -1242,7 +1238,7 @@ pub fn get_anchored_namespaces(
         ],
         |r| {
             Ok(json!({
-                "namespace": crate::decoder::checksum_address(&blob_hex(&r.get::<_, Vec<u8>>(0)?)),
+                "namespace": blob_addr(&r.get::<_, Vec<u8>>(0)?),
                 "anchor_count": r.get::<_, i64>(1)?,
                 "key_count": r.get::<_, i64>(2)?,
                 "last_block": r.get::<_, i64>(3)?,
@@ -1253,14 +1249,18 @@ pub fn get_anchored_namespaces(
     )
 }
 
-/// Namespaces on record, for paging the listing above.
-pub fn count_anchored_namespaces(db: &Db) -> i64 {
-    query_count(
+/// What the /anchoring header and its pager each need: `(namespaces, anchors)`.
+/// One statement over the summary table, so the two numbers shown side by side
+/// are read at the same instant.
+pub fn count_anchored_summary(db: &Db) -> (i64, i64) {
+    query_opt(
         &lock(db),
-        "count_anchored_namespaces",
-        "SELECT COUNT(*) FROM anchored_namespaces",
+        "count_anchored_summary",
+        "SELECT COUNT(*), COALESCE(SUM(anchor_count), 0) FROM anchored_namespaces",
         [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )
+    .unwrap_or((0, 0))
 }
 
 /// Keys one namespace has anchored, for paging its listing — the summary row
@@ -1282,42 +1282,41 @@ pub fn count_namespace_keys(db: &Db, namespace: &str) -> i64 {
 /// is answered from `idx_anchored_ns_key` alone, then only the page's heads are
 /// read as rows, so no page view drags every revision's metadata through a sort.
 pub fn get_namespace_keys(db: &Db, namespace: &str, page: u32, per_page: u32) -> Vec<Value> {
-    let conn = lock(db);
-    let ns = hex_blob(namespace);
-    let keys: Vec<(Vec<u8>, i64)> = query_rows(
-        &conn,
+    query_rows(
+        &lock(db),
         "get_namespace_keys",
-        "SELECT key, COUNT(*) AS revisions, MAX(block_number) AS last_block
-         FROM anchored_events WHERE namespace=?1
-         GROUP BY key
-         ORDER BY last_block DESC, key
-         LIMIT ?2 OFFSET ?3",
-        params![ns, i64::from(per_page), page_offset(page, per_page)],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    );
-    keys.into_iter()
-        .filter_map(|(key, revisions)| {
-            query_opt(
-                &conn,
-                "get_namespace_keys head",
-                "SELECT commitment, metadata, block_number, timestamp, tx_hash
-                 FROM anchored_events WHERE namespace=?1 AND key=?2
-                 ORDER BY block_number DESC, log_index DESC LIMIT 1",
-                params![ns, key],
-                |r| {
-                    Ok(json!({
-                        "key": blob_hex(&key),
-                        "commitment": blob_hex(&r.get::<_, Vec<u8>>(0)?),
-                        "metadata": blob_hex(&r.get::<_, Vec<u8>>(1)?),
-                        "block_number": r.get::<_, i64>(2)?,
-                        "timestamp": r.get::<_, i64>(3)?,
-                        "tx_hash": blob_hex(&r.get::<_, Vec<u8>>(4)?),
-                        "revisions": revisions,
-                    }))
-                },
-            )
-        })
-        .collect()
+        // The inner query walks `idx_anchored_ns_key` and never leaves it: the
+        // page's keys and their revision counts come out of the index alone.
+        // Only those rows are then joined to their head, so the payloads of
+        // superseded revisions are never read.
+        "SELECT k.key, k.revisions, h.commitment, h.metadata, h.block_number, h.timestamp, h.tx_hash
+         FROM (SELECT key, COUNT(*) AS revisions, MAX(block_number) AS last_block
+               FROM anchored_events WHERE namespace=?1
+               GROUP BY key
+               ORDER BY last_block DESC, key
+               LIMIT ?2 OFFSET ?3) k
+         JOIN anchored_events h ON h.id = (SELECT id FROM anchored_events
+                                           WHERE namespace=?1 AND key=k.key
+                                           ORDER BY block_number DESC, log_index DESC
+                                           LIMIT 1)
+         ORDER BY k.last_block DESC, k.key",
+        params![
+            hex_blob(namespace),
+            i64::from(per_page),
+            page_offset(page, per_page)
+        ],
+        |r| {
+            Ok(json!({
+                "key": blob_hex(&r.get::<_, Vec<u8>>(0)?),
+                "revisions": r.get::<_, i64>(1)?,
+                "commitment": blob_hex(&r.get::<_, Vec<u8>>(2)?),
+                "metadata": blob_hex(&r.get::<_, Vec<u8>>(3)?),
+                "block_number": r.get::<_, i64>(4)?,
+                "timestamp": r.get::<_, i64>(5)?,
+                "tx_hash": blob_hex(&r.get::<_, Vec<u8>>(6)?),
+            }))
+        },
+    )
 }
 
 /// The head revision of one `(namespace, key)` — what `latest` returns.
@@ -1387,12 +1386,7 @@ pub fn get_recent_anchored(db: &Db, limit: usize) -> Vec<AnchoredEvent> {
 /// Total anchors ever indexed. Summed over the summary table — one row per
 /// namespace, maintained with each insert — rather than counted over the log.
 pub fn count_anchored(db: &Db) -> i64 {
-    query_count(
-        &lock(db),
-        "count_anchored",
-        "SELECT COALESCE(SUM(anchor_count), 0) FROM anchored_namespaces",
-        [],
-    )
+    count_anchored_summary(db).1
 }
 
 // ---------------------------------------------------------------------------

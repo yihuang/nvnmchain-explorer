@@ -1,0 +1,18 @@
+{# Shared markup. Import where used: Tera does not inherit imports from base.html. #}
+
+{# Previous/next links for a listing, hidden when everything fits on one page.
+   Links are relative, so the page keeps whatever path it is on; `query` carries
+   any other parameter the page needs to preserve, e.g. "tab=transfers&". #}
+{% macro pager(page, total_pages, query="") %}
+{% if total_pages > 1 %}
+<div class="flex justify-center gap-3 mt-5 text-xs items-center">
+    {% if page > 1 %}
+    <a href="?{{ query }}page={{ page - 1 }}" class="badge badge-info hover:text-blue-300">← Previous</a>
+    {% endif %}
+    <span class="text-dim">Page {{ page }} of {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <a href="?{{ query }}page={{ page + 1 }}" class="badge badge-info hover:text-blue-300">Next →</a>
+    {% endif %}
+</div>
+{% endif %}
+{% endmacro pager %}

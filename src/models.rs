@@ -109,8 +109,6 @@ pub struct RegistryDeployed {
     pub name: String,
     pub description: String,
     pub block_number: i64,
-    pub log_index: i64,
-    pub timestamp: i64,
     pub created_at: i64,
 }
 

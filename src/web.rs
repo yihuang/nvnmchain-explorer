@@ -102,17 +102,27 @@ fn html_or_json(
 /// `base.html`, so every one of these must be present or the render fails —
 /// build page contexts through here rather than by hand.
 fn page_ctx(state: &AppState, extra: Value) -> Value {
+    page_ctx_for(state, db::get_latest_block(&state.db), extra)
+}
+
+/// [`page_ctx`] for handlers that have already read the tip, so the page does
+/// not query for it twice.
+fn page_ctx_for(
+    state: &AppState,
+    latest_block: Option<crate::models::Block>,
+    extra: Value,
+) -> Value {
     let mut map = serde_json::Map::new();
     map.insert(
         "latest_block".into(),
-        serde_json::to_value(db::get_latest_block(&state.db)).unwrap_or(Value::Null),
+        serde_json::to_value(latest_block).unwrap_or(Value::Null),
     );
     map.insert("native_symbol".into(), json!(state.cfg.native_symbol));
     map.insert("anchoring_url".into(), json!(state.cfg.anchoring_url));
     // The search box echoes it; only the search page has one to echo.
     map.insert("query".into(), json!(""));
     // From the stats blob, so the nav's anchoring gate costs no query.
-    map.insert("anchored_total".into(), json!(anchored_total(state)));
+    map.insert("has_anchors".into(), json!(has_anchors(state)));
     if let Value::Object(o) = extra {
         for (k, v) in o {
             map.insert(k, v);
@@ -121,17 +131,21 @@ fn page_ctx(state: &AppState, extra: Value) -> Value {
     Value::Object(map)
 }
 
-/// Anchors on record, read out of the stats blob without copying it — this
-/// runs on every page render.
-fn anchored_total(state: &AppState) -> i64 {
+/// Whether the chain has ever anchored, which is all the nav needs to know.
+/// Read from the stats blob rather than the database — this runs on every
+/// render — so the tab can lag the first anchor by one stats tick.
+fn has_anchors(state: &AppState) -> bool {
     state
         .stats
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .get("anchored_total")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
+        .get("has_anchors")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
+
+/// Rows per page, for every listing the explorer serves.
+const PER_PAGE: u32 = 25;
 
 /// The 1-based page a listing was asked for.
 fn page_param(query: &HashMap<String, String>) -> u32 {
@@ -144,7 +158,7 @@ fn page_param(query: &HashMap<String, String>) -> u32 {
 
 /// Pages needed to show `total` rows, never fewer than one.
 fn total_pages(total: i64, per_page: u32) -> u32 {
-    ((total as f64) / (per_page as f64)).ceil().max(1.0) as u32
+    (total.max(0) as u64).div_ceil(u64::from(per_page)).max(1) as u32
 }
 
 /// Compact method badge for a transaction: decoded name > signature > selector.
@@ -339,8 +353,9 @@ pub async fn home(
     } else {
         0.0
     };
-    let ctx = page_ctx(
+    let ctx = page_ctx_for(
         &state,
+        latest_block,
         json!({
             "stats": stats,
             "recent_blocks": recent_blocks,
@@ -550,7 +565,7 @@ pub async fn blocks_page(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let per_page: i64 = 25;
+    let per_page = i64::from(PER_PAGE);
     // Bounded before the arithmetic below multiplies it.
     let page = i64::from(page_param(&query));
     let from: Option<i64> = query.get("from").and_then(|f| f.parse().ok());
@@ -570,8 +585,9 @@ pub async fn blocks_page(
         i -= 1;
     }
 
-    let ctx = page_ctx(
+    let ctx = page_ctx_for(
         &state,
+        latest,
         json!({
             "blocks": blocks,
             "latest_num": latest_num,
@@ -580,7 +596,6 @@ pub async fn blocks_page(
             "page": page,
             "first_num": blocks.first().and_then(|b| b.get("number")).and_then(Value::as_i64),
             "last_num": blocks.last().and_then(|b| b.get("number")).and_then(Value::as_i64),
-            "latest_block": latest,
         }),
     );
     html_or_json(&state, &headers, &query, "blocks.html", &ctx)
@@ -879,15 +894,7 @@ pub async fn address_page(
 ) -> Response {
     let checksummed = checksum_address(&address);
     if !is_valid_address(&checksummed) {
-        return if wants_json(&headers, &query) {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Invalid address: {address}")})),
-            )
-                .into_response()
-        } else {
-            not_found_html(&state, "Address", &address, "Invalid address")
-        };
+        return invalid_address(&state, &headers, &query, "Address", &address);
     }
 
     let tab = query
@@ -895,7 +902,7 @@ pub async fn address_page(
         .cloned()
         .unwrap_or_else(|| "transactions".into());
     let page = page_param(&query);
-    let per_page: u32 = 25;
+    let per_page = PER_PAGE;
 
     let (transactions, html_transactions, tx_count, total_pages, transfer_count) =
         if tab == "transfers" {
@@ -906,7 +913,7 @@ pub async fn address_page(
         } else {
             let txs = db::get_address_transactions(&state.db, &checksummed, page, per_page);
             let count = db::get_address_transaction_count(&state.db, &checksummed);
-            let total_pages = ((count as f64) / (per_page as f64)).ceil().max(1.0) as u32;
+            let total_pages = total_pages(count, per_page);
             let html_txs: Vec<Value> = txs
                 .iter()
                 .map(|t| {
@@ -976,15 +983,7 @@ pub async fn token_page(
 ) -> Response {
     let checksummed = checksum_address(&address);
     if !is_valid_address(&checksummed) {
-        return if wants_json(&headers, &query) {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Invalid address: {address}")})),
-            )
-                .into_response()
-        } else {
-            not_found_html(&state, "Token", &address, "Invalid address")
-        };
+        return invalid_address(&state, &headers, &query, "Token", &address);
     }
 
     // A corrupt row (NUL/control chars from the pre-fix decoder) is treated
@@ -1019,7 +1018,7 @@ pub async fn token_page(
         .cloned()
         .unwrap_or_else(|| "transfers".into());
     let page = page_param(&query);
-    let per_page: u32 = 25;
+    let per_page = PER_PAGE;
     let transfers = if tab == "transfers" {
         db::get_token_transfers(&state.db, &checksummed, page, per_page)
     } else {
@@ -1049,10 +1048,10 @@ pub async fn tokens_page(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let page = page_param(&query);
-    let per_page: u32 = 25;
+    let per_page = PER_PAGE;
     let tokens = db::get_all_tokens(&state.db, page, per_page);
     let total = db::get_token_count(&state.db);
-    let total_pages = ((total as f64) / (per_page as f64)).ceil().max(1.0) as u32;
+    let total_pages = total_pages(total, per_page);
     let ctx = page_ctx(
         &state,
         json!({
@@ -1070,28 +1069,23 @@ pub async fn tokens_page(
 // Anchoring
 // ---------------------------------------------------------------------------
 
-fn anchored_rows(events: &[crate::models::AnchoredEvent]) -> Vec<Value> {
-    events
-        .iter()
-        .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
-        .collect()
-}
-
-/// A namespace is an address; say so the way the client asked to hear it.
-fn invalid_namespace(
+/// An address-shaped path segment that is not an address — a namespace, a
+/// token, an account — said the way the client asked to hear it.
+fn invalid_address(
     state: &AppState,
     headers: &HeaderMap,
     query: &HashMap<String, String>,
-    namespace: &str,
+    kind: &str,
+    address: &str,
 ) -> Response {
     if wants_json(headers, query) {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid address: {namespace}")})),
+            Json(json!({"error": format!("Invalid address: {address}")})),
         )
             .into_response()
     } else {
-        not_found_html(state, "Namespace", namespace, "Invalid address")
+        not_found_html(state, kind, address, "Invalid address")
     }
 }
 
@@ -1103,24 +1097,22 @@ pub async fn anchoring_page(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let page = page_param(&query);
-    let per_page: u32 = 25;
+    // Commitments head the page, namespaces fill the table — one row each.
+    let (namespace_count, total) = db::count_anchored_summary(&state.db);
     // The panel is the same on every page; only the first one shows it.
     let recent = if page == 1 {
-        anchored_rows(&db::get_recent_anchored(&state.db, 10))
+        db::get_recent_anchored(&state.db, 10)
     } else {
         Vec::new()
     };
     let ctx = page_ctx(
         &state,
         json!({
-            "namespaces": db::get_anchored_namespaces(&state.db, state.cfg.registry_factory.as_deref(), page, per_page),
+            "namespaces": db::get_anchored_namespaces(&state.db, state.cfg.registry_factory.as_deref(), page, PER_PAGE),
             "recent": recent,
-            // Commitments for the header line, namespaces for the pager: the
-            // table lists one row per namespace.
-            "total": db::count_anchored(&state.db),
+            "total": total,
             "page": page,
-            "per_page": per_page,
-            "total_pages": total_pages(db::count_anchored_namespaces(&state.db), per_page),
+            "total_pages": total_pages(namespace_count, PER_PAGE),
         }),
     );
     html_or_json(&state, &headers, &query, "anchoring.html", &ctx)
@@ -1135,12 +1127,11 @@ pub async fn anchoring_namespace_page(
 ) -> Response {
     let checksummed = checksum_address(&namespace);
     if !is_valid_address(&checksummed) {
-        return invalid_namespace(&state, &headers, &query, &namespace);
+        return invalid_address(&state, &headers, &query, "Namespace", &namespace);
     }
     let namespace = checksummed;
     let page = page_param(&query);
-    let per_page: u32 = 25;
-    let keys = db::get_namespace_keys(&state.db, &namespace, page, per_page);
+    let keys = db::get_namespace_keys(&state.db, &namespace, page, PER_PAGE);
     // Labelled when the configured factory deployed this namespace.
     let registry = state
         .cfg
@@ -1154,8 +1145,7 @@ pub async fn anchoring_namespace_page(
             "registry": registry,
             "keys": keys,
             "page": page,
-            "per_page": per_page,
-            "total_pages": total_pages(db::count_namespace_keys(&state.db, &namespace), per_page),
+            "total_pages": total_pages(db::count_namespace_keys(&state.db, &namespace), PER_PAGE),
         }),
     );
     html_or_json(&state, &headers, &query, "anchoring_namespace.html", &ctx)
@@ -1171,30 +1161,33 @@ pub async fn anchoring_key_page(
 ) -> Response {
     let checksummed = checksum_address(&namespace);
     if !is_valid_address(&checksummed) {
-        return invalid_namespace(&state, &headers, &query, &namespace);
+        return invalid_address(&state, &headers, &query, "Namespace", &namespace);
     }
     let namespace = checksummed;
-    // The head is its own read: it belongs on every page of the history, and
-    // nothing bounds how long that history gets.
-    let Some(head) = db::get_key_head(&state.db, &namespace, &key) else {
+    let page = page_param(&query);
+    let revisions = db::count_key_revisions(&state.db, &namespace, &key);
+    let history = db::get_key_history(&state.db, &namespace, &key, page, PER_PAGE);
+    // The head belongs on every page of a history nothing bounds the length of,
+    // but page one already opens on it.
+    let head = if page == 1 {
+        history.first().cloned()
+    } else {
+        db::get_key_head(&state.db, &namespace, &key)
+    };
+    let Some(head) = head else {
         return not_found(&state, &headers, &query, "Anchored key", &key);
     };
-    let page = page_param(&query);
-    let per_page: u32 = 25;
-    let revisions = db::count_key_revisions(&state.db, &namespace, &key);
-    let history = db::get_key_history(&state.db, &namespace, &key, page, per_page);
     let ctx = page_ctx(
         &state,
         json!({
             "namespace": namespace,
             "key": head.key,
             "self_verifying": is_self_verifying(&head.commitment, &head.metadata),
-            "head": serde_json::to_value(&head).unwrap_or(Value::Null),
-            "history": anchored_rows(&history),
+            "head": head,
+            "history": history,
             "revisions": revisions,
             "page": page,
-            "per_page": per_page,
-            "total_pages": total_pages(revisions, per_page),
+            "total_pages": total_pages(revisions, PER_PAGE),
         }),
     );
     html_or_json(&state, &headers, &query, "anchoring_key.html", &ctx)
@@ -1432,6 +1425,15 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
             }
         },
     );
+
+    // Thousands separators, matching what the live stats stream renders in the
+    // browser: a tile must not change shape the first time a tick lands.
+    tera.register_filter("comma", |value: &Value, _: &HashMap<String, Value>| {
+        Ok(match value.as_i64() {
+            Some(n) => Value::String(comma_num(n)),
+            None => value.clone(),
+        })
+    });
 
     tera.register_function("truncate_hash", |args: &HashMap<String, Value>| {
         let h = args.get("h").and_then(Value::as_str).unwrap_or("");

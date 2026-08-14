@@ -6,11 +6,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use nvnmchain_explorer::anchoring::{
-    is_self_verifying, ANCHORED_SIGNATURE, ANCHORED_TOPIC, ANCHORING_ADDRESS,
-};
+use nvnmchain_explorer::anchoring::{is_self_verifying, ANCHORING_ADDRESS};
 use nvnmchain_explorer::db::{self, Db};
-use nvnmchain_explorer::decoder::{decode_event, decode_function_call, keccak_hex};
+use nvnmchain_explorer::decoder::{
+    decode_event, decode_function_call, keccak_hex, ANCHORED_SIGNATURE, ANCHORED_TOPIC,
+};
 use nvnmchain_explorer::indexer::anchored_event;
 use nvnmchain_explorer::models::{AnchoredEvent, Block, BlockBundle, Transaction};
 use serde_json::{json, Value};
@@ -233,7 +233,10 @@ fn reindexing_a_block_does_not_duplicate() {
         REGISTRY_METADATA,
     );
     assert_eq!(db::count_anchored(&db), 1);
-    assert_eq!(db::get_key_history(&db, REGISTRY, REGISTRY_KEY, 1, 25).len(), 1);
+    assert_eq!(
+        db::get_key_history(&db, REGISTRY, REGISTRY_KEY, 1, 25).len(),
+        1
+    );
 }
 
 #[test]
@@ -385,7 +388,7 @@ fn a_deployment_labels_its_namespace_for_the_configured_factory_only() {
     let decoded = decode_event(&log).expect("decoded log");
     assert_eq!(decoded.name.as_deref(), Some("RegistryDeployed"));
     let deployed =
-        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx, 1).expect("deployment parses");
+        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx).expect("deployment parses");
     assert_eq!(deployed.registry, REGISTRY);
     assert_eq!(deployed.name, "docs");
     assert_eq!(deployed.description, "docs about docs");
@@ -434,7 +437,7 @@ fn an_impostors_deployment_cannot_unlabel_a_registry() {
     let deployed = |factory: &str, name: &str| {
         let log = registry_deployed_log(factory, REGISTRY, name);
         let decoded = decode_event(&log).expect("decoded log");
-        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx, 0).expect("parses")
+        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx).expect("parses")
     };
     let impostor = format!("0x{}", "ee".repeat(20));
     let bundle = BlockBundle {
@@ -462,8 +465,6 @@ fn an_impostors_deployment_cannot_unlabel_a_registry() {
 
 /// A server over a DB holding one registry anchor, plus its base URL.
 async fn serve() -> (tempfile::TempDir, String) {
-    use nvnmchain_explorer::web::{self, AppState};
-
     let (dir, db) = temp_db();
     index_anchor(
         &db,
@@ -472,6 +473,13 @@ async fn serve() -> (tempfile::TempDir, String) {
         REGISTRY_COMMITMENT,
         REGISTRY_METADATA,
     );
+    let base = serve_db(db).await;
+    (dir, base)
+}
+
+/// A server over `db`, and its base URL. The caller keeps the TempDir alive.
+async fn serve_db(db: Db) -> String {
+    use nvnmchain_explorer::web::{self, AppState};
 
     let cfg = nvnmchain_explorer::config::Settings::from_env();
     let tera = web::build_tera(db.clone()).expect("templates");
@@ -491,7 +499,7 @@ async fn serve() -> (tempfile::TempDir, String) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, web::app(state)).await;
     });
-    (dir, format!("http://{addr}"))
+    format!("http://{addr}")
 }
 
 #[tokio::test]
@@ -624,14 +632,55 @@ async fn pages_without_rows_still_render_the_layout() {
     }
 }
 
+#[tokio::test]
+async fn a_listing_longer_than_a_page_is_paged() {
+    // Every listing shares one pager macro, so this covers the markup the
+    // token and address pages render too.
+    let (_dir, db) = temp_db();
+    for i in 0..26 {
+        index_anchor(
+            &db,
+            600 + i,
+            &format!("0x{}{:02x}", "aa".repeat(31), i),
+            REGISTRY_COMMITMENT,
+            "0x",
+        );
+    }
+    let base = serve_db(db).await;
+    let client = reqwest::Client::new();
+    let page = |n: u32| {
+        let (client, base) = (client.clone(), base.clone());
+        async move {
+            client
+                .get(format!("{base}/anchoring/{REGISTRY}?page={n}"))
+                .send()
+                .await
+                .expect("page")
+                .text()
+                .await
+                .expect("body")
+        }
+    };
+
+    let first = page(1).await;
+    assert!(first.contains("Page 1 of 2"), "first page is paged");
+    assert!(first.contains("?page=2"), "and offers the next one");
+    assert!(!first.contains("Previous"), "with nowhere back to go");
+
+    let second = page(2).await;
+    assert!(second.contains("Page 2 of 2"));
+    assert!(second.contains("?page=1"), "the way back");
+    assert!(!second.contains("Next"), "and no page three");
+}
+
 /// The layout, rendered with whatever `page_ctx` would have put in it.
-fn nav(anchored_total: i64) -> String {
+fn nav(has_anchors: bool) -> String {
     let (_dir, db) = temp_db();
     let tera = nvnmchain_explorer::web::build_tera(db).expect("templates load");
     let ctx = tera::Context::from_serialize(json!({
         "native_symbol": "PATH",
         "anchoring_url": Value::Null,
-        "anchored_total": anchored_total,
+        "has_anchors": has_anchors,
         "latest_block": Value::Null,
         "query": "",
     }))
@@ -645,11 +694,11 @@ fn the_anchoring_tab_waits_for_the_first_anchor() {
     // reachable either way -- a link from elsewhere still resolves, and would
     // start 404ing the day someone anchored if this hid them instead.
     assert!(
-        !nav(0).contains(r#"href="/anchoring""#),
+        !nav(false).contains(r#"href="/anchoring""#),
         "nav on an unused chain"
     );
     assert!(
-        nav(1).contains(r#"href="/anchoring""#),
+        nav(true).contains(r#"href="/anchoring""#),
         "nav once something is anchored"
     );
 }

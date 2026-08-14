@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}Address {{ truncate_hash(h=address, prefix=8, suffix=4) }} ⋅ nvnmchain Explorer{% endblock %}
 {% block content %}
 
@@ -163,15 +164,5 @@
 </div>
 {% endif %}
 
-{% if total_pages > 1 %}
-<div class="flex justify-center gap-3 mt-5 text-xs items-center">
-    {% if page > 1 %}
-    <a href="?tab={{ active_tab }}&page={{ page - 1 }}" class="badge badge-info hover:text-blue-300">← Previous</a>
-    {% endif %}
-    <span class="text-dim">Page {{ page }} of {{ total_pages }}</span>
-    {% if page < total_pages %}
-    <a href="?tab={{ active_tab }}&page={{ page + 1 }}" class="badge badge-info hover:text-blue-300">Next →</a>
-    {% endif %}
-</div>
-{% endif %}
+{{ ui::pager(page=page, total_pages=total_pages, query="tab=" ~ active_tab ~ "&") }}
 {% endblock %}

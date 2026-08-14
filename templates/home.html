@@ -36,11 +36,11 @@
         <div class="stat-label">Gas Utilization</div>
     </div>
     <div class="card card-body">
-        <div id="stat-total-txns" class="stat-value">{% if stats %}{{ stats.total_txns }}{% else %}—{% endif %}</div>
+        <div id="stat-total-txns" class="stat-value">{% if stats %}{{ stats.total_txns | comma }}{% else %}—{% endif %}</div>
         <div class="stat-label">Total Txns</div>
     </div>
     <div class="card card-body">
-        <div id="stat-tokens" class="stat-value">{% if stats %}{{ stats.token_count }}{% else %}—{% endif %}</div>
+        <div id="stat-tokens" class="stat-value">{% if stats %}{{ stats.token_count | comma }}{% else %}—{% endif %}</div>
         <div class="stat-label">Tokens</div>
     </div>
 </div>
