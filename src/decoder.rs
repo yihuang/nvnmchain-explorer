@@ -208,15 +208,15 @@ fn format_token(ty: &ParamType, token: &Token) -> String {
         (ParamType::Bool, Token::Bool(b)) => b.to_string(),
         (ParamType::Uint(_), Token::Uint(n)) => n.to_string(),
         (ParamType::Int(bits), Token::Int(n)) => {
-            // ethabi hands us the raw two's-complement word; convert it to a
-            // signed decimal using the declared bit width.
+            // Canonical encoding sign-extends narrow ints across the word, so
+            // mask to the declared width before the two's-complement conversion.
             let bits = *bits;
-            let n = *n;
+            let mask = EthersUint::MAX >> (256 - bits);
+            let n = *n & mask;
             let sign_bit = EthersUint::from(1u64) << (bits - 1);
             if n < sign_bit {
                 n.to_string()
             } else {
-                let mask = EthersUint::MAX >> (256 - bits);
                 format!("-{}", (n ^ mask) + EthersUint::from(1u64))
             }
         }
@@ -913,14 +913,17 @@ mod tests {
 
     #[test]
     fn decode_abi_args_signed_int() {
-        // ethabi hands the raw two's-complement word; format_token converts it
-        // to a signed decimal using the declared bit width.
+        // An int8 -1 arrives sign-extended as 32 bytes of 0xff; the formatter
+        // masks to the declared width first.
         let data = abi_encode(&[Token::Int(EthersUint::MAX)]);
         assert_eq!(decode_abi_args(&["int256"], &data), vec!["-1"]);
-        let data = abi_encode(&[Token::Int(0xffu64.into())]);
         assert_eq!(decode_abi_args(&["int8"], &data), vec!["-1"]);
+        // The most negative int8, sign-extended: 0xff…80.
+        let data = abi_encode(&[Token::Int(EthersUint::MAX - EthersUint::from(0x7fu64))]);
+        assert_eq!(decode_abi_args(&["int8"], &data), vec!["-128"]);
         let data = abi_encode(&[Token::Int(42u64.into())]);
         assert_eq!(decode_abi_args(&["int256"], &data), vec!["42"]);
+        assert_eq!(decode_abi_args(&["int8"], &data), vec!["42"]);
     }
 
     #[test]
