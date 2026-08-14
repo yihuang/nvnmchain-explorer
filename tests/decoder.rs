@@ -1,11 +1,85 @@
+use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{
-    checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
-    flatten_trace, TRANSFER_TOPIC,
+    checksum_address, decode_abi_args, decode_event, decode_function_call, extract_balance_changes,
+    extract_calls, flatten_trace, TRANSFER_TOPIC,
 };
-use nvnmchain_explorer::models::{Transaction, TransferEvent};
+use nvnmchain_explorer::models::{BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
-use nvnmchain_explorer::tokens::format_token_amount;
-use serde_json::json;
+use nvnmchain_explorer::tokens::{
+    decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text,
+};
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+
+fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
+    (dir, Arc::new(Mutex::new(conn)))
+}
+
+/// A block carrying one transaction, in the shape the RPC returns it.
+///
+/// Every address here has alphabetic nibbles on purpose: a fixture of digits
+/// alone cannot tell a checksummed address from a lowercase one, and that is
+/// exactly what the storage round-trip has to preserve.
+fn sample_raw_block() -> Value {
+    json!({
+        "number": "0x10",
+        "hash": format!("0x{}", "ab".repeat(32)),
+        "parentHash": format!("0x{}", "cd".repeat(32)),
+        "timestamp": "0x64",
+        "gasUsed": "0x5208",
+        "gasLimit": "0x1c9c380",
+        "miner": format!("0x{}", "2b".repeat(20)),
+        "consensusContext": {"epoch": 1, "view": 2, "proposer": format!("0x{}", "11".repeat(32))},
+        "transactions": [{
+            "hash": format!("0x{}", "ff".repeat(32)),
+            "blockNumber": "0x10",
+            "transactionIndex": "0x0",
+            "from": format!("0x{}", "3c".repeat(20)),
+            "to": format!("0x{}", "4d".repeat(20)),
+            "gas": "0x5208",
+            "gasPrice": "0x4a817c800",
+            "value": "0x1",
+            "nonce": "0x3",
+            "chainId": "0x2b45",
+            "type": "0x76",
+            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
+            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
+        }]
+    })
+}
+
+/// The token and the two parties of the sample transfer.
+fn sample_parties() -> (String, String, String) {
+    (
+        checksum_address(&format!("0x{}", "aa".repeat(20))),
+        checksum_address(&format!("0x{}", "1a".repeat(20))),
+        checksum_address(&format!("0x{}", "2b".repeat(20))),
+    )
+}
+
+fn sample_transfer(block: &nvnmchain_explorer::models::Block, tx: &Transaction) -> TransferEvent {
+    let (token, from, to) = sample_parties();
+    TransferEvent {
+        id: 0,
+        tx_hash: tx.hash.clone(),
+        block_number: block.number,
+        log_index: 0,
+        token_addr: token,
+        from_addr: from,
+        to_addr: to,
+        amount: "100".into(),
+        timestamp: block.timestamp,
+        created_at: 0,
+    }
+}
+
+/// A fixture address from one repeated byte: `addr("22")` is `0x2222…2222`.
+fn addr(byte: &str) -> String {
+    checksum_address(&format!("0x{}", byte.repeat(20)))
+}
 
 fn transfer_calldata(to: &str, amount: u128) -> String {
     format!(
@@ -106,6 +180,66 @@ fn flatten_trace_nested() {
     assert_eq!(flat[0]["children"], json!([1, 2]));
     assert_eq!(flat[1]["gas"], "21000");
     assert_eq!(flat[2]["value"], "1");
+}
+
+/// ABI-encode a `string` return value the standard dynamic way:
+/// word 0 = offset (0x20), word 1 = length, word 2 = UTF-8 payload padded.
+fn abi_string(s: &str) -> String {
+    let payload = s.as_bytes();
+    let mut words: Vec<u8> = Vec::new();
+    let mut offset_word = [0u8; 32];
+    offset_word[24..32].copy_from_slice(&32u64.to_be_bytes()); // offset = 32
+    words.extend_from_slice(&offset_word);
+    let mut len_word = [0u8; 32];
+    len_word[24..32].copy_from_slice(&(payload.len() as u64).to_be_bytes()); // length
+    words.extend_from_slice(&len_word);
+    words.extend_from_slice(payload);
+    let padded = payload.len().div_ceil(32) * 32;
+    words.resize(64 + padded, 0);
+    format!("0x{}", hex::encode(&words))
+}
+
+#[test]
+fn decode_string_result_dynamic_encoding() {
+    // Regression: the real `name()`/`symbol()` responses for a TIP-20 token
+    // (e.g. 0x20C0…e37D → "TestUSD") use the offset-indirection form. The
+    // old decoder read the offset word (32) as the length and returned the
+    // raw length word (31 NULs + 0x07) instead of the payload.
+    assert_eq!(decode_string_result(&abi_string("TestUSD")), "TestUSD");
+    assert_eq!(decode_string_result(&abi_string("TESTUSD")), "TESTUSD");
+    assert_eq!(decode_string_result(&abi_string("")), "");
+    // A string long enough to span multiple words.
+    let long = "pathUSD-pathUSD-pathUSD-pathUSD-pathUSD-pathUSD";
+    assert_eq!(decode_string_result(&abi_string(long)), long);
+
+    // Non-standard in-place short string (length in word 0) still decodes.
+    let mut in_place = vec![0u8; 64];
+    in_place[31] = 7;
+    in_place[32..39].copy_from_slice(b"TestUSD");
+    assert_eq!(
+        decode_string_result(&format!("0x{}", hex::encode(&in_place))),
+        "TestUSD"
+    );
+
+    // Empty / malformed inputs degrade to an empty string.
+    assert_eq!(decode_string_result(""), "");
+    assert_eq!(decode_string_result("0x"), "");
+    assert_eq!(decode_string_result("0x12"), "");
+}
+
+#[test]
+fn sanitize_metadata_text_rejects_control_chars() {
+    // The pre-fix decoder produced this exact garbage for a 7-char name:
+    // 31 NUL bytes followed by the length byte 0x07.
+    let garbage = "\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{7}";
+    assert!(has_control_chars(garbage));
+    assert_eq!(sanitize_metadata_text(garbage), "");
+
+    // Legit metadata passes through (trailing NUL padding trimmed).
+    assert!(!has_control_chars("TestUSD"));
+    assert_eq!(sanitize_metadata_text("TestUSD"), "TestUSD");
+    assert_eq!(sanitize_metadata_text("TestUSD\u{0}\u{0}"), "TestUSD");
+    assert_eq!(sanitize_metadata_text(""), "");
 }
 
 #[test]
@@ -289,52 +423,35 @@ fn fresh_schema_has_all_columns() {
 
 #[test]
 fn blob_hex_round_trip() {
-    use nvnmchain_explorer::db::{self, Db};
-    use std::sync::{Arc, Mutex};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("blob.db");
-    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
-    let db: Db = Arc::new(Mutex::new(conn));
-
     // Block with one transaction (so the tx row is exercised too).
-    let hash = format!("0x{}", "ab".repeat(32));
-    let parent = format!("0x{}", "cd".repeat(32));
-    let proposer = format!("0x{}", "11".repeat(32));
-    let miner = format!("0x{}", "22".repeat(20));
-    let tx_hash = format!("0x{}", "ff".repeat(32));
-    let raw_block = json!({
-        "number": "0x10",
-        "hash": hash,
-        "parentHash": parent,
-        "timestamp": "0x64",
-        "gasUsed": "0x5208",
-        "gasLimit": "0x1c9c380",
-        "miner": miner,
-        "consensusContext": {"epoch": 1, "view": 2, "proposer": proposer},
-        "transactions": [{
-            "hash": tx_hash,
-            "blockNumber": "0x10",
-            "transactionIndex": "0x0",
-            "from": format!("0x{}", "33".repeat(20)),
-            "to": format!("0x{}", "44".repeat(20)),
-            "gas": "0x5208",
-            "gasPrice": "0x4a817c800",
-            "value": "0x1",
-            "nonce": "0x3",
-            "chainId": "0x2b45",
-            "type": "0x76",
-            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
-            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
-        }]
-    });
+    let (_dir, db) = temp_db("blob.db");
+    let raw_block = sample_raw_block();
+    let hash = raw_block["hash"].as_str().unwrap().to_string();
+    let parent = raw_block["parentHash"].as_str().unwrap().to_string();
+    let proposer = raw_block["consensusContext"]["proposer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let miner = raw_block["miner"].as_str().unwrap().to_string();
+    let tx_hash = raw_block["transactions"][0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let block = parse_block(&raw_block);
     // The indexer fills the canonical RLP encoding separately; embed the real
     // bytes of a known tempo 0x76 transaction (block 664125).
     let rlp = include_str!("../fixtures/tx_664125.rlp").trim();
     let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
     tx.raw = Some(rlp.to_string());
-    db::save_block_bundle(&db, &block, &[tx], &[], &[], &[], &[]).expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![],
+        anchored: vec![],
+        tokens: vec![],
+        registries: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     // Block reads back with identical hex, and hash lookup is case-insensitive
     // (binary storage normalizes hex case — a bonus over TEXT comparisons).
@@ -368,79 +485,25 @@ fn blob_hex_round_trip() {
 
 #[test]
 fn duplicate_bundle_is_idempotent() {
-    use nvnmchain_explorer::db::{self, Db};
-    use std::sync::{Arc, Mutex};
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("dedup.db");
-    let conn = db::init_db(path.to_str().unwrap()).expect("init_db");
-    let db: Db = Arc::new(Mutex::new(conn));
-
-    let raw_block = json!({
-        "number": "0x10",
-        "hash": format!("0x{}", "ab".repeat(32)),
-        "parentHash": format!("0x{}", "cd".repeat(32)),
-        "timestamp": "0x64",
-        "gasUsed": "0x5208",
-        "gasLimit": "0x1c9c380",
-        "miner": format!("0x{}", "22".repeat(20)),
-        "consensusContext": {"epoch": 1, "view": 2, "proposer": format!("0x{}", "11".repeat(32))},
-        "transactions": [{
-            "hash": format!("0x{}", "ff".repeat(32)),
-            "blockNumber": "0x10",
-            "transactionIndex": "0x0",
-            "from": format!("0x{}", "33".repeat(20)),
-            "to": format!("0x{}", "44".repeat(20)),
-            "gas": "0x5208",
-            "gasPrice": "0x4a817c800",
-            "value": "0x1",
-            "nonce": "0x3",
-            "chainId": "0x2b45",
-            "type": "0x76",
-            "signature": {"type": "webAuthn", "r": "0x01", "s": "0x02"},
-            "calls": [{"to": format!("0x{}", "55".repeat(20)), "value": "0x0", "input": "0xa9059cbb"}],
-        }]
-    });
+    let (_dir, db) = temp_db("dedup.db");
+    let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let tx = parse_transaction(&raw_block["transactions"][0], &block);
-    let token = checksum_address(&format!("0x{}", "aa".repeat(20)));
-    let from = checksum_address(&format!("0x{}", "11".repeat(20)));
-    let to = checksum_address(&format!("0x{}", "22".repeat(20)));
-    let transfer = TransferEvent {
-        id: 0,
-        tx_hash: tx.hash.clone(),
-        block_number: block.number,
-        log_index: 0,
-        token_addr: token.clone(),
-        from_addr: from.clone(),
-        to_addr: to.clone(),
-        amount: "100".into(),
-        timestamp: block.timestamp,
-        created_at: 0,
-    };
+    let (token, from, to) = sample_parties();
+    let transfer = sample_transfer(&block, &tx);
 
     // The same block written twice (what the indexer's concurrent fetch/retry
     // races can produce). Blocks and txs upsert; transfers must dedupe.
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        &[],
-        &[],
-        &[],
-    )
-    .expect("first save");
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        &[],
-        &[],
-        &[],
-    )
-    .expect("duplicate save");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![transfer],
+        anchored: vec![],
+        tokens: vec![],
+        registries: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("first save");
+    db::save_block_bundle(&db, &bundle).expect("duplicate save");
 
     let conn = db::lock(&db);
     let count: i64 = conn
@@ -480,6 +543,77 @@ fn duplicate_bundle_is_idempotent() {
         )
         .expect("sender balance");
     assert_eq!(sender, "-100", "sender delta applied exactly once");
+}
+
+/// A transfer written by the indexer must read back through every listing that
+/// shows it. The columns are BLOBs; readers that bound TEXT against them
+/// matched nothing, so these tabs were permanently empty while the counters
+/// beside them reported rows.
+#[test]
+fn indexed_transfer_reads_back_through_every_listing() {
+    let (_dir, db) = temp_db("listings.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let tx = parse_transaction(&raw_block["transactions"][0], &block);
+    let (token, from, to) = sample_parties();
+    let transfer = sample_transfer(&block, &tx);
+    let meta = nvnmchain_explorer::tokens::TokenMeta {
+        address: token.clone(),
+        name: "Probe".into(),
+        symbol: "PRB".into(),
+        decimals: 2,
+        currency: "USD".into(),
+        total_supply: "1000".into(),
+    };
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx.clone()],
+        transfers: vec![transfer],
+        anchored: vec![],
+        tokens: vec![meta],
+        registries: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
+
+    let by_token = db::get_token_transfers(&db, &token, 1, 25);
+    assert_eq!(by_token.len(), 1, "token transfers");
+    assert_eq!(by_token[0]["from_addr"], json!(from));
+    assert_eq!(by_token[0]["to_addr"], json!(to));
+    assert_eq!(by_token[0]["amount"], json!("100"));
+    // Joined against the transaction, not just the log — and canonicalized, not
+    // handed back in whatever case the node happened to report.
+    assert_eq!(
+        by_token[0]["tx_from"],
+        json!(checksum_address(&tx.from_addr))
+    );
+    assert_ne!(tx.from_addr, checksum_address(&tx.from_addr));
+
+    assert_eq!(
+        db::get_address_transfers(&db, &to, 1, 25).len(),
+        1,
+        "recipient"
+    );
+    assert_eq!(
+        db::get_address_transfers(&db, &from, 1, 25).len(),
+        1,
+        "sender"
+    );
+    assert_eq!(db::get_token_transfer_count(&db, &token), 1);
+
+    // Holdings need the batch metadata lookup, which bound TEXT as well.
+    assert_eq!(
+        db::get_tokens_metadata(&db, std::slice::from_ref(&token)).len(),
+        1
+    );
+    let holdings = db::get_address_holdings(&db, &to);
+    assert_eq!(holdings.len(), 1, "recipient holdings");
+    assert_eq!(holdings[0]["symbol"], json!("PRB"));
+    assert_eq!(holdings[0]["formatted"], json!("1"));
+
+    // And the tokens list reports the holders the transfer created.
+    assert_eq!(db::get_token_holder_count(&db, &token), 2);
+    let stored = db::get_token_metadata(&db, &token).expect("token metadata");
+    assert_eq!(stored.holder_count, 2, "holder_count on the tokens list");
 }
 
 #[test]
@@ -547,16 +681,15 @@ fn blob_storage_queries_match_text_params() {
         currency: "USD".into(),
         total_supply: "1000000".into(),
     };
-    db::save_block_bundle(
-        &db,
-        &block,
-        std::slice::from_ref(&tx),
-        std::slice::from_ref(&transfer),
-        &[],
-        std::slice::from_ref(&meta),
-        &[],
-    )
-    .expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![transfer],
+        anchored: vec![],
+        tokens: vec![meta],
+        registries: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     // Address transfers tab: query binds the address as raw bytes.
     let addr_transfers = db::get_address_transfers(&db, &to, 1, 25);
@@ -598,5 +731,315 @@ fn blob_storage_queries_match_text_params() {
     assert_eq!(
         meta_back.holder_count, 2,
         "sync_holder_counts must backfill stale counts"
+    );
+}
+
+#[test]
+fn huge_page_numbers_do_not_panic() {
+    use nvnmchain_explorer::db::{self, Db};
+    use std::sync::{Arc, Mutex};
+
+    // `page` is user input; u32 offset math overflowed (a panic under
+    // debug assertions, a garbage offset in release).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pages.db");
+    let db: Db = Arc::new(Mutex::new(
+        db::init_db(path.to_str().unwrap()).expect("init_db"),
+    ));
+
+    assert!(
+        db::get_address_transactions(&db, &format!("0x{}", "11".repeat(20)), u32::MAX, 25)
+            .is_empty()
+    );
+    assert!(
+        db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
+    );
+    assert!(db::get_all_tokens(&db, u32::MAX, 25).is_empty());
+}
+
+/// `authorizeKey(keyId, WebAuthn, KeyRestrictions{expiry, enforceLimits, one
+/// TokenLimit, allowAnyCalls: false, no CallScopes})`, encoded by `cast`.
+/// One 32-byte argument word per line; `->` marks an offset.
+const AUTHORIZE_KEY_CALLDATA: &str = concat!(
+    "0x980a6025",
+    "0000000000000000000000001111111111111111111111111111111111111111", // keyId
+    "0000000000000000000000000000000000000000000000000000000000000002", // signatureType: WebAuthn
+    "0000000000000000000000000000000000000000000000000000000000000060", // -> restrictions
+    "0000000000000000000000000000000000000000000000000000000070dbd880", // restrictions.expiry
+    "0000000000000000000000000000000000000000000000000000000000000001", // restrictions.enforceLimits
+    "00000000000000000000000000000000000000000000000000000000000000a0", // -> limits
+    "0000000000000000000000000000000000000000000000000000000000000000", // restrictions.allowAnyCalls
+    "0000000000000000000000000000000000000000000000000000000000000120", // -> allowedCalls
+    "0000000000000000000000000000000000000000000000000000000000000001", // limits.len
+    "0000000000000000000000002222222222222222222222222222222222222222", // limits[0].token
+    "00000000000000000000000000000000000000000000000000000000000003e8", // limits[0].amount
+    "0000000000000000000000000000000000000000000000000000000000015180", // limits[0].period
+    "0000000000000000000000000000000000000000000000000000000000000000", // allowedCalls.len
+);
+
+#[test]
+fn revoke_key_decodes() {
+    let revoke = format!("0x5ae7ab32{}{}", "00".repeat(12), "33".repeat(20));
+    let call = decode_function_call(&revoke).expect("revokeKey");
+    assert_eq!(call.name.as_deref(), Some("revokeKey"));
+    assert_eq!(call.params.len(), 1);
+    assert_eq!(call.params[0].name, "keyId");
+    assert_eq!(call.params[0].value, addr("33"));
+}
+
+#[test]
+fn authorize_key_restrictions_decode() {
+    // The old bare-`tuple` spelling decoded this parameter to nothing at all.
+    let call = decode_function_call(AUTHORIZE_KEY_CALLDATA).expect("authorizeKey");
+    let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert_eq!(call.params[0].value, addr("11"));
+    assert_eq!(call.params[1].value, "2");
+    // expiry, enforceLimits, one TokenLimit, allowAnyCalls, no CallScopes.
+    assert_eq!(
+        call.params[2].value,
+        format!(
+            "(1893456000, true, [({}, 1000, 86400)], false, [])",
+            addr("22")
+        )
+    );
+}
+
+/// The same authorization carrying two `CallScope`s, the first with a
+/// `SelectorRule` that names a recipient — encoded by `cast`.
+const SCOPES_CALLDATA: &str = concat!(
+    "0x980a6025",
+    "0000000000000000000000001111111111111111111111111111111111111111", // keyId
+    "0000000000000000000000000000000000000000000000000000000000000002", // signatureType: WebAuthn
+    "0000000000000000000000000000000000000000000000000000000000000060", // -> restrictions
+    "0000000000000000000000000000000000000000000000000000000070dbd880", // restrictions.expiry
+    "0000000000000000000000000000000000000000000000000000000000000001", // restrictions.enforceLimits
+    "00000000000000000000000000000000000000000000000000000000000000a0", // -> limits
+    "0000000000000000000000000000000000000000000000000000000000000000", // restrictions.allowAnyCalls
+    "00000000000000000000000000000000000000000000000000000000000000c0", // -> allowedCalls
+    "0000000000000000000000000000000000000000000000000000000000000000", // limits.len
+    "0000000000000000000000000000000000000000000000000000000000000002", // allowedCalls.len
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> allowedCalls[0]
+    "0000000000000000000000000000000000000000000000000000000000000140", // -> allowedCalls[1]
+    "0000000000000000000000002222222222222222222222222222222222222222", // allowedCalls[0].target
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> [0].selectorRules
+    "0000000000000000000000000000000000000000000000000000000000000001", // [0].selectorRules.len
+    "0000000000000000000000000000000000000000000000000000000000000020", // -> [0].selectorRules[0]
+    "a9059cbb00000000000000000000000000000000000000000000000000000000", // [0].rule[0].selector
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> [0].rule[0].recipients
+    "0000000000000000000000000000000000000000000000000000000000000001", // [0].rule[0].recipients.len
+    "0000000000000000000000003333333333333333333333333333333333333333", // [0].rule[0].recipients[0]
+    "0000000000000000000000004444444444444444444444444444444444444444", // allowedCalls[1].target
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> [1].selectorRules
+    "0000000000000000000000000000000000000000000000000000000000000001", // [1].selectorRules.len
+    "0000000000000000000000000000000000000000000000000000000000000020", // -> [1].selectorRules[0]
+    "095ea7b300000000000000000000000000000000000000000000000000000000", // [1].rule[0].selector
+    "0000000000000000000000000000000000000000000000000000000000000040", // -> [1].rule[0].recipients
+    "0000000000000000000000000000000000000000000000000000000000000000", // [1].rule[0].recipients.len
+);
+
+/// The TIP-1053 witness overload: `KeyRestrictions` sits *before* another
+/// argument — encoded by `cast`.
+const WITNESS_CALLDATA: &str = concat!(
+    "0xe3c154d2",
+    "0000000000000000000000001111111111111111111111111111111111111111", // keyId
+    "0000000000000000000000000000000000000000000000000000000000000001", // signatureType: P256
+    "0000000000000000000000000000000000000000000000000000000000000080", // -> restrictions
+    "00000000000000000000000000000000000000000000000000000000000000ab", // witness
+    "0000000000000000000000000000000000000000000000000000000070dbd880", // restrictions.expiry
+    "0000000000000000000000000000000000000000000000000000000000000000", // restrictions.enforceLimits
+    "00000000000000000000000000000000000000000000000000000000000000a0", // -> limits
+    "0000000000000000000000000000000000000000000000000000000000000001", // restrictions.allowAnyCalls
+    "0000000000000000000000000000000000000000000000000000000000000120", // -> allowedCalls
+    "0000000000000000000000000000000000000000000000000000000000000001", // limits.len
+    "0000000000000000000000002222222222222222222222222222222222222222", // limits[0].token
+    "00000000000000000000000000000000000000000000000000000000000003e8", // limits[0].amount
+    "0000000000000000000000000000000000000000000000000000000000015180", // limits[0].period
+    "0000000000000000000000000000000000000000000000000000000000000000", // allowedCalls.len
+);
+
+#[test]
+fn tip20_functions_report_their_named_inputs() {
+    // mint/burn resolve from the TIP-20 table, not the signature list.
+    let mint = format!("0x40c10f19{}{}{:064x}", "00".repeat(12), "11".repeat(20), 5);
+    let call = decode_function_call(&mint).expect("mint");
+    assert_eq!(call.signature.as_deref(), Some("mint(address,uint256)"));
+    assert_eq!(call.params[1].value, "5");
+
+    let burn = format!("0x42966c68{:064x}", 7);
+    let call = decode_function_call(&burn).expect("burn");
+    assert_eq!(call.signature.as_deref(), Some("burn(uint256)"));
+    assert_eq!(call.params[0].name, "amount");
+    assert_eq!(call.params[0].value, "7");
+}
+
+#[test]
+fn signature_list_selectors_are_the_well_known_ones() {
+    // Pin the derived selectors to their well-known 4 bytes; a bad derivation
+    // stops matching silently.
+    for (selector, name) in [
+        ("0x70a08231", "balanceOf"),
+        ("0x18160ddd", "totalSupply"),
+        ("0x06fdde03", "name"),
+        ("0x95d89b41", "symbol"),
+        ("0x313ce567", "decimals"),
+        ("0xdd62ed3e", "allowance"),
+        ("0x54063a55", "authorizeKey"),
+        ("0x980a6025", "authorizeKey"),
+        ("0xe3c154d2", "authorizeKey"),
+        ("0x9a424307", "authorizeAdminKey"),
+        ("0xcff31c46", "burnKeyAuthorizationWitness"),
+        ("0x5ae7ab32", "revokeKey"),
+        ("0xcbbb4480", "updateSpendingLimit"),
+        ("0xf5456703", "setAllowedCalls"),
+        ("0xf3941811", "removeAllowedCalls"),
+    ] {
+        let call = decode_function_call(selector).expect(name);
+        assert_eq!(call.name.as_deref(), Some(name), "selector {selector}");
+    }
+}
+
+/// A dynamic array of dynamic tuples: one offset word per element, nested
+/// arrays in each tail.
+#[test]
+fn multiple_call_scopes_decode() {
+    let call = decode_function_call(SCOPES_CALLDATA).expect("authorizeKey");
+    assert_eq!(
+        call.params[2].value,
+        format!(
+            "(1893456000, true, [], false, [({}, [(0xa9059cbb, [{}])]), ({}, [(0x095ea7b3, [])])])",
+            addr("22"),
+            addr("33"),
+            addr("44"),
+        )
+    );
+}
+
+/// A dynamic tuple occupies one head word, not one per field; the witness
+/// after it catches a miscount.
+#[test]
+fn witness_overload_decodes_the_argument_after_the_tuple() {
+    let call = decode_function_call(WITNESS_CALLDATA).expect("authorizeKey with witness");
+    assert_eq!(call.name.as_deref(), Some("authorizeKey"));
+    let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["keyId", "signatureType", "restrictions", "witness"]);
+    assert_eq!(
+        call.params[2].value,
+        format!(
+            "(1893456000, false, [({}, 1000, 86400)], true, [])",
+            addr("22")
+        )
+    );
+    assert_eq!(call.params[3].value, format!("0x{:064x}", 0xab));
+}
+
+/// Replace one argument word (counted after the selector), so a variant
+/// fixture cannot drift from the base it claims to match.
+fn with_arg_word(calldata: &str, index: usize, word: &str) -> String {
+    let (selector, args) = calldata.split_at(10);
+    let mut words: Vec<&str> = args
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    assert_eq!(word.len(), 64, "a replacement word is 32 bytes of hex");
+    words[index] = word;
+    format!("{selector}{}", words.concat())
+}
+
+/// A hostile length claim fails fast against the data instead of spinning.
+#[test]
+fn array_length_is_bounded_by_the_calldata() {
+    // Argument word 8 is the `TokenLimit[]` length; one limit is encoded.
+    let hostile = with_arg_word(
+        AUTHORIZE_KEY_CALLDATA,
+        8,
+        "000000000000000000000000000000000000000000000000ffffffffffffffff",
+    );
+    let call = decode_function_call(&hostile).expect("authorizeKey");
+    assert_eq!(call.name.as_deref(), Some("authorizeKey"));
+    // All-or-nothing: the refused list keeps its names and types, values empty.
+    let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert!(call.params.iter().all(|p| p.value.is_empty()));
+}
+
+/// A fixed-size array of dynamic elements has no length prefix, just offsets.
+#[test]
+fn fixed_size_array_of_dynamic_elements_has_no_length_prefix() {
+    let calldata = [
+        format!("{:064x}", 0x20),   // argument -> array
+        format!("{:064x}", 0x40),   // element 0 -> "hi"
+        format!("{:064x}", 0x80),   // element 1 -> "yo"
+        format!("{:064x}", 2),      //
+        format!("{:0<64}", "6869"), // "hi"
+        format!("{:064x}", 2),      //
+        format!("{:0<64}", "796f"), // "yo"
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["string[2]"], &bytes),
+        vec!["[hi, yo]".to_string()]
+    );
+}
+
+/// Dynamic `bytes` and `string`: offsets to a length word and padded payload.
+#[test]
+fn bytes_and_string_arguments_decode() {
+    let calldata = [
+        format!("{:064x}", 0x40),       // -> bytes
+        format!("{:064x}", 0x80),       // -> string
+        format!("{:064x}", 4),          //
+        format!("{:0<64}", "deadbeef"), //
+        format!("{:064x}", 2),          //
+        format!("{:0<64}", "6869"),     // "hi"
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["bytes", "string"], &bytes),
+        vec!["0xdeadbeef".to_string(), "hi".to_string()]
+    );
+}
+
+/// A length the payload cannot back decodes to nothing rather than whatever
+/// follows.
+#[test]
+fn a_length_longer_than_its_payload_decodes_nothing() {
+    let calldata = [
+        format!("{:064x}", 0x20),
+        format!("{:064x}", 100),        // claims 100 bytes
+        format!("{:0<64}", "deadbeef"), // 32 are present
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(decode_abi_args(&["bytes"], &bytes), Vec::<String>::new());
+}
+
+/// A static array sits inline at its element width — no offset, no length.
+#[test]
+fn fixed_size_array_of_static_elements_is_inline() {
+    let calldata = [
+        format!("{:064x}", 1),
+        format!("{:064x}", 2),
+        format!("{:064x}", 3),
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["uint256[3]"], &bytes),
+        vec!["[1, 2, 3]".to_string()]
+    );
+}
+
+/// Truncated calldata is refused outright rather than zero-padded.
+#[test]
+fn a_truncated_static_array_decodes_nothing() {
+    let calldata = [format!("{:064x}", 1), format!("{:064x}", 2)].concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["uint256[3]"], &bytes),
+        Vec::<String>::new()
     );
 }

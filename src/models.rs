@@ -170,3 +170,16 @@ pub struct TransferEvent {
     pub timestamp: i64,
     pub created_at: i64,
 }
+
+/// One block and everything indexed alongside it: its transactions, the
+/// transfers and anchored commitments their receipts carried, metadata for
+/// newly seen tokens, and any registries deployed.
+#[derive(Debug, Clone)]
+pub struct BlockBundle {
+    pub block: Block,
+    pub txs: Vec<Transaction>,
+    pub transfers: Vec<TransferEvent>,
+    pub anchored: Vec<AnchoredEvent>,
+    pub tokens: Vec<crate::tokens::TokenMeta>,
+    pub registries: Vec<RegistryDeployed>,
+}

@@ -23,7 +23,20 @@ pub struct TokenMeta {
     pub total_supply: String,
 }
 
-fn decode_string_result(raw: &str) -> String {
+/// Decode an ABI-encoded `string` return value (e.g. `name()` / `symbol()`).
+///
+/// A dynamic `string` is encoded with an offset indirection, even when it is
+/// short:
+///
+/// ```text
+/// word 0 = byte offset to the length word (0x20 for a single string)
+/// word 1 = byte length of the UTF-8 payload
+/// word 2+ = payload, right-padded to a 32-byte boundary
+/// ```
+///
+/// A few non-standard contracts return the string in place (length in word 0),
+/// so that shape is accepted as a fallback.
+pub fn decode_string_result(raw: &str) -> String {
     if raw.is_empty() || raw == "0x" {
         return String::new();
     }
@@ -34,9 +47,19 @@ fn decode_string_result(raw: &str) -> String {
     if bytes.len() < 32 {
         return String::new();
     }
-    let len = u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as usize;
-    let payload = &bytes[32..(32 + len).min(bytes.len())];
-    String::from_utf8_lossy(payload).into_owned()
+    let offset = u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0; 8])) as usize;
+    // Standard dynamic-string encoding: the first word is an offset into the
+    // buffer pointing at the length word, followed by the payload.
+    if offset >= 32 && offset + 32 <= bytes.len() {
+        let len = u64::from_be_bytes(bytes[offset + 24..offset + 32].try_into().unwrap_or([0; 8]))
+            as usize;
+        let start = offset + 32;
+        let end = (start + len).min(bytes.len());
+        return String::from_utf8_lossy(&bytes[start..end]).into_owned();
+    }
+    // Fallback: short string encoded in place (length in word 0).
+    let len = offset.min(bytes.len().saturating_sub(32));
+    String::from_utf8_lossy(&bytes[32..32 + len]).into_owned()
 }
 
 fn decode_uint_result(raw: &str, default: i64) -> i64 {
@@ -67,6 +90,26 @@ fn decode_uint256_result(raw: &str) -> String {
     num_bigint::BigInt::from_bytes_be(num_bigint::Sign::Plus, &bytes).to_string()
 }
 
+/// Clean a decoded `name()`/`symbol()` string. Real token metadata is
+/// printable text; a mis-decoded ABI value (e.g. a length word read as the
+/// payload) is full of NUL/control characters and should degrade to the
+/// empty string rather than render as garbage.
+pub fn sanitize_metadata_text(s: &str) -> String {
+    let trimmed = s.trim_end_matches('\0');
+    if trimmed.chars().any(|c| c.is_control()) {
+        String::new()
+    } else {
+        trimmed.trim().to_string()
+    }
+}
+
+/// Whether a stored name/symbol carries control characters — the signature of
+/// a value written by the pre-fix string decoder — and therefore needs a
+/// re-fetch.
+pub fn has_control_chars(s: &str) -> bool {
+    s.chars().any(|c| c.is_control())
+}
+
 /// Fetch TIP-20 token metadata from the chain, tolerating missing views.
 pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> TokenMeta {
     let checksummed = checksum_address(address);
@@ -92,6 +135,10 @@ pub async fn fetch_token_metadata(rpc: &ChainRpc, address: &str) -> TokenMeta {
             decode_string_result(&raw)
         }
     };
+    // Guard against stale/bad decodes: a mis-decoded ABI word must not be
+    // stored or rendered as a name/symbol.
+    let name = sanitize_metadata_text(&name);
+    let symbol = sanitize_metadata_text(&symbol);
     let decimals_raw = rpc
         .eth_call(&checksummed, DECIMALS_CALL, "latest")
         .await

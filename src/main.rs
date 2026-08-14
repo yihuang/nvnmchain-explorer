@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
-use tracing::info;
+use tracing::{info, warn};
 
 use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db};
@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         tera,
         block_events: block_tx,
         stats: home_stats,
+        shutdown: shutdown_rx.clone(),
     };
     let app = web::app(state);
 
@@ -84,13 +85,27 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {addr}"))?;
     info!("listening on http://{addr}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            let _ = shutdown_tx.send(true);
-        })
-        .await
-        .context("server error")?;
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let sig = shutdown_signal().await;
+        info!("received {sig}, shutting down (second one force quits)");
+        let _ = shutdown_tx.send(true);
+        // The installed handler replaced the default disposition for good, so
+        // signals no longer kill the process; catch a second one ourselves.
+        tokio::spawn(async {
+            let sig = shutdown_signal().await;
+            warn!("received {sig} again, exiting now");
+            std::process::exit(130);
+        });
+    });
+
+    tokio::select! {
+        r = server => r.context("server error")?,
+        // Backstop: graceful shutdown waits on in-flight connections, and a
+        // streaming handler could hold it open indefinitely.
+        _ = shutdown_deadline(shutdown_rx) => {
+            warn!("connections still open {GRACE_SECS}s after shutdown; exiting anyway");
+        }
+    }
 
     // The indexer loops exit on the shutdown signal; give them a bounded
     // window to flush in-flight work, then exit regardless.
@@ -100,7 +115,21 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+/// How long graceful shutdown may wait on in-flight connections.
+const GRACE_SECS: u64 = 5;
+
+/// Resolve `GRACE_SECS` after shutdown is requested; never if it isn't.
+async fn shutdown_deadline(mut rx: watch::Receiver<bool>) {
+    if rx.wait_for(|&stop| stop).await.is_ok() {
+        tokio::time::sleep(Duration::from_secs(GRACE_SECS)).await;
+    } else {
+        // Sender gone without a signal: the server arm settles the race.
+        std::future::pending::<()>().await
+    }
+}
+
+/// Wait for SIGINT or SIGTERM, returning which arrived.
+async fn shutdown_signal() -> &'static str {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     let terminate = async {
@@ -112,7 +141,7 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        _ = ctrl_c => info!("received SIGINT, shutting down"),
-        _ = terminate => info!("received SIGTERM, shutting down"),
+        _ = ctrl_c => "SIGINT",
+        _ = terminate => "SIGTERM",
     }
 }

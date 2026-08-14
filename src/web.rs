@@ -17,7 +17,8 @@ use futures_util::stream::unfold;
 use num_bigint::BigInt;
 use serde_json::{json, Value};
 use tera::Tera;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
+use tower_http::cors::CorsLayer;
 
 use crate::anchoring::is_self_verifying;
 use crate::config::Settings;
@@ -27,7 +28,9 @@ use crate::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
 };
 use crate::rpc::ChainRpc;
-use crate::tokens::{fetch_token_metadata, format_token_amount, format_token_amount_with_symbol};
+use crate::tokens::{
+    fetch_token_metadata, format_token_amount, format_token_amount_with_symbol, has_control_chars,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -40,6 +43,9 @@ pub struct AppState {
     /// Home-page stats, published by the indexer's stats task — read here so
     /// a page view costs no aggregate queries.
     pub stats: Arc<RwLock<Value>>,
+    /// Flipped on SIGINT/SIGTERM. The SSE stream ends when it flips; since
+    /// this state owns a `block_events` sender, it never ends on its own.
+    pub shutdown: watch::Receiver<bool>,
 }
 
 fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
@@ -328,6 +334,7 @@ pub async fn events(State(state): State<AppState>) -> Response {
     let stream = unfold(
         SseState {
             rx,
+            shutdown: state.shutdown.clone(),
             db: state.db.clone(),
             pending: std::collections::VecDeque::new(),
             last_num: -1,
@@ -346,6 +353,7 @@ pub async fn events(State(state): State<AppState>) -> Response {
 
 struct SseState {
     rx: broadcast::Receiver<Value>,
+    shutdown: watch::Receiver<bool>,
     db: Db,
     /// Catch-up events (blocks replayed after a broadcast lag).
     pending: std::collections::VecDeque<Value>,
@@ -372,6 +380,11 @@ fn sse_event(payload: &Value) -> Result<Event, std::convert::Infallible> {
 async fn sse_step(
     mut state: SseState,
 ) -> Option<(Result<Event, std::convert::Infallible>, SseState)> {
+    // Ending the stream is what lets graceful shutdown finish: axum waits
+    // for in-flight connections, and this one never ends on its own.
+    if *state.shutdown.borrow() {
+        return None;
+    }
     // Initial event: the current tip (with its transactions), so the panels
     // are populated immediately on connect.
     if !state.sent_initial {
@@ -389,7 +402,12 @@ async fn sse_step(
         return Some((sse_event(&v), state));
     }
     loop {
-        match state.rx.recv().await {
+        let received = tokio::select! {
+            biased; // shutdown wins a tie
+            _ = state.shutdown.wait_for(|&stop| stop) => return None,
+            received = state.rx.recv() => received,
+        };
+        match received {
             Ok(block) => {
                 if let Some(n) = block.pointer("/block/number").and_then(Value::as_i64) {
                     state.last_num = n;
@@ -937,9 +955,11 @@ pub async fn token_page(
         };
     }
 
+    // A corrupt row (NUL/control chars from the pre-fix decoder) is treated
+    // as missing so the page re-fetches clean metadata on the spot.
     let meta = match db::get_token_metadata(&state.db, &checksummed) {
-        Some(m) => m,
-        None => {
+        Some(m) if !has_control_chars(&m.name) && !has_control_chars(&m.symbol) => m,
+        _ => {
             let fetched = fetch_token_metadata(&state.rpc, &checksummed).await;
             let _ = db::save_token_metadata(&state.db, &fetched);
             db::get_token_metadata(&state.db, &checksummed).unwrap_or_else(|| {
@@ -960,10 +980,12 @@ pub async fn token_page(
         }
     };
 
+    // The token page only has a Transfers tab (token.html), so default to it
+    // instead of "transactions" — otherwise the home page renders an empty list.
     let tab = query
         .get("tab")
         .cloned()
-        .unwrap_or_else(|| "transactions".into());
+        .unwrap_or_else(|| "transfers".into());
     let page: u32 = query
         .get("page")
         .and_then(|p| p.parse().ok())
@@ -1498,5 +1520,8 @@ pub fn app(state: AppState) -> Router {
         .route("/anchoring/{namespace}", get(anchoring_namespace_page))
         .route("/anchoring/{namespace}/{key}", get(anchoring_key_page))
         .route("/search", get(search_page))
+        // Public explorer: allow cross-origin reads from any site (the wallet
+        // is hosted on a different origin and needs `?format=json`).
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }

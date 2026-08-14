@@ -12,7 +12,7 @@ use nvnmchain_explorer::anchoring::{
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{decode_event, decode_function_call, keccak_hex};
 use nvnmchain_explorer::indexer::anchored_event;
-use nvnmchain_explorer::models::{AnchoredEvent, Block, Transaction};
+use nvnmchain_explorer::models::{AnchoredEvent, Block, BlockBundle, Transaction};
 use serde_json::{json, Value};
 
 /// The registry contract that emitted the fixtures — its address is the namespace,
@@ -156,16 +156,15 @@ fn index_anchor(
     let tx = test_tx(&block);
     let log = anchored_log(REGISTRY, key, commitment, metadata);
     let event = event_from_log(&log, &tx, 0);
-    db::save_block_bundle(
-        db,
-        &block,
-        &[tx],
-        &[],
-        std::slice::from_ref(&event),
-        &[],
-        &[],
-    )
-    .expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![],
+        anchored: vec![event.clone()],
+        tokens: vec![],
+        registries: vec![],
+    };
+    db::save_block_bundle(db, &bundle).expect("save bundle");
     event
 }
 
@@ -284,7 +283,15 @@ fn namespaces_are_partitioned_by_caller() {
     );
     let txs = [tx];
     let events = [mine, theirs];
-    db::save_block_bundle(&db, &block, &txs, &[], &events, &[], &[]).expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: txs.to_vec(),
+        transfers: vec![],
+        anchored: events.to_vec(),
+        tokens: vec![],
+        registries: vec![],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     // Same key, different callers: the writes never collide.
     let other = nvnmchain_explorer::decoder::checksum_address(&other);
@@ -310,7 +317,7 @@ fn namespaces_are_partitioned_by_caller() {
 
     // Re-writing an already-indexed block inserts nothing, so neither the
     // summary nor the total may move.
-    db::save_block_bundle(&db, &block, &txs, &[], &events, &[], &[]).expect("re-save");
+    db::save_block_bundle(&db, &bundle).expect("re-save");
     assert_eq!(db::get_anchored_namespaces(&db, None, 1, 25), namespaces);
     assert_eq!(db::count_anchored(&db), 2);
 
@@ -387,8 +394,15 @@ fn a_deployment_labels_its_namespace_for_the_configured_factory_only() {
     assert_eq!(deployed.description, "docs about docs");
 
     let txs = [tx];
-    db::save_block_bundle(&db, &block, &txs, &[], &[anchor], &[], &[deployed])
-        .expect("save bundle");
+    let bundle = BlockBundle {
+        block,
+        txs: txs.to_vec(),
+        transfers: vec![],
+        anchored: vec![anchor],
+        tokens: vec![],
+        registries: vec![deployed],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
 
     // Labelled for the factory that deployed it, bare for anyone else.
     let labelled = db::get_anchored_namespaces(&db, Some(FACTORY), 1, 25);
@@ -438,6 +452,7 @@ async fn serve() -> (tempfile::TempDir, String) {
         tera: web::build_tera(temp_db().1).expect("templates"),
         block_events: tokio::sync::broadcast::channel(16).0,
         stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
+        shutdown: tokio::sync::watch::channel(false).1,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

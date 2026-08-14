@@ -107,15 +107,7 @@ async fn backfill_throughput() {
             let num = next;
             set.spawn(async move {
                 if let Ok(Some(bundle)) = fetch_block_bundle(&rpc, num).await {
-                    let _ = db::save_block_bundle(
-                        &db,
-                        &bundle.block,
-                        &bundle.txs,
-                        &bundle.transfers,
-                        &bundle.anchored,
-                        &bundle.tokens,
-                        &bundle.registries,
-                    );
+                    let _ = db::save_block_bundle(&db, &bundle);
                 }
             });
             next += 1;
@@ -266,6 +258,7 @@ async fn web_api_serves_indexed_data() {
         tera,
         block_events: block_tx,
         stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
+        shutdown: tokio::sync::watch::channel(false).1,
     };
     let app = web::app(state);
 
