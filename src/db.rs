@@ -30,6 +30,93 @@ fn blob_hex(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
+/// One stored address, in the checksummed form the rest of the explorer keys
+/// on — links, balance rows and metadata lookups all compare that spelling, and
+/// binary storage has dropped the case by the time it comes back.
+fn blob_addr(bytes: &[u8]) -> String {
+    crate::decoder::checksum_address(&blob_hex(bytes))
+}
+
+/// Degrade a failed query to "no data", after saying so.
+///
+/// Pages must survive a database problem — that is why the explorer answers an
+/// unreadable table with an empty one rather than a 500 — but a failure that
+/// leaves no trace is how a broken read path stays broken. Every discard below
+/// is deliberate; none of them is silent.
+trait OrWarn<T> {
+    fn or_warn(self, what: &str) -> Option<T>;
+}
+
+impl<T, E: std::fmt::Display> OrWarn<T> for Result<T, E> {
+    fn or_warn(self, what: &str) -> Option<T> {
+        match self {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::warn!("{what}: {e}");
+                None
+            }
+        }
+    }
+}
+
+/// Run a query and collect its rows, degrading to none if it fails. Preparing,
+/// binding and decoding each fail differently, and every read helper wants the
+/// same answer to all three: no data, and a line in the log saying why.
+///
+/// Undecodable rows are reported once per query rather than once per row — a
+/// column read at the wrong type fails for the whole table, so the signal is
+/// the first error plus what it cost.
+fn query_rows<T, P: rusqlite::Params>(
+    conn: &Connection,
+    what: &str,
+    sql: &str,
+    params: P,
+    map: impl FnMut(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> Vec<T> {
+    let Some(mut stmt) = conn.prepare(sql).or_warn(what) else {
+        return Vec::new();
+    };
+    let Some(rows) = stmt.query_map(params, map).or_warn(what) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let (mut dropped, mut first) = (0usize, None);
+    for row in rows {
+        match row {
+            Ok(value) => out.push(value),
+            Err(e) => {
+                dropped += 1;
+                first.get_or_insert_with(|| e.to_string());
+            }
+        }
+    }
+    if let Some(e) = first {
+        tracing::warn!("{what}: dropped {dropped} undecodable row(s); first: {e}");
+    }
+    out
+}
+
+/// One row, or none — a missing row is not a failure, an unreadable one is.
+fn query_opt<T, P: rusqlite::Params>(
+    conn: &Connection,
+    what: &str,
+    sql: &str,
+    params: P,
+    map: impl FnOnce(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> Option<T> {
+    conn.query_row(sql, params, map)
+        .optional()
+        .or_warn(what)
+        .flatten()
+}
+
+/// A `COUNT(*)`, or zero if it could not be read.
+fn query_count<P: rusqlite::Params>(conn: &Connection, what: &str, sql: &str, params: P) -> i64 {
+    conn.query_row(sql, params, |r| r.get(0))
+        .or_warn(what)
+        .unwrap_or(0)
+}
+
 pub fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -177,13 +264,13 @@ pub fn set_kv(conn: &Connection, key: &str, value: &str) -> Result<()> {
 }
 
 pub fn get_kv(db: &Db, key: &str) -> Option<String> {
-    let conn = lock(db);
-    conn.query_row("SELECT value FROM kv WHERE key=?1", params![key], |r| {
-        r.get::<_, String>(0)
-    })
-    .optional()
-    .ok()
-    .flatten()
+    query_opt(
+        &lock(db),
+        "get_kv",
+        "SELECT value FROM kv WHERE key=?1",
+        params![key],
+        |r| r.get(0),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -314,46 +401,43 @@ fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
 }
 
 pub fn get_block_by_number(db: &Db, number: i64) -> Option<Block> {
-    let conn = lock(db);
-    conn.query_row(
+    query_opt(
+        &lock(db),
+        "get_block_by_number",
         &format!("SELECT {BLOCK_COLS} FROM blocks WHERE number=?1"),
         params![number],
         row_to_block,
     )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 pub fn get_block_by_hash(db: &Db, hash: &str) -> Option<Block> {
-    let conn = lock(db);
-    conn.query_row(
+    query_opt(
+        &lock(db),
+        "get_block_by_hash",
         &format!("SELECT {BLOCK_COLS} FROM blocks WHERE hash=?1"),
         params![hex_blob(hash)],
         row_to_block,
     )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 pub fn get_latest_block(db: &Db) -> Option<Block> {
-    let conn = lock(db);
-    conn.query_row(
+    query_opt(
+        &lock(db),
+        "get_latest_block",
         &format!("SELECT {BLOCK_COLS} FROM blocks ORDER BY number DESC LIMIT 1"),
         [],
         row_to_block,
     )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 /// Number of indexed block rows (the history-completion metric).
 pub fn get_block_count(db: &Db) -> i64 {
-    let conn = lock(db);
-    conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get::<_, i64>(0))
-        .unwrap_or(0)
+    query_count(
+        &lock(db),
+        "get_block_count",
+        "SELECT COUNT(*) FROM blocks",
+        [],
+    )
 }
 
 /// Record the chain head observed by the indexer (for index-progress display).
@@ -371,23 +455,25 @@ pub fn get_chain_head(db: &Db) -> i64 {
 
 /// Lowest stored block height; `None` when the table is empty.
 pub fn get_min_block_number(db: &Db) -> Option<i64> {
-    let conn = lock(db);
-    conn.query_row("SELECT MIN(number) FROM blocks", [], |r| r.get::<_, i64>(0))
-        .ok()
-        .filter(|n| *n != 0)
+    query_opt(
+        &lock(db),
+        "get_min_block_number",
+        "SELECT MIN(number) FROM blocks",
+        [],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .flatten()
+    .filter(|n| *n != 0)
 }
 
 pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
-    let conn = lock(db);
-    let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT {BLOCK_COLS} FROM blocks ORDER BY number DESC LIMIT ?1"
-    )) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(params![limit as i64], row_to_block) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    query_rows(
+        &lock(db),
+        "get_recent_blocks",
+        &format!("SELECT {BLOCK_COLS} FROM blocks ORDER BY number DESC LIMIT ?1"),
+        params![limit as i64],
+        row_to_block,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -447,13 +533,13 @@ fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
         hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),
         block_number: row.get(1)?,
         position: row.get(2)?,
-        from_addr: blob_hex(&row.get::<_, Vec<u8>>(3)?),
-        to_addr: row.get::<_, Option<Vec<u8>>>(4)?.map(|b| blob_hex(&b)),
+        from_addr: blob_addr(&row.get::<_, Vec<u8>>(3)?),
+        to_addr: row.get::<_, Option<Vec<u8>>>(4)?.map(|b| blob_addr(&b)),
         status: row.get(5)?,
         gas_used: row.get(6)?,
         base_fee: row.get(7)?,
-        contract_address: row.get::<_, Option<Vec<u8>>>(8)?.map(|b| blob_hex(&b)),
-        fee_token: row.get::<_, Option<Vec<u8>>>(9)?.map(|b| blob_hex(&b)),
+        contract_address: row.get::<_, Option<Vec<u8>>>(8)?.map(|b| blob_addr(&b)),
+        fee_token: row.get::<_, Option<Vec<u8>>>(9)?.map(|b| blob_addr(&b)),
         fee_amount: row.get(10)?,
         input: row.get(11)?,
         raw: row
@@ -467,41 +553,33 @@ fn row_to_tx(row: &rusqlite::Row) -> rusqlite::Result<Transaction> {
 }
 
 pub fn get_transaction(db: &Db, hash: &str) -> Option<Transaction> {
-    let conn = lock(db);
-    conn.query_row(
+    query_opt(
+        &lock(db),
+        "get_transaction",
         &format!("SELECT {TX_COLS} FROM transactions WHERE hash=?1"),
         params![hex_blob(hash)],
         row_to_tx,
     )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 pub fn get_block_transactions(db: &Db, block_number: i64) -> Vec<Transaction> {
-    let conn = lock(db);
-    let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT {TX_COLS} FROM transactions WHERE block_number=?1 ORDER BY position"
-    )) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(params![block_number], row_to_tx) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    query_rows(
+        &lock(db),
+        "get_block_transactions",
+        &format!("SELECT {TX_COLS} FROM transactions WHERE block_number=?1 ORDER BY position"),
+        params![block_number],
+        row_to_tx,
+    )
 }
 
 pub fn get_recent_transactions(db: &Db, limit: usize) -> Vec<Transaction> {
-    let conn = lock(db);
-    let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT {TX_COLS} FROM transactions ORDER BY timestamp DESC LIMIT ?1"
-    )) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(params![limit as i64], row_to_tx) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    query_rows(
+        &lock(db),
+        "get_recent_transactions",
+        &format!("SELECT {TX_COLS} FROM transactions ORDER BY timestamp DESC LIMIT ?1"),
+        params![limit as i64],
+        row_to_tx,
+    )
 }
 
 pub fn get_address_transactions(
@@ -510,30 +588,29 @@ pub fn get_address_transactions(
     page: u32,
     per_page: u32,
 ) -> Vec<Transaction> {
-    let conn = lock(db);
-    let offset = page_offset(page, per_page);
-    let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT {TX_COLS} FROM transactions WHERE from_addr=?1 OR to_addr=?1 ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
-    )) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(
-        params![hex_blob(address), per_page as i64, offset],
+    query_rows(
+        &lock(db),
+        "get_address_transactions",
+        &format!(
+            "SELECT {TX_COLS} FROM transactions WHERE from_addr=?1 OR to_addr=?1 \
+             ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
+        ),
+        params![
+            hex_blob(address),
+            per_page as i64,
+            page_offset(page, per_page)
+        ],
         row_to_tx,
-    ) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    )
 }
 
 pub fn get_address_transaction_count(db: &Db, address: &str) -> i64 {
-    let conn = lock(db);
-    conn.query_row(
+    query_count(
+        &lock(db),
+        "get_address_transaction_count",
         "SELECT COUNT(*) FROM transactions WHERE from_addr=?1 OR to_addr=?1",
         params![hex_blob(address)],
-        |r| r.get::<_, i64>(0),
     )
-    .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -568,9 +645,12 @@ pub fn save_token_metadata(db: &Db, meta: &crate::tokens::TokenMeta) -> Result<(
     upsert_token_meta(&conn, meta)
 }
 
+const TOKEN_COLS: &str = "address, name, symbol, decimals, currency, total_supply, logo_uri, \
+                          holder_count, created_at, updated_at";
+
 fn row_to_token(row: &rusqlite::Row) -> rusqlite::Result<TokenMetadata> {
     Ok(TokenMetadata {
-        address: blob_hex(&row.get::<_, Vec<u8>>(0)?),
+        address: blob_addr(&row.get::<_, Vec<u8>>(0)?),
         name: row.get(1)?,
         symbol: row.get(2)?,
         decimals: row.get(3)?,
@@ -584,29 +664,25 @@ fn row_to_token(row: &rusqlite::Row) -> rusqlite::Result<TokenMetadata> {
 }
 
 pub fn get_token_metadata(db: &Db, address: &str) -> Option<TokenMetadata> {
-    let conn = lock(db);
-    conn.query_row(
-        "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at FROM token_metadata WHERE address=?1",
+    query_opt(
+        &lock(db),
+        "get_token_metadata",
+        &format!("SELECT {TOKEN_COLS} FROM token_metadata WHERE address=?1"),
         params![hex_blob(address)],
         row_to_token,
     )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 pub fn get_all_tokens(db: &Db, page: u32, per_page: u32) -> Vec<TokenMetadata> {
-    let conn = lock(db);
-    let offset = page_offset(page, per_page);
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at FROM token_metadata ORDER BY holder_count DESC LIMIT ?1 OFFSET ?2",
-    ) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(params![per_page as i64, offset], row_to_token) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    query_rows(
+        &lock(db),
+        "get_all_tokens",
+        &format!(
+            "SELECT {TOKEN_COLS} FROM token_metadata ORDER BY holder_count DESC LIMIT ?1 OFFSET ?2"
+        ),
+        params![per_page as i64, page_offset(page, per_page)],
+        row_to_token,
+    )
 }
 
 /// Every stored token-metadata row (unpaginated), used by the startup repair
@@ -625,36 +701,35 @@ pub fn get_all_token_metas(db: &Db) -> Vec<TokenMetadata> {
 }
 
 pub fn get_token_count(db: &Db) -> i64 {
-    let conn = lock(db);
-    conn.query_row("SELECT COUNT(*) FROM token_metadata", [], |r| {
-        r.get::<_, i64>(0)
-    })
-    .unwrap_or(0)
+    query_count(
+        &lock(db),
+        "get_token_count",
+        "SELECT COUNT(*) FROM token_metadata",
+        [],
+    )
 }
 
 pub fn get_token_transfer_count(db: &Db, token_addr: &str) -> i64 {
-    let conn = lock(db);
-    conn.query_row(
+    query_count(
+        &lock(db),
+        "get_token_transfer_count",
         "SELECT COUNT(*) FROM transfer_events WHERE token_addr=?1",
         params![hex_blob(token_addr)],
-        |r| r.get::<_, i64>(0),
     )
-    .unwrap_or(0)
 }
 
 /// Find a token by exact symbol/name (case-insensitive), used by search.
 pub fn get_token_by_symbol_or_name(db: &Db, q: &str) -> Option<TokenMetadata> {
-    let conn = lock(db);
-    conn.query_row(
-        "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, \
-         holder_count, created_at, updated_at FROM token_metadata \
-         WHERE lower(symbol)=lower(?1) OR lower(name)=lower(?1) LIMIT 1",
+    query_opt(
+        &lock(db),
+        "get_token_by_symbol_or_name",
+        &format!(
+            "SELECT {TOKEN_COLS} FROM token_metadata \
+             WHERE lower(symbol)=lower(?1) OR lower(name)=lower(?1) LIMIT 1"
+        ),
         params![q],
         row_to_token,
     )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 // ---------------------------------------------------------------------------
@@ -699,16 +774,14 @@ fn adjust_balance(
     if delta.sign() == num_bigint::Sign::NoSign {
         return Ok(());
     }
-    let current = conn
-        .query_row(
-            "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
-            params![token, holder],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "0".into());
+    let current = query_opt(
+        conn,
+        "adjust_balance",
+        "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
+        params![token, holder],
+        |r| r.get::<_, String>(0),
+    )
+    .unwrap_or_else(|| "0".into());
     let new = bigint(&current) + delta;
     if new.sign() == num_bigint::Sign::NoSign {
         conn.execute(
@@ -820,31 +893,46 @@ pub fn save_transfer(db: &Db, transfer: &TransferEvent) -> Result<()> {
     Ok(())
 }
 
+const TRANSFER_COLS: &str = "e.id, e.tx_hash, e.block_number, e.log_index, e.token_addr, \
+                             e.from_addr, e.to_addr, e.amount, e.timestamp, e.created_at";
+
 fn row_to_transfer(row: &rusqlite::Row) -> rusqlite::Result<TransferEvent> {
     Ok(TransferEvent {
         id: row.get(0)?,
         tx_hash: blob_hex(&row.get::<_, Vec<u8>>(1)?),
         block_number: row.get(2)?,
         log_index: row.get(3)?,
-        token_addr: blob_hex(&row.get::<_, Vec<u8>>(4)?),
-        from_addr: blob_hex(&row.get::<_, Vec<u8>>(5)?),
-        to_addr: blob_hex(&row.get::<_, Vec<u8>>(6)?),
+        token_addr: blob_addr(&row.get::<_, Vec<u8>>(4)?),
+        from_addr: blob_addr(&row.get::<_, Vec<u8>>(5)?),
+        to_addr: blob_addr(&row.get::<_, Vec<u8>>(6)?),
         amount: row.get(7)?,
         timestamp: row.get(8)?,
         created_at: row.get(9)?,
     })
 }
 
-fn transfer_to_json(transfer: &TransferEvent, tx: Option<&Transaction>) -> Value {
-    let tx_from = tx
-        .map(|t| t.from_addr.clone())
-        .unwrap_or_else(|| transfer.from_addr.clone());
-    let tx_to = tx
-        .map(|t| t.to_addr.clone())
-        .unwrap_or_else(|| Some(transfer.to_addr.clone()));
-    let tx_timestamp = tx.map(|t| t.timestamp).unwrap_or(transfer.timestamp);
-    let tx_status = tx.map(|t| t.status).unwrap_or(1);
-    json!({
+/// A transfer row plus the four fields of its transaction the listings show.
+/// Columns 10..14 come from the `LEFT JOIN`, so they are all null together when
+/// the transaction has not been indexed; the transfer's own values stand in.
+fn row_to_transfer_json(row: &rusqlite::Row) -> rusqlite::Result<Value> {
+    let transfer = row_to_transfer(row)?;
+    let joined = row.get::<_, Option<Vec<u8>>>(10)?.is_some();
+    let (tx_from, tx_to, tx_timestamp, tx_status) = if joined {
+        (
+            blob_addr(&row.get::<_, Vec<u8>>(11)?),
+            row.get::<_, Option<Vec<u8>>>(12)?.map(|b| blob_addr(&b)),
+            row.get(13)?,
+            row.get(14)?,
+        )
+    } else {
+        (
+            transfer.from_addr.clone(),
+            Some(transfer.to_addr.clone()),
+            transfer.timestamp,
+            1,
+        )
+    };
+    Ok(json!({
         "id": transfer.id,
         "tx_hash": transfer.tx_hash,
         "block_number": transfer.block_number,
@@ -859,70 +947,57 @@ fn transfer_to_json(transfer: &TransferEvent, tx: Option<&Transaction>) -> Value
         "tx_to": tx_to,
         "tx_timestamp": tx_timestamp,
         "tx_status": tx_status,
-    })
+    }))
+}
+
+/// One page of transfers matching `filter`, joined to their transactions.
+///
+/// Joined rather than fetched per row: the listing wants four fields of the
+/// transaction, and reading each one back whole would re-materialize the raw
+/// RLP and the stored trace once per line of the page.
+fn transfer_page(
+    db: &Db,
+    what: &str,
+    filter: &str,
+    key: &str,
+    page: u32,
+    per_page: u32,
+) -> Vec<Value> {
+    let sql = format!(
+        "SELECT {TRANSFER_COLS}, t.hash, t.from_addr, t.to_addr, t.timestamp, t.status
+         FROM transfer_events e LEFT JOIN transactions t ON t.hash = e.tx_hash
+         WHERE {filter}
+         ORDER BY e.block_number DESC, e.log_index DESC LIMIT ?2 OFFSET ?3"
+    );
+    query_rows(
+        &lock(db),
+        what,
+        &sql,
+        params![hex_blob(key), per_page as i64, page_offset(page, per_page)],
+        row_to_transfer_json,
+    )
 }
 
 pub fn get_token_transfers(db: &Db, token_addr: &str, page: u32, per_page: u32) -> Vec<Value> {
-    let transfers: Vec<TransferEvent> = {
-        let conn = lock(db);
-        let offset = page_offset(page, per_page);
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT id, tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at
-             FROM transfer_events WHERE token_addr=?1
-             ORDER BY block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3",
-        ) else {
-            return Vec::new();
-        };
-        let Ok(rows) = stmt.query_map(
-            params![hex_blob(token_addr), per_page as i64, offset],
-            row_to_transfer,
-        ) else {
-            return Vec::new();
-        };
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    let mut out = Vec::with_capacity(transfers.len());
-    for t in &transfers {
-        out.push(transfer_to_json(
-            t,
-            get_transaction(db, &t.tx_hash).as_ref(),
-        ));
-    }
-    out
+    transfer_page(
+        db,
+        "get_token_transfers",
+        "e.token_addr=?1",
+        token_addr,
+        page,
+        per_page,
+    )
 }
 
 pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -> Vec<Value> {
-    let transfers: Vec<TransferEvent> = {
-        let conn = lock(db);
-        let offset = page_offset(page, per_page);
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT id, tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at
-             FROM transfer_events WHERE from_addr=?1 OR to_addr=?2
-             ORDER BY block_number DESC, log_index DESC LIMIT ?3 OFFSET ?4",
-        ) else {
-            return Vec::new();
-        };
-        let Ok(rows) = stmt.query_map(
-            params![
-                hex_blob(address),
-                hex_blob(address),
-                per_page as i64,
-                offset
-            ],
-            row_to_transfer,
-        ) else {
-            return Vec::new();
-        };
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    let mut out = Vec::with_capacity(transfers.len());
-    for t in &transfers {
-        out.push(transfer_to_json(
-            t,
-            get_transaction(db, &t.tx_hash).as_ref(),
-        ));
-    }
-    out
+    transfer_page(
+        db,
+        "get_address_transfers",
+        "e.from_addr=?1 OR e.to_addr=?1",
+        address,
+        page,
+        per_page,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -941,18 +1016,10 @@ pub fn get_tokens_metadata(
     let conn = lock(db);
     for chunk in addresses.chunks(100) {
         let placeholders = vec!["?"; chunk.len()].join(",");
-        let sql = format!(
-            "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, \
-             holder_count, created_at, updated_at FROM token_metadata WHERE address IN ({placeholders})"
-        );
-        let Ok(mut stmt) = conn.prepare(&sql) else {
-            continue;
-        };
+        let sql =
+            format!("SELECT {TOKEN_COLS} FROM token_metadata WHERE address IN ({placeholders})");
         let params = rusqlite::params_from_iter(chunk.iter().map(|a| hex_blob(a)));
-        let Ok(rows) = stmt.query_map(params, row_to_token) else {
-            continue;
-        };
-        for row in rows.flatten() {
+        for row in query_rows(&conn, "get_tokens_metadata", &sql, params, row_to_token) {
             out.insert(row.address.clone(), row);
         }
     }
@@ -961,24 +1028,22 @@ pub fn get_tokens_metadata(
 
 /// All token addresses known to the indexer (for cache seeding).
 pub fn get_all_token_addresses(db: &Db) -> Vec<String> {
-    let conn = lock(db);
-    let Ok(mut stmt) = conn.prepare("SELECT address FROM token_metadata") else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    query_rows(
+        &lock(db),
+        "get_all_token_addresses",
+        "SELECT address FROM token_metadata",
+        [],
+        |r| Ok(blob_addr(&r.get::<_, Vec<u8>>(0)?)),
+    )
 }
 
 pub fn get_token_holder_count(db: &Db, token_addr: &str) -> i64 {
-    let conn = lock(db);
-    conn.query_row(
+    query_count(
+        &lock(db),
+        "get_token_holder_count",
         "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
         params![token_addr],
-        |r| r.get::<_, i64>(0),
     )
-    .unwrap_or(0)
 }
 
 /// Recompute `token_metadata.holder_count` for every token that has balance
@@ -1005,40 +1070,28 @@ pub fn sync_holder_counts(conn: &Connection) -> Result<()> {
 
 /// Contract-label lookup (populated at index time for created contracts).
 pub fn get_contract_label(db: &Db, addr: &str) -> Option<String> {
-    let conn = lock(db);
-    conn.query_row(
+    query_opt(
+        &lock(db),
+        "get_contract_label",
         "SELECT name FROM contract_labels WHERE address=?1",
         params![addr],
-        |r| r.get::<_, String>(0),
+        |r| r.get(0),
     )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 pub fn get_address_holdings(db: &Db, address: &str) -> Vec<Value> {
-    let balances: Vec<(String, String)> = {
-        let conn = lock(db);
-        let Ok(mut stmt) =
-            conn.prepare("SELECT token_addr, balance FROM token_balances WHERE holder_addr=?1")
-        else {
-            return Vec::new();
-        };
-        let Ok(rows) = stmt.query_map(params![address], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        }) else {
-            return Vec::new();
-        };
-        rows.filter_map(|r| r.ok()).collect()
-    };
+    let balances: Vec<(String, String)> = query_rows(
+        &lock(db),
+        "get_address_holdings",
+        "SELECT token_addr, balance FROM token_balances WHERE holder_addr=?1",
+        params![address],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
     let mut holdings = Vec::new();
     let token_addrs: Vec<String> = balances.iter().map(|(a, _)| a.clone()).collect();
     let metas = get_tokens_metadata(db, &token_addrs);
     for (token_addr, balance) in &balances {
-        // `get_tokens_metadata` keys are lowercase hex (blob_hex), while
-        // `token_balances.token_addr` stores EIP-55 checksummed text; match
-        // case-insensitively so the joined metadata is found.
-        if let Some(meta) = metas.get(&token_addr.to_lowercase()) {
+        if let Some(meta) = metas.get(token_addr) {
             let formatted = crate::tokens::format_token_amount(balance, meta.decimals);
             holdings.push(json!({
                 "token": meta.address,
