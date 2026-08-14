@@ -653,3 +653,26 @@ fn blob_storage_queries_match_text_params() {
         "sync_holder_counts must backfill stale counts"
     );
 }
+
+#[test]
+fn huge_page_numbers_do_not_panic() {
+    use nvnmchain_explorer::db::{self, Db};
+    use std::sync::{Arc, Mutex};
+
+    // `page` is user input; u32 offset math overflowed (a panic under
+    // debug assertions, a garbage offset in release).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pages.db");
+    let db: Db = Arc::new(Mutex::new(
+        db::init_db(path.to_str().unwrap()).expect("init_db"),
+    ));
+
+    assert!(
+        db::get_address_transactions(&db, &format!("0x{}", "11".repeat(20)), u32::MAX, 25)
+            .is_empty()
+    );
+    assert!(
+        db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
+    );
+    assert!(db::get_all_tokens(&db, u32::MAX, 25).is_empty());
+}
