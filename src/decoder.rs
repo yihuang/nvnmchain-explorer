@@ -351,10 +351,21 @@ fn additional_sigs() -> &'static [&'static str] {
         "decimals()",
         "allowance(address owner, address spender)",
         // AccountKeychain. `KeyRestrictions` is spelled as the tuple it
-        // expands to, since the selector hashes the expansion.
+        // expands to, since the selector hashes the expansion. `authorizeKey`
+        // is overloaded three times, each overload with its own selector.
+        "authorizeKey(address keyId, uint8 signatureType, uint64 expiry, bool enforceLimits, \
+         (address,uint256)[] limits)",
         "authorizeKey(address keyId, uint8 signatureType, \
          (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions)",
+        "authorizeKey(address keyId, uint8 signatureType, \
+         (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions, \
+         bytes32 witness)",
+        "authorizeAdminKey(address keyId, uint8 signatureType, bytes32 witness)",
+        "burnKeyAuthorizationWitness(bytes32 witness)",
         "revokeKey(address keyId)",
+        "updateSpendingLimit(address keyId, address token, uint256 newLimit)",
+        "setAllowedCalls(address keyId, (address,(bytes4,address[])[])[] scopes)",
+        "removeAllowedCalls(address keyId, address target)",
     ]
 }
 
