@@ -1,11 +1,14 @@
 //! Background indexer tuned for a sub-second chain.
 //!
 //! New heads arrive instantly via a WebSocket `newHeads` subscription (with a
-//! polling fallback). Blocks are *fetched* concurrently (batched receipts,
-//! single `debug_traceBlockByNumber` call) and *written* by one serialized
-//! SQLite writer, one transaction per block.
+//! polling fallback). Blocks are fetched in multi-block JSON-RPC HTTP batches
+//! (receipts only when a block has transactions) and written by one serialized
+//! SQLite writer. Tip catch-up is coalesced and windowed so the writer is not
+//! left idle; backfill yields the RPC when the tip falls behind.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -18,11 +21,20 @@ use tracing::{info, warn};
 use crate::anchoring::ANCHORING_ADDRESS;
 use crate::config::Settings;
 use crate::db::{self, Db};
-use crate::decoder::{checksum_address, decode_event, flatten_trace};
+use crate::decoder::{checksum_address, decode_event};
 use crate::models::{AnchoredEvent, BlockBundle, RegistryDeployed, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::tokens::fetch_token_metadata;
+
+/// How many blocks share one JSON-RPC HTTP request. Sixteen empty blocks
+/// (32 methods when receipts are included) measured at ~265ms against the
+/// public RPC — one RTT for a range that used to be 16 separate connections.
+const RPC_BLOCK_BATCH: u64 = 16;
+
+/// How far the indexed tip may lag before backfill yields the RPC so catch-up
+/// is not starved by history.
+const TIP_YIELD_LAG: u64 = 16;
 
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
@@ -47,118 +59,67 @@ impl IndexerConfig {
     }
 }
 
-/// Fetch a block and everything attached to it: transactions, receipts
-/// (one batched call), traces (one call), transfers, and fee-token metadata.
+/// Fetch a block and everything attached to it: transactions, receipts when
+/// the block has any, transfers, and fee-token metadata.
 pub async fn fetch_block_bundle(rpc: &ChainRpc, block_num: u64) -> Result<Option<BlockBundle>> {
-    fetch_block_bundle_with_cache(rpc, Arc::new(Mutex::new(HashSet::new())), block_num).await
+    let mut bundles = fetch_block_bundles(
+        rpc,
+        Arc::new(Mutex::new(HashSet::new())),
+        block_num..=block_num,
+    )
+    .await?;
+    Ok(bundles.pop())
 }
 
-/// Like [`fetch_block_bundle`], but skips token-metadata fetches for addresses
-/// already known to the indexer (shared across concurrent block tasks).
-pub async fn fetch_block_bundle_with_cache(
-    rpc: &ChainRpc,
-    known_tokens: Arc<Mutex<HashSet<String>>>,
-    block_num: u64,
-) -> Result<Option<BlockBundle>> {
-    // Exactly three RPC calls for the whole block, sent as one batched
-    // request: block with tx bodies, receipts, trace. Each can fail
-    // independently (tracing is unsupported on some chains).
-    let num_hex = format!("0x{block_num:x}");
-    let results = rpc
-        .batch_call(vec![
-            (
-                "eth_getBlockByNumber".to_string(),
-                json!([num_hex.clone(), true]),
-            ),
-            ("eth_getBlockReceipts".to_string(), json!([num_hex.clone()])),
-            (
-                "debug_traceBlockByNumber".to_string(),
-                json!([num_hex, {"tracer": "callTracer"}]),
-            ),
-        ])
-        .await?;
-    let mut iter = results.into_iter();
-    let Some(Ok(raw_block)) = iter.next() else {
-        warn!("block {block_num} not found");
-        return Ok(None);
-    };
-    if raw_block.is_null() {
-        warn!("block {block_num} not found");
-        return Ok(None);
-    }
-    let receipts = iter.next().and_then(|r| r.ok());
-    let trace_result = iter.next().and_then(|r| r.ok());
+/// Split `from..=to` into contiguous chunks of at most `batch` blocks.
+fn block_chunks(from: u64, to: u64, batch: u64) -> impl Iterator<Item = RangeInclusive<u64>> {
+    let batch = batch.max(1);
+    std::iter::successors((from <= to).then_some(from), move |&start| {
+        start.checked_add(batch).filter(|&next| next <= to)
+    })
+    .map(move |start| start..=start.saturating_add(batch - 1).min(to))
+}
 
-    let block = parse_block(&raw_block);
-    let raw_txs = raw_block
-        .get("transactions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    // Traces (unsupported on this chain — degrades to no trace data).
-    let mut trace_map: HashMap<String, Vec<Value>> = HashMap::new();
-    if !raw_txs.is_empty() {
-        if let Some(traces) = trace_result {
-            if let Some(entries) = traces.as_array() {
-                for entry in entries {
-                    let tx_hash = entry
-                        .get("txHash")
-                        .or_else(|| entry.get("transactionHash"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    if tx_hash.is_empty() {
-                        continue;
-                    }
-                    let result = entry.get("result").unwrap_or(entry);
-                    trace_map.insert(tx_hash.to_string(), flatten_trace(result));
-                }
-            }
-        }
-    }
-
-    // Receipts by block, keyed by tx hash.
-    let receipt_by_hash: HashMap<String, Value> = match receipts {
+/// One non-null `eth_getBlockByNumber(full=true)` result plus optional
+/// receipts. Token metadata is filled in later — this is pure CPU.
+fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
+    let block = parse_block(raw_block);
+    let receipt_by_hash: HashMap<&str, &Value> = match receipts {
         Some(Value::Array(receipts)) => receipts
             .iter()
             .filter_map(|r| {
                 r.get("transactionHash")
                     .and_then(Value::as_str)
-                    .map(|h| (h.to_string(), r.clone()))
+                    .map(|h| (h, r))
             })
             .collect(),
         _ => HashMap::new(),
     };
 
+    let raw_txs = raw_block
+        .get("transactions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
     let mut anchored = Vec::new();
     let mut registries = Vec::new();
-    let mut transfer_tokens: HashSet<String> = HashSet::new();
-    // Running log index across the whole block. Receipts normally carry a
-    // unique `logIndex`; when one is missing or mangled the counter fills in
-    // a unique value so the DB's (block_number, log_index) key never
-    // collides within a block.
     let mut next_log_index = 0u64;
 
-    for tx_data in &raw_txs {
+    for tx_data in raw_txs {
         let tx_hash = tx_data.get("hash").and_then(Value::as_str).unwrap_or("");
         if tx_hash.is_empty() {
             continue;
         }
         let mut tx = parse_transaction(tx_data, &block);
         tx.timestamp = block.timestamp;
-        // Canonical RLP: re-encode the RPC object with the official tempo
-        // primitives (the block response already carries the full signed tx,
-        // so no extra per-tx RPC is needed). Byte-identical to the node's
-        // `eth_getRawTransactionByHash` for the 0x76 type.
+        // Re-encode the RPC object with the official tempo primitives; the
+        // block already carries the signed tx, so no extra per-tx RPC.
         if let Ok(signed) = serde_json::from_value::<crate::tempo::AASigned>(tx_data.clone()) {
             let mut buf = Vec::new();
             signed.eip2718_encode(&mut buf);
             tx.raw = Some(format!("0x{}", hex::encode(buf)));
-        }
-        if let Some(flat) = trace_map.get(tx_hash) {
-            tx.trace_data = Some(serde_json::to_string(flat).unwrap_or_else(|_| "[]".into()));
         }
         if let Some(receipt) = receipt_by_hash.get(tx_hash) {
             apply_receipt(
@@ -167,55 +128,153 @@ pub async fn fetch_block_bundle_with_cache(
                 &mut transfers,
                 &mut anchored,
                 &mut registries,
-                &mut transfer_tokens,
                 &mut next_log_index,
             );
         }
         txs.push(tx);
     }
 
-    // Token metadata (fee tokens + transfer tokens) is network I/O; fetch
-    // concurrently for addresses the indexer hasn't seen yet, best-effort.
-    let mut tokens = Vec::new();
-    let mut unseen: Vec<String> = Vec::new();
-    for addr in &transfer_tokens {
-        if !known_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(addr)
-        {
-            unseen.push(addr.clone());
-        }
-    }
-    if !unseen.is_empty() {
-        let mut set = tokio::task::JoinSet::new();
-        for addr in &unseen {
-            let rpc = rpc.clone();
-            let addr = addr.clone();
-            set.spawn(async move { fetch_token_metadata(&rpc, &addr).await });
-        }
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok(meta) => {
-                    known_tokens
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(meta.address.clone());
-                    tokens.push(meta);
-                }
-                Err(e) => warn!("token metadata task failed: {e:#}"),
-            }
-        }
-    }
-
-    Ok(Some(BlockBundle {
+    BlockBundle {
         block,
         txs,
         transfers,
         anchored,
-        tokens,
+        tokens: Vec::new(),
         registries,
-    }))
+    }
+}
+
+/// Fetch `nums` in one HTTP request of `eth_getBlockByNumber`, then a second
+/// request of `eth_getBlockReceipts` only for blocks that have transactions.
+async fn fetch_raw_blocks(
+    rpc: &ChainRpc,
+    nums: RangeInclusive<u64>,
+) -> Result<Vec<(Value, Option<Value>)>> {
+    if nums.is_empty() {
+        return Ok(Vec::new());
+    }
+    let calls: Vec<(String, Value)> = nums
+        .clone()
+        .map(|n| {
+            (
+                "eth_getBlockByNumber".into(),
+                json!([format!("0x{n:x}"), true]),
+            )
+        })
+        .collect();
+    let results = rpc.batch_call(calls).await?;
+
+    let mut blocks = Vec::with_capacity(results.len());
+    let mut need_receipts = Vec::new();
+    for (num, res) in nums.zip(results) {
+        match res {
+            Ok(v) if !v.is_null() => {
+                let has_txs = v
+                    .get("transactions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|txs| !txs.is_empty());
+                if has_txs {
+                    need_receipts.push((blocks.len(), num));
+                }
+                blocks.push((v, None));
+            }
+            Ok(_) => warn!("block {num} not found"),
+            Err(e) => warn!("getBlock({num}) failed: {e}"),
+        }
+    }
+    if need_receipts.is_empty() {
+        return Ok(blocks);
+    }
+
+    let calls: Vec<(String, Value)> = need_receipts
+        .iter()
+        .map(|(_, n)| ("eth_getBlockReceipts".into(), json!([format!("0x{n:x}")])))
+        .collect();
+    match rpc.batch_call(calls).await {
+        Ok(results) => {
+            for ((idx, num), res) in need_receipts.into_iter().zip(results) {
+                match res {
+                    Ok(v) => blocks[idx].1 = Some(v),
+                    Err(e) => warn!("getBlockReceipts({num}) failed: {e}"),
+                }
+            }
+        }
+        Err(e) => warn!("receipts batch failed: {e:#}"),
+    }
+    Ok(blocks)
+}
+
+async fn fetch_block_bundles(
+    rpc: &ChainRpc,
+    known_tokens: Arc<Mutex<HashSet<String>>>,
+    nums: RangeInclusive<u64>,
+) -> Result<Vec<BlockBundle>> {
+    let mut bundles: Vec<BlockBundle> = fetch_raw_blocks(rpc, nums)
+        .await?
+        .iter()
+        .map(|(raw, receipts)| assemble_bundle(raw, receipts.as_ref()))
+        .collect();
+    attach_token_metadata(rpc, &known_tokens, &mut bundles).await;
+    Ok(bundles)
+}
+
+fn bundle_token_addrs(bundle: &BlockBundle) -> impl Iterator<Item = &str> {
+    bundle
+        .transfers
+        .iter()
+        .map(|t| t.token_addr.as_str())
+        .chain(bundle.txs.iter().filter_map(|t| t.fee_token.as_deref()))
+}
+
+async fn attach_token_metadata(
+    rpc: &ChainRpc,
+    known_tokens: &Arc<Mutex<HashSet<String>>>,
+    bundles: &mut [BlockBundle],
+) {
+    let mut unseen = HashSet::new();
+    {
+        let known = known_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        for bundle in bundles.iter() {
+            for addr in bundle_token_addrs(bundle) {
+                if !known.contains(addr) {
+                    unseen.insert(addr.to_string());
+                }
+            }
+        }
+    }
+    if unseen.is_empty() {
+        return;
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for addr in unseen {
+        let rpc = rpc.clone();
+        set.spawn(async move { fetch_token_metadata(&rpc, &addr).await });
+    }
+    let mut metas = HashMap::new();
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(meta) => {
+                metas.insert(meta.address.clone(), meta);
+            }
+            Err(e) => warn!("token metadata task failed: {e:#}"),
+        }
+    }
+    known_tokens
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(metas.keys().cloned());
+
+    for bundle in bundles.iter_mut() {
+        // Deduped: one token backs every transfer of it in the block, and the
+        // rows are upserted by address.
+        let tokens: Vec<_> = bundle_token_addrs(bundle)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter_map(|addr| metas.get(addr).cloned())
+            .collect();
+        bundle.tokens = tokens;
+    }
 }
 
 fn apply_receipt(
@@ -224,7 +283,6 @@ fn apply_receipt(
     transfers: &mut Vec<TransferEvent>,
     anchored: &mut Vec<AnchoredEvent>,
     registries: &mut Vec<RegistryDeployed>,
-    transfer_tokens: &mut HashSet<String>,
     next_log_index: &mut u64,
 ) {
     tx.receipt_data = Some(serde_json::to_string(receipt).unwrap_or_else(|_| "{}".into()));
@@ -247,9 +305,7 @@ fn apply_receipt(
         tx.contract_address = Some(checksum_address(addr));
     }
     if let Some(fee_token) = receipt.get("feeToken").and_then(Value::as_str) {
-        let fee_token = checksum_address(fee_token);
-        tx.fee_token = Some(fee_token.clone());
-        transfer_tokens.insert(fee_token);
+        tx.fee_token = Some(checksum_address(fee_token));
     }
     if let Some(fee_amount) = receipt.get("feeAmount") {
         tx.fee_amount = match fee_amount {
@@ -366,14 +422,13 @@ fn apply_receipt(
             tx_hash: tx.hash.clone(),
             block_number: tx.block_number,
             log_index,
-            token_addr: token.clone(),
+            token_addr: token,
             from_addr: from,
             to_addr: to,
             amount,
             timestamp: tx.timestamp,
             created_at: db::now_ts(),
         });
-        transfer_tokens.insert(token.clone());
     }
 }
 
@@ -482,139 +537,147 @@ async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, dur: Duration) 
     }
 }
 
-/// Index every block in `from..=to`, fetching up to `concurrency` in
-/// parallel, and return the bundles in number order (the caller decides how
-/// to persist/broadcast them — this lets the forward loop emit a gapless live
-/// feed regardless of fetch completion order or writer timing).
-async fn index_range_concurrent(
-    rpc: &ChainRpc,
-    from: u64,
-    to: u64,
-    concurrency: usize,
-    known_tokens: Arc<Mutex<HashSet<String>>>,
-    shutdown: &watch::Receiver<bool>,
-) -> Vec<BlockBundle> {
-    if from > to {
-        return Vec::new();
-    }
-    let mut set = tokio::task::JoinSet::new();
-    let mut next = to;
-    let mut remaining = to - from + 1;
-    // Cap the reservation: ranges can be huge after downtime (forward loop
-    // catch-up), and each bundle is a sizable struct.
-    let mut out = Vec::with_capacity((to - from + 1).min(16384) as usize);
-    loop {
-        // Abort in-flight fetches as soon as shutdown is requested.
-        if *shutdown.borrow() {
-            set.abort_all();
-            break;
-        }
-        while remaining > 0 && set.len() < concurrency {
-            let rpc = rpc.clone();
-            let known = known_tokens.clone();
-            let num = next;
-            set.spawn(async move {
-                match fetch_block_bundle_with_cache(&rpc, known, num).await {
-                    Ok(Some(bundle)) => Some(bundle),
-                    Ok(None) => {
-                        warn!("block {num} not found");
-                        None
-                    }
-                    Err(e) => {
-                        warn!("index_block({num}) failed: {e:#}");
-                        None
-                    }
-                }
-            });
-            next = next.wrapping_sub(1);
-            remaining -= 1;
-        }
-        if set.is_empty() {
-            break;
-        }
-        if let Some(Ok(Some(bundle))) = set.join_next().await {
-            out.push(bundle);
-        }
-    }
-    out.sort_by_key(|b| b.block.number);
-    out
-}
-
-async fn forward_loop(
+/// Shared state for the forward and backfill loops.
+#[derive(Clone)]
+struct Indexer {
     rpc: ChainRpc,
     db: Db,
     cfg: IndexerConfig,
-    bundle_tx: mpsc::Sender<BlockBundle>,
     known_tokens: Arc<Mutex<HashSet<String>>>,
+    bundle_tx: mpsc::Sender<BlockBundle>,
     shutdown: watch::Receiver<bool>,
-    block_events: broadcast::Sender<Value>,
-) {
-    let (head_tx, mut head_rx) = mpsc::channel::<u64>(256);
-    let watcher_rpc = rpc.clone();
-    let ws_url = cfg.ws_url.clone();
-    let index_ws = cfg.index_ws;
-    let poll = cfg.poll;
-    let watcher_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        crate::ws::head_watcher(
-            watcher_rpc,
-            ws_url,
-            index_ws,
-            poll,
-            head_tx,
-            watcher_shutdown,
-        )
-        .await;
-    });
+    tip_lag: Arc<AtomicU64>,
+}
 
-    let mut sent = db::get_latest_block(&db)
+impl Indexer {
+    fn shutting_down(&self) -> bool {
+        *self.shutdown.borrow()
+    }
+
+    fn set_tip_lag(&self, lag: u64) {
+        self.tip_lag.store(lag, Ordering::Relaxed);
+    }
+
+    /// Fetch `from..=to` as multi-block RPC batches, returning bundles in
+    /// number order so the caller can emit a gapless live feed.
+    async fn fetch_range(&self, from: u64, to: u64) -> Vec<BlockBundle> {
+        if from > to {
+            return Vec::new();
+        }
+        let inflight = (self.cfg.concurrency.max(1) as u64).div_ceil(RPC_BLOCK_BATCH) as usize;
+        let mut chunks = block_chunks(from, to, RPC_BLOCK_BATCH);
+        let mut set = tokio::task::JoinSet::new();
+        let mut out = Vec::with_capacity((to - from + 1).min(16384) as usize);
+        loop {
+            if self.shutting_down() {
+                set.abort_all();
+                break;
+            }
+            while set.len() < inflight {
+                let Some(chunk) = chunks.next() else {
+                    break;
+                };
+                let rpc = self.rpc.clone();
+                let known = self.known_tokens.clone();
+                set.spawn(async move { fetch_block_bundles(&rpc, known, chunk).await });
+            }
+            if set.is_empty() {
+                break;
+            }
+            match set.join_next().await {
+                Some(Ok(Ok(bundles))) => out.extend(bundles),
+                Some(Ok(Err(e))) => warn!("index range fetch failed: {e:#}"),
+                Some(Err(e)) => warn!("index range task failed: {e:#}"),
+                None => break,
+            }
+        }
+        out.sort_by_key(|b| b.block.number);
+        out
+    }
+
+    async fn send_bundles(&self, bundles: impl IntoIterator<Item = BlockBundle>) -> bool {
+        for b in bundles {
+            if self.bundle_tx.send(b).await.is_err() {
+                warn!("writer stopped");
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Collapse every queued head into the highest one seen. The watcher polls and
+/// subscribes concurrently, so a slow poll can deliver a stale head after a
+/// newer one — taking the last would walk the tip backwards.
+fn drain_heads(rx: &mut mpsc::Receiver<u64>, mut head: u64) -> u64 {
+    while let Ok(n) = rx.try_recv() {
+        head = head.max(n);
+    }
+    head
+}
+
+/// Fresh DB: wait for backfill to seed the head so this loop never tries to
+/// index the whole history, and so the two loops don't fetch the same blocks.
+async fn wait_for_seed(db: &Db) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(b) = db::get_latest_block(db) {
+            return b.number as u64;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return 0;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn forward_loop(ix: Indexer, block_events: broadcast::Sender<Value>) {
+    let (head_tx, mut head_rx) = mpsc::channel::<u64>(256);
+    tokio::spawn(crate::ws::head_watcher(
+        ix.rpc.clone(),
+        ix.cfg.ws_url.clone(),
+        ix.cfg.index_ws,
+        ix.cfg.poll,
+        head_tx,
+        ix.shutdown.clone(),
+    ));
+
+    let mut sent = db::get_latest_block(&ix.db)
         .map(|b| b.number as u64)
         .unwrap_or(0);
     info!("forward loop started from block {sent}");
 
     while let Some(head) = head_rx.recv().await {
-        if *shutdown.borrow() {
+        if ix.shutting_down() {
             break;
         }
-        // Track the chain tip for the home page's index-progress display.
-        db::set_chain_head(&db, head as i64);
+        // A fast head feed delivers every block; fold queued heads into one
+        // range so we fetch a batch instead of one HTTP request per block.
+        let mut head = drain_heads(&mut head_rx, head);
+        db::set_chain_head(&ix.db, head as i64);
+
         if sent == 0 && head > 0 {
-            // Fresh DB: the backfill loop seeds history (including the head).
-            // Wait for its first write so the loops don't both fetch the
-            // same blocks — and never try to index the whole history here.
-            let mut waited = Duration::ZERO;
-            while db::get_latest_block(&db).is_none() && waited < Duration::from_secs(5) {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                waited += Duration::from_millis(100);
-            }
-            sent = db::get_latest_block(&db)
-                .map(|b| b.number as u64)
-                .unwrap_or(0);
-            if sent == 0 {
-                // Backfill hasn't seeded anything yet; wait for the next head
-                // instead of attempting a full-history range.
-                continue;
-            }
-            if sent >= head {
+            sent = wait_for_seed(&ix.db).await;
+            if sent == 0 || sent >= head {
                 continue;
             }
         }
-        if head > sent {
+        if head > sent + 1 {
             info!("new blocks: {sent} -> {head} (+{})", head - sent);
-            let bundles = index_range_concurrent(
-                &rpc,
-                sent + 1,
-                head,
-                cfg.concurrency,
-                known_tokens.clone(),
-                &shutdown,
-            )
-            .await;
-            // Live feed, emitted strictly in number order from the fetched
-            // bundles: concurrent fetches complete out of order, and the
-            // writer persists asynchronously, so neither can be broadcast
-            // directly. Backfill history never reaches this loop, so the
-            // stream stays tip-only and gapless.
+        }
+        // Window the catch-up so the writer starts before a large gap has
+        // finished fetching, and so memory stays bounded.
+        while sent < head {
+            if ix.shutting_down() {
+                return;
+            }
+            head = drain_heads(&mut head_rx, head);
+            db::set_chain_head(&ix.db, head as i64);
+            let end = sent.saturating_add(ix.cfg.batch).min(head);
+            ix.set_tip_lag(head.saturating_sub(sent));
+            let bundles = ix.fetch_range(sent + 1, end).await;
+            // Live feed is tip-only and in number order: concurrent fetches
+            // complete out of order, and backfill must not reach viewers.
             for b in &bundles {
                 let _ = block_events.send(crate::models::block_event_json(
                     &b.block,
@@ -622,104 +685,82 @@ async fn forward_loop(
                     crate::models::STREAM_TX_CAP,
                 ));
             }
-            for b in bundles {
-                if bundle_tx.send(b).await.is_err() {
-                    warn!("writer stopped; forward loop exiting");
-                    return;
-                }
+            if !ix.send_bundles(bundles).await {
+                return;
             }
-            sent = head;
+            sent = end;
         }
+        ix.set_tip_lag(0);
     }
     warn!("forward loop stopped (head feed closed)");
 }
 
-async fn backfill_loop(
-    rpc: ChainRpc,
-    db: Db,
-    cfg: IndexerConfig,
-    bundle_tx: mpsc::Sender<BlockBundle>,
-    known_tokens: Arc<Mutex<HashSet<String>>>,
-    mut shutdown: watch::Receiver<bool>,
-) {
+async fn backfill_loop(mut ix: Indexer) {
     info!(
         "backfill loop started (batch {}, concurrency {})",
-        cfg.batch, cfg.concurrency
+        ix.cfg.batch, ix.cfg.concurrency
     );
 
+    // In-memory descending frontier: advancing this without waiting for the
+    // writer lets the next fetch overlap the previous commit. Writes are
+    // idempotent, so a crash just re-fetches the last in-flight batch.
+    let mut frontier: Option<u64> = db::get_min_block_number(&ix.db).map(|n| n as u64);
     let mut consecutive_failures = 0u32;
     loop {
-        if *shutdown.borrow() {
+        if ix.shutting_down() {
             break;
         }
-        let target = match db::get_min_block_number(&db) {
-            Some(min) if min > 1 => min as u64,
+        if ix.tip_lag.load(Ordering::Relaxed) > TIP_YIELD_LAG {
+            if sleep_or_shutdown(&mut ix.shutdown, Duration::from_millis(50)).await {
+                break;
+            }
+            continue;
+        }
+        let target = match frontier {
+            Some(min) if min > 1 => min,
             Some(_) => {
-                // Fully backfilled; nothing to do until history changes.
-                if sleep_or_shutdown(&mut shutdown, cfg.poll).await {
+                if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
                     break;
                 }
+                frontier = db::get_min_block_number(&ix.db).map(|n| n as u64);
                 continue;
             }
-            None => {
-                // Fresh DB: seed the descending frontier at the head so
-                // history is indexed down to block 1 (the head itself is
-                // written first, which the forward loop waits for).
-                match rpc.eth_block_number().await {
-                    Ok(head) => head + 1,
-                    Err(e) => {
-                        warn!("backfill head fetch failed: {e:#}");
-                        if sleep_or_shutdown(&mut shutdown, cfg.poll).await {
-                            break;
-                        }
-                        continue;
+            None => match ix.rpc.eth_block_number().await {
+                Ok(head) => head + 1,
+                Err(e) => {
+                    warn!("backfill head fetch failed: {e:#}");
+                    if sleep_or_shutdown(&mut ix.shutdown, ix.cfg.poll).await {
+                        break;
                     }
+                    continue;
                 }
-            }
+            },
         };
-        let start = target.saturating_sub(cfg.batch).max(1);
-        let bundles = index_range_concurrent(
-            &rpc,
-            start,
-            target - 1,
-            cfg.concurrency,
-            known_tokens.clone(),
-            &shutdown,
-        )
-        .await;
-        // Send tip-first so the head lands in the DB as soon as possible
-        // (the forward loop waits for it on a fresh database).
-        for b in bundles.into_iter().rev() {
-            if bundle_tx.send(b).await.is_err() {
-                warn!("writer stopped; backfill loop exiting");
-                return;
-            }
-        }
-        // The writer persists asynchronously; wait until this batch is on
-        // disk so the progress check below isn't reading stale state.
-        // (`min == 0` means the table is still empty — keep waiting.)
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let min = db::get_min_block_number(&db).unwrap_or(0) as u64;
-            let persisted = min != 0 && min <= start;
-            if persisted || *shutdown.borrow() || tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        let new_min = db::get_min_block_number(&db).unwrap_or(0) as u64;
-        if new_min >= target {
-            // Nothing was persisted; back off instead of spinning.
+        let start = target.saturating_sub(ix.cfg.batch).max(1);
+        let bundles = ix.fetch_range(start, target - 1).await;
+        if bundles.is_empty() {
             consecutive_failures += 1;
             let backoff = Duration::from_millis(200 * consecutive_failures.min(10) as u64);
-            if sleep_or_shutdown(&mut shutdown, backoff).await {
+            if sleep_or_shutdown(&mut ix.shutdown, backoff).await {
                 break;
             }
-        } else {
-            consecutive_failures = 0;
-            info!("backfill: {} remaining", new_min.saturating_sub(1));
+            continue;
         }
+        // Blocks the range failed to fetch must stay above the frontier or
+        // nothing ever revisits them: it only descends, and a hole below it is
+        // out of reach. `fetch_range` sorts, so the first bundle is the lowest.
+        let reached = bundles
+            .first()
+            .map(|b| b.block.number as u64)
+            .unwrap_or(start);
+        // Tip-first so the head lands in the DB as soon as possible (the
+        // forward loop waits for it on a fresh database).
+        if !ix.send_bundles(bundles.into_iter().rev()).await {
+            return;
+        }
+        frontier = Some(reached);
+        consecutive_failures = 0;
+        info!("backfill: {} remaining", reached.saturating_sub(1));
     }
 }
 
@@ -843,23 +884,17 @@ pub async fn run_forever(
         }
     });
 
-    let forward = tokio::spawn(forward_loop(
-        rpc.clone(),
-        db.clone(),
-        cfg.clone(),
-        bundle_tx.clone(),
-        known_tokens.clone(),
-        shutdown.clone(),
-        block_events.clone(),
-    ));
-    let backfill = tokio::spawn(backfill_loop(
-        rpc.clone(),
-        db.clone(),
-        cfg.clone(),
-        bundle_tx.clone(),
-        known_tokens.clone(),
+    let ix = Indexer {
+        rpc,
+        db,
+        cfg,
+        known_tokens,
+        bundle_tx: bundle_tx.clone(),
         shutdown,
-    ));
+        tip_lag: Arc::new(AtomicU64::new(0)),
+    };
+    let forward = tokio::spawn(forward_loop(ix.clone(), block_events));
+    let backfill = tokio::spawn(backfill_loop(ix));
     drop(bundle_tx);
 
     tokio::select! {
@@ -1013,6 +1048,7 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decoder::TRANSFER_TOPIC;
 
     /// An `Anchored` log as a node reports it, from `emitter`.
     fn anchored_log(emitter: &str, caller: &str) -> Value {
@@ -1052,14 +1088,13 @@ mod tests {
         };
         let receipt = json!({"status": "0x1", "logs": logs});
         let (mut anchored, mut transfers, mut registries) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut tokens, mut next_log_index) = (HashSet::new(), 0u64);
+        let mut next_log_index = 0u64;
         apply_receipt(
             &mut tx,
             &receipt,
             &mut transfers,
             &mut anchored,
             &mut registries,
-            &mut tokens,
             &mut next_log_index,
         );
         (tx, anchored)
@@ -1092,5 +1127,98 @@ mod tests {
             &caller,
         )]);
         assert_eq!(anchored.len(), 1);
+    }
+
+    fn chunks(from: u64, to: u64, batch: u64) -> Vec<RangeInclusive<u64>> {
+        block_chunks(from, to, batch).collect()
+    }
+
+    #[test]
+    fn block_chunks_splits_range() {
+        assert_eq!(chunks(1, 40, 16), vec![1..=16, 17..=32, 33..=40]);
+        assert_eq!(chunks(7, 7, 16), vec![7..=7]);
+        assert_eq!(chunks(1, 3, 1), vec![1..=1, 2..=2, 3..=3]);
+        assert!(chunks(5, 4, 16).is_empty());
+        // A zero batch would otherwise chunk forever.
+        assert_eq!(chunks(1, 2, 0), vec![1..=1, 2..=2]);
+        // The final chunk stops at `to` rather than overflowing past it.
+        assert_eq!(
+            chunks(u64::MAX - 1, u64::MAX, 16),
+            vec![u64::MAX - 1..=u64::MAX]
+        );
+    }
+
+    #[test]
+    fn drain_heads_keeps_the_highest() {
+        let (tx, mut rx) = mpsc::channel::<u64>(8);
+        // The watcher polls and subscribes concurrently, so a slow poll can
+        // deliver a stale head after a newer subscription one.
+        for n in [104u64, 107, 105] {
+            tx.try_send(n).expect("queue head");
+        }
+        assert_eq!(drain_heads(&mut rx, 103), 107);
+        // Nothing queued leaves the caller's head untouched.
+        assert_eq!(drain_heads(&mut rx, 107), 107);
+    }
+
+    #[test]
+    fn assemble_empty_block_without_receipts() {
+        let raw = json!({
+            "number": "0x10",
+            "hash": format!("0x{}", "ab".repeat(32)),
+            "parentHash": format!("0x{}", "cd".repeat(32)),
+            "timestamp": "0x64",
+            "transactions": [],
+        });
+        let bundle = assemble_bundle(&raw, None);
+        assert_eq!(bundle.block.number, 16);
+        assert_eq!(bundle.block.tx_count, 0);
+        assert!(bundle.txs.is_empty());
+        assert!(bundle.transfers.is_empty());
+    }
+
+    #[test]
+    fn assemble_decodes_transfer_receipt() {
+        let from = format!("0x{}", "1a".repeat(20));
+        let to = format!("0x{}", "2b".repeat(20));
+        let token = format!("0x{}", "aa".repeat(20));
+        let tx_hash = format!("0x{}", "ff".repeat(32));
+        let raw = json!({
+            "number": "0x10",
+            "hash": format!("0x{}", "ab".repeat(32)),
+            "parentHash": format!("0x{}", "cd".repeat(32)),
+            "timestamp": "0x64",
+            "transactions": [{
+                "hash": tx_hash,
+                "blockNumber": "0x10",
+                "transactionIndex": "0x0",
+                "from": from,
+                "to": token,
+                "input": "0x",
+            }],
+        });
+        let receipts = json!([{
+            "transactionHash": tx_hash,
+            "status": "0x1",
+            "gasUsed": "0x5208",
+            "logs": [{
+                "address": token,
+                "logIndex": "0x0",
+                "topics": [
+                    TRANSFER_TOPIC,
+                    format!("0x{}{}", "00".repeat(12), from.trim_start_matches("0x")),
+                    format!("0x{}{}", "00".repeat(12), to.trim_start_matches("0x")),
+                ],
+                "data": format!("0x{:064x}", 100u64),
+            }],
+        }]);
+        let bundle = assemble_bundle(&raw, Some(&receipts));
+        assert_eq!(bundle.txs.len(), 1);
+        assert_eq!(bundle.txs[0].status, 1);
+        assert_eq!(bundle.transfers.len(), 1);
+        assert_eq!(bundle.transfers[0].from_addr, checksum_address(&from));
+        assert_eq!(bundle.transfers[0].to_addr, checksum_address(&to));
+        assert_eq!(bundle.transfers[0].amount, "100");
+        assert_eq!(bundle.transfers[0].token_addr, checksum_address(&token));
     }
 }

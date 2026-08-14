@@ -334,19 +334,28 @@ impl ChainRpc {
             .to_string())
     }
 
-    /// Trace a transaction with the callTracer; `None` when tracing is
-    /// unavailable.
-    pub async fn debug_trace_transaction(&self, tx_hash: &str) -> Option<Value> {
+    /// Trace a transaction with the callTracer, keeping the node's error so a
+    /// caller can tell "this node cannot trace" from "nothing to say about this
+    /// transaction" — the two want different handling.
+    pub async fn try_debug_trace_transaction(&self, tx_hash: &str) -> Result<Value> {
         self.call(
             "debug_traceTransaction",
             json!([tx_hash, {"tracer": "callTracer"}]),
         )
         .await
-        .ok()
-        .filter(|v| !v.is_null())
     }
 
-    /// Trace all transactions in a block with the callTracer.
+    /// Trace a transaction with the callTracer; `None` when tracing is
+    /// unavailable. Not on the index path — kept for debugging.
+    pub async fn debug_trace_transaction(&self, tx_hash: &str) -> Option<Value> {
+        self.try_debug_trace_transaction(tx_hash)
+            .await
+            .ok()
+            .filter(|v| !v.is_null())
+    }
+
+    /// Trace all transactions in a block with the callTracer. Not on the index
+    /// path — kept for debugging.
     pub async fn debug_trace_block(&self, block_num: u64) -> Option<Value> {
         self.call(
             "debug_traceBlockByNumber",
