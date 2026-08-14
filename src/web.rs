@@ -17,7 +17,7 @@ use futures_util::stream::unfold;
 use num_bigint::BigInt;
 use serde_json::{json, Value};
 use tera::Tera;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tower_http::cors::CorsLayer;
 
 use crate::config::Settings;
@@ -39,6 +39,9 @@ pub struct AppState {
     pub tera: Arc<Tera>,
     /// Live stream of indexed blocks, fed by the indexer writer task.
     pub block_events: broadcast::Sender<Value>,
+    /// Flipped on SIGINT/SIGTERM. The SSE stream ends when it flips; since
+    /// this state owns a `block_events` sender, it never ends on its own.
+    pub shutdown: watch::Receiver<bool>,
 }
 
 fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
@@ -316,6 +319,7 @@ pub async fn events(State(state): State<AppState>) -> Response {
     let stream = unfold(
         SseState {
             rx,
+            shutdown: state.shutdown.clone(),
             db: state.db.clone(),
             pending: std::collections::VecDeque::new(),
             last_num: -1,
@@ -334,6 +338,7 @@ pub async fn events(State(state): State<AppState>) -> Response {
 
 struct SseState {
     rx: broadcast::Receiver<Value>,
+    shutdown: watch::Receiver<bool>,
     db: Db,
     /// Catch-up events (blocks replayed after a broadcast lag).
     pending: std::collections::VecDeque<Value>,
@@ -352,6 +357,11 @@ fn sse_event(payload: &Value) -> Result<Event, std::convert::Infallible> {
 async fn sse_step(
     mut state: SseState,
 ) -> Option<(Result<Event, std::convert::Infallible>, SseState)> {
+    // Ending the stream is what lets graceful shutdown finish: axum waits
+    // for in-flight connections, and this one never ends on its own.
+    if *state.shutdown.borrow() {
+        return None;
+    }
     // Initial event: the current tip (with its transactions), so the panels
     // are populated immediately on connect.
     if !state.sent_initial {
@@ -369,7 +379,12 @@ async fn sse_step(
         return Some((sse_event(&v), state));
     }
     loop {
-        match state.rx.recv().await {
+        let received = tokio::select! {
+            biased; // shutdown wins a tie
+            _ = state.shutdown.wait_for(|&stop| stop) => return None,
+            received = state.rx.recv() => received,
+        };
+        match received {
             Ok(block) => {
                 if let Some(n) = block.pointer("/block/number").and_then(Value::as_i64) {
                     state.last_num = n;

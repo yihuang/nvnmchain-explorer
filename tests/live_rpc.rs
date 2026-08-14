@@ -261,6 +261,7 @@ async fn web_api_serves_indexed_data() {
         cfg,
         tera,
         block_events: block_tx,
+        shutdown: tokio::sync::watch::channel(false).1,
     };
     let app = web::app(state);
 
