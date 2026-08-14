@@ -240,6 +240,8 @@
                         <a href="/" class="nav-link">Home</a>
                         <a href="/blocks" class="nav-link">Blocks</a>
                         <a href="/tokens" class="nav-link">Tokens</a>
+                        {# Hidden until the chain anchors something; the routes answer either way. #}
+                        {% if has_anchors | default(value=false) %}<a href="/anchoring" class="nav-link">Anchoring</a>{% endif %}
                     </div>
                 </div>
                 <div class="flex items-center gap-3">
@@ -255,7 +257,7 @@
             </div>
             <div class="pb-4">
                 <form action="/search" method="GET" class="max-w-2xl mx-auto">
-                    <input type="text" name="q" placeholder="Search block, transaction, address or token…" class="search-input" value="{{ query }}">
+                    <input type="text" name="q" placeholder="Search block, transaction, address or token…" class="search-input" value="{{ query | default(value='') }}">
                 </form>
             </div>
         </div>

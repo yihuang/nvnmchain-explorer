@@ -245,6 +245,8 @@ async fn web_api_serves_indexed_data() {
         batch_size: 5,
         index_concurrency: 8,
         native_symbol: "OM".into(),
+        registry_factory: None,
+        anchoring_url: None,
         stats_interval_seconds: 5.0,
     };
     let tera = web::build_tera(db.clone()).expect("tera");
@@ -255,6 +257,7 @@ async fn web_api_serves_indexed_data() {
         cfg,
         tera,
         block_events: block_tx,
+        stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
         shutdown: tokio::sync::watch::channel(false).1,
     };
     let app = web::app(state);

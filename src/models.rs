@@ -94,6 +94,24 @@ pub struct Transaction {
     pub created_at: i64,
 }
 
+/// One `RegistryDeployed` log: a registry contract coming into existence. The
+/// emitting factory is recorded rather than filtered at ingest — like transfers,
+/// any factory's log lands here, and reads trust only the configured one.
+///
+/// The event's third string (free-form registry metadata) is deliberately not
+/// a field: no page shows it, and it stays readable in the log.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegistryDeployed {
+    pub factory: String,
+    /// The deployed registry — the namespace its anchors will live in.
+    pub registry: String,
+    pub creator: String,
+    pub name: String,
+    pub description: String,
+    pub block_number: i64,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenMetadata {
     pub address: String,
@@ -118,6 +136,25 @@ pub struct ContractLabel {
     pub created_at: i64,
 }
 
+/// One `Anchored` log: the commitment `namespace` published under `key`.
+///
+/// The precompile keeps only the head, so this table is the whole history —
+/// `(namespace, key)` by block and log index replays a key.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnchoredEvent {
+    pub tx_hash: String,
+    pub block_number: i64,
+    pub log_index: i64,
+    /// The calling address, which is the namespace the commitment lives in.
+    pub namespace: String,
+    pub key: String,
+    pub commitment: String,
+    /// The emitted payload, never stored on chain (`0x…`).
+    pub metadata: String,
+    pub timestamp: i64,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferEvent {
     pub id: i64,
@@ -133,11 +170,14 @@ pub struct TransferEvent {
 }
 
 /// One block and everything indexed alongside it: its transactions, the
-/// transfers their receipts carried, and metadata for newly seen tokens.
+/// transfers and anchored commitments their receipts carried, metadata for
+/// newly seen tokens, and any registries deployed.
 #[derive(Debug, Clone)]
 pub struct BlockBundle {
     pub block: Block,
     pub txs: Vec<Transaction>,
     pub transfers: Vec<TransferEvent>,
+    pub anchored: Vec<AnchoredEvent>,
     pub tokens: Vec<crate::tokens::TokenMeta>,
+    pub registries: Vec<RegistryDeployed>,
 }

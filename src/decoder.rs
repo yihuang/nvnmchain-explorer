@@ -126,7 +126,7 @@ pub fn keccak_hex(input: &[u8]) -> String {
 pub fn checksum_address(addr: &str) -> String {
     let lower = addr.trim().to_lowercase();
     let lower = lower.strip_prefix("0x").unwrap_or(&lower);
-    if lower.len() != 40 || !lower.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_address(lower) {
         return addr.trim().to_string();
     }
     let hash = keccak256(lower.as_bytes());
@@ -339,6 +339,33 @@ fn tip20_fns() -> &'static [FnDef] {
     ]
 }
 
+/// The anchoring precompile's calls. Kept apart from the TIP-20 table because
+/// the precompile is this chain's, not upstream Tempo's — the selectors are
+/// still derived from the canonical signatures, so they cannot drift.
+fn anchoring_fns() -> &'static [FnDef] {
+    &[
+        FnDef {
+            name: "anchor",
+            canonical: "anchor(bytes32,bytes32,bytes)",
+            inputs: &[
+                ("bytes32", "key"),
+                ("bytes32", "commitment"),
+                ("bytes", "metadata"),
+            ],
+        },
+        FnDef {
+            name: "anchorAndHash",
+            canonical: "anchorAndHash(bytes32,bytes)",
+            inputs: &[("bytes32", "key"), ("bytes", "metadata")],
+        },
+        FnDef {
+            name: "latest",
+            canonical: "latest(address,bytes32)",
+            inputs: &[("address", "namespace"), ("bytes32", "key")],
+        },
+    ]
+}
+
 /// Functions known by signature alone, in the named form the UI shows. The
 /// selector is derived from this string when [`BY_SELECTOR`] is built, so
 /// there is no hand-written selector to fall out of step.
@@ -374,10 +401,10 @@ fn selector_hex(sig: &str) -> String {
     format!("0x{}", hex::encode(&hash[..4]))
 }
 
-/// How a recognised selector is decoded: a TIP-20 entry, or a signature-list
-/// entry parsed when the table is built.
+/// How a recognised selector is decoded: a table entry carrying its own named
+/// inputs, or a signature-list entry parsed when the table is built.
 enum Known {
-    Tip20(&'static FnDef),
+    Def(&'static FnDef),
     Sig(SigEntry),
 }
 
@@ -392,7 +419,7 @@ impl Known {
     /// Name, canonical signature, and `(type, name)` inputs.
     fn parts(&self) -> (&str, &str, Vec<(&str, &str)>) {
         match self {
-            Known::Tip20(def) => (
+            Known::Def(def) => (
                 def.name,
                 def.canonical,
                 def.inputs.iter().map(|&(t, n)| (t, n)).collect(),
@@ -410,16 +437,19 @@ impl Known {
     }
 }
 
-/// Selector -> function, hashed once rather than on every decode. TIP-20
-/// entries take precedence.
+/// Selector -> function, hashed once rather than on every decode. The `FnDef`
+/// tables take precedence over the signature list.
 static BY_SELECTOR: LazyLock<HashMap<String, Known>> =
-    LazyLock::new(|| build_table(tip20_fns(), additional_sigs()));
+    LazyLock::new(|| build_table(tip20_fns().iter().chain(anchoring_fns()), additional_sigs()));
 
 /// Split out so precedence can be tested against a deliberate collision.
-fn build_table(tip20: &'static [FnDef], sigs: &'static [&'static str]) -> HashMap<String, Known> {
+fn build_table(
+    defs: impl IntoIterator<Item = &'static FnDef>,
+    sigs: &'static [&'static str],
+) -> HashMap<String, Known> {
     let mut by_selector = HashMap::new();
-    for def in tip20 {
-        by_selector.insert(selector_hex(def.canonical), Known::Tip20(def));
+    for def in defs {
+        by_selector.insert(selector_hex(def.canonical), Known::Def(def));
     }
     for &sig in sigs {
         // Selector, canonical form, and parameter names all derive from the
@@ -475,7 +505,7 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     let (selector, args) = raw.split_at(4);
     let sel_hex = format!("0x{}", hex::encode(selector));
 
-    // Both tables report the canonical signature; the names are on `params`.
+    // Every table reports the canonical signature; the names are on `params`.
     let (name, signature, params) = match BY_SELECTOR.get(&sel_hex) {
         Some(known) => {
             let (name, canonical, inputs) = known.parts();
@@ -509,8 +539,31 @@ pub const TRANSFER_WITH_MEMO_TOPIC: &str =
     "0xab2461e5dc8495f413774182e5eb0e9f0f30a81bf32c4b7a4a1d70c3c4e2f0a";
 pub const APPROVAL_TOPIC: &str =
     "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+pub const ANCHORED_SIGNATURE: &str = "Anchored(address,bytes32,bytes32,bytes)";
+/// `keccak256(ANCHORED_SIGNATURE)` — asserted in the tests so it cannot drift.
+pub const ANCHORED_TOPIC: &str =
+    "0x778db4d46fc7a84c4e5105dcb250cb47092b78648868d3efaf18e1205b25801d";
+/// `RegistryDeployed(address,address,string,string,string)` — the factory
+/// announcing a registry. Asserted against its signature in the tests.
+pub const REGISTRY_DEPLOYED_TOPIC: &str =
+    "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576";
 
-fn address_from_topic(topic: &str) -> String {
+/// Lowercase `0x…` form, so hex from the chain and hex we derive compare equal.
+pub fn normalize_hex(value: &str) -> String {
+    let value = value.trim();
+    format!(
+        "0x{}",
+        value.strip_prefix("0x").unwrap_or(value).to_lowercase()
+    )
+}
+
+/// Whether `addr` is 20 hex-encoded bytes — the shape, not the checksum.
+pub fn is_valid_address(addr: &str) -> bool {
+    let s = addr.strip_prefix("0x").unwrap_or(addr);
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn address_from_topic(topic: &str) -> String {
     let hexed = topic.strip_prefix("0x").unwrap_or(topic);
     let addr = &hexed[hexed.len().saturating_sub(40)..];
     checksum_address(addr)
@@ -567,15 +620,11 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
     match topic0.as_str() {
         TRANSFER_TOPIC => {
             if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("Transfer".into()),
-                    signature: Some("Transfer(address,address,uint256)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
+                return Some(make(
+                    "Transfer",
+                    "Transfer(address,address,uint256)",
+                    Vec::new(),
+                ));
             }
             let from = topics[1].as_str().unwrap_or("");
             let to = topics[2].as_str().unwrap_or("");
@@ -606,15 +655,11 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
         }
         TRANSFER_WITH_MEMO_TOPIC => {
             if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("TransferWithMemo".into()),
-                    signature: Some("TransferWithMemo(address,address,uint256,bytes32)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
+                return Some(make(
+                    "TransferWithMemo",
+                    "TransferWithMemo(address,address,uint256,bytes32)",
+                    Vec::new(),
+                ));
             }
             let from = topics[1].as_str().unwrap_or("");
             let to = topics[2].as_str().unwrap_or("");
@@ -651,15 +696,11 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
         }
         APPROVAL_TOPIC => {
             if topics.len() < 3 {
-                return Some(DecodedEvent {
-                    name: Some("Approval".into()),
-                    signature: Some("Approval(address,address,uint256)".into()),
-                    contract,
-                    params: Vec::new(),
-                    topic0,
-                    log_index,
-                    transaction_hash,
-                });
+                return Some(make(
+                    "Approval",
+                    "Approval(address,address,uint256)",
+                    Vec::new(),
+                ));
             }
             let owner = topics[1].as_str().unwrap_or("");
             let spender = topics[2].as_str().unwrap_or("");
@@ -683,6 +724,96 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
                         ty: "uint256".into(),
                         name: "amount".into(),
                         value: uint256_from_data(&data, 0),
+                        indexed: false,
+                    },
+                ],
+            ))
+        }
+        REGISTRY_DEPLOYED_TOPIC => {
+            const REGISTRY_DEPLOYED_SIGNATURE: &str =
+                "RegistryDeployed(address,address,string,string,string)";
+            if topics.len() < 3 {
+                return Some(make(
+                    "RegistryDeployed",
+                    REGISTRY_DEPLOYED_SIGNATURE,
+                    Vec::new(),
+                ));
+            }
+            // The two addresses are indexed; `data` is the three strings.
+            let raw = hex::decode(data.strip_prefix("0x").unwrap_or(&data)).unwrap_or_default();
+            let values = decode_abi_args(&["string", "string", "string"], &raw);
+            let text = |at: usize| values.get(at).cloned().unwrap_or_default();
+            Some(make(
+                "RegistryDeployed",
+                REGISTRY_DEPLOYED_SIGNATURE,
+                vec![
+                    DecodedParam {
+                        ty: "address".into(),
+                        name: "registry".into(),
+                        value: address_from_topic(topics[1].as_str().unwrap_or("")),
+                        indexed: true,
+                    },
+                    DecodedParam {
+                        ty: "address".into(),
+                        name: "creator".into(),
+                        value: address_from_topic(topics[2].as_str().unwrap_or("")),
+                        indexed: true,
+                    },
+                    DecodedParam {
+                        ty: "string".into(),
+                        name: "name".into(),
+                        value: text(0),
+                        indexed: false,
+                    },
+                    DecodedParam {
+                        ty: "string".into(),
+                        name: "description".into(),
+                        value: text(1),
+                        indexed: false,
+                    },
+                    DecodedParam {
+                        ty: "string".into(),
+                        name: "metadata".into(),
+                        value: text(2),
+                        indexed: false,
+                    },
+                ],
+            ))
+        }
+        ANCHORED_TOPIC => {
+            if topics.len() < 3 {
+                return Some(make("Anchored", ANCHORED_SIGNATURE, Vec::new()));
+            }
+            // data is `abi.encode(bytes32 commitment, bytes metadata)`; the
+            // caller and key are indexed, so they arrive as topics.
+            let raw = hex::decode(data.strip_prefix("0x").unwrap_or(&data)).unwrap_or_default();
+            let values = decode_abi_args(&["bytes32", "bytes"], &raw);
+            Some(make(
+                "Anchored",
+                ANCHORED_SIGNATURE,
+                vec![
+                    DecodedParam {
+                        ty: "address".into(),
+                        name: "caller".into(),
+                        value: address_from_topic(topics[1].as_str().unwrap_or("")),
+                        indexed: true,
+                    },
+                    DecodedParam {
+                        ty: "bytes32".into(),
+                        name: "key".into(),
+                        value: normalize_hex(topics[2].as_str().unwrap_or("")),
+                        indexed: true,
+                    },
+                    DecodedParam {
+                        ty: "bytes32".into(),
+                        name: "commitment".into(),
+                        value: values.first().cloned().unwrap_or_default(),
+                        indexed: false,
+                    },
+                    DecodedParam {
+                        ty: "bytes".into(),
+                        name: "metadata".into(),
+                        value: values.get(1).cloned().unwrap_or_default(),
                         indexed: false,
                     },
                 ],
@@ -983,10 +1114,10 @@ mod tests {
         assert!(decode_abi_args(&["not-a-type"], &[0u8; 32]).is_empty());
     }
 
-    /// A signature-list entry must not shadow a TIP-20 entry; the live tables
-    /// share no selector, so build one that collides.
+    /// A signature-list entry must not shadow an `FnDef` entry; the live
+    /// tables share no selector, so build one that collides.
     #[test]
-    fn tip20_wins_when_both_tables_claim_a_selector() {
+    fn fn_def_wins_when_both_tables_claim_a_selector() {
         static TIP20: [FnDef; 1] = [FnDef {
             name: "burn",
             canonical: "burn(uint256)",
@@ -994,10 +1125,10 @@ mod tests {
         }];
         let table = build_table(&TIP20, &["burn(uint256 value)"]);
         match table.get(&selector_hex("burn(uint256)")) {
-            Some(Known::Tip20(def)) => assert_eq!(def.inputs[0].1, "amount"),
+            Some(Known::Def(def)) => assert_eq!(def.inputs[0].1, "amount"),
             Some(Known::Sig(entry)) => {
                 panic!(
-                    "signature list shadowed the TIP-20 entry: {}",
+                    "signature list shadowed the FnDef entry: {}",
                     entry.canonical
                 )
             }

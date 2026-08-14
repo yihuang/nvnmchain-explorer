@@ -8,7 +8,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use crate::models::{Block, BlockBundle, TokenMetadata, Transaction, TransferEvent};
+use crate::models::{AnchoredEvent, Block, BlockBundle, TokenMetadata, Transaction, TransferEvent};
 
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -124,6 +124,13 @@ pub fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// A per-row write through the connection's statement cache. The block path
+/// runs these once per row inside one transaction, where `Connection::execute`
+/// would re-prepare the same SQL every time.
+fn exec_cached(conn: &Connection, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
+    Ok(conn.prepare_cached(sql)?.execute(params)?)
+}
+
 pub fn init_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("open db {path}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -133,6 +140,20 @@ pub fn init_db(path: &str) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // `registries` first keyed on address alone, which let any contract's
+    // RegistryDeployed log replace the row a trusted factory wrote. Every row
+    // is re-derivable by indexing, so databases on the old key start over.
+    let address_keyed_alone = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('registries') WHERE pk > 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        == 1;
+    if address_keyed_alone {
+        conn.execute("DROP TABLE registries", [])?;
+    }
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS blocks (
@@ -226,6 +247,55 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_transfer_from ON transfer_events(from_addr);
         CREATE INDEX IF NOT EXISTS idx_transfer_to ON transfer_events(to_addr);
 
+        CREATE TABLE IF NOT EXISTS anchored_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tx_hash BLOB NOT NULL,
+            block_number INTEGER NOT NULL,
+            log_index INTEGER NOT NULL DEFAULT 0,
+            namespace BLOB NOT NULL,
+            key BLOB NOT NULL,
+            commitment BLOB NOT NULL,
+            metadata BLOB NOT NULL DEFAULT X'',
+            timestamp INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            -- Re-indexing a block must not duplicate its logs.
+            UNIQUE (block_number, log_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_anchored_tx_hash ON anchored_events(tx_hash);
+        -- The head lookup and the per-key history both walk this.
+        CREATE INDEX IF NOT EXISTS idx_anchored_ns_key
+            ON anchored_events(namespace, key, block_number, log_index);
+
+        -- Per-namespace stats for /anchoring, like token_metadata.holder_count:
+        -- maintained with each inserted anchor and recomputed at startup, so no
+        -- page view aggregates over every anchor ever written.
+        CREATE TABLE IF NOT EXISTS anchored_namespaces (
+            namespace BLOB PRIMARY KEY,
+            anchor_count INTEGER NOT NULL DEFAULT 0,
+            key_count INTEGER NOT NULL DEFAULT 0,
+            last_block INTEGER NOT NULL DEFAULT 0,
+            last_timestamp INTEGER NOT NULL DEFAULT 0
+        );
+        -- The /anchoring listing's exact order, so a page is an index walk
+        -- rather than a sort of every namespace.
+        CREATE INDEX IF NOT EXISTS idx_anchored_ns_order
+            ON anchored_namespaces(anchor_count DESC, last_block DESC, namespace);
+
+        -- RegistryDeployed rows, factory recorded rather than filtered: reads
+        -- trust only the configured factory, the way transfer rows carry their
+        -- token. Keyed by both, so a contract emitting the signature over
+        -- someone else's address writes its own row instead of replacing theirs.
+        CREATE TABLE IF NOT EXISTS registries (
+            address BLOB NOT NULL,
+            factory BLOB NOT NULL,
+            creator BLOB NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            block_number INTEGER NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (address, factory)
+        );
+
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
@@ -260,7 +330,8 @@ pub fn lock<'a>(db: &'a Db) -> MutexGuard<'a, Connection> {
 // ---------------------------------------------------------------------------
 
 pub fn set_kv(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
+    exec_cached(
+        conn,
         "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         params![key, value, now_ts()],
@@ -287,7 +358,8 @@ const BLOCK_COLS: &str =
      extra_data, epoch, view, proposer, miner, tx_count, created_at";
 
 fn upsert_block(conn: &Connection, block: &Block) -> Result<()> {
-    conn.execute(
+    exec_cached(
+        conn,
         r#"
         INSERT INTO blocks (number, hash, parent_hash, timestamp, timestamp_ms, gas_used, gas_limit,
                             base_fee, size, extra_data, epoch, view, proposer,
@@ -372,9 +444,34 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
     }
     apply_transfer_balances(txn, &inserted)?;
     refresh_holder_counts(txn, &inserted)?;
+    for event in &bundle.anchored {
+        if insert_anchored(txn, event)? {
+            refresh_anchored_namespace(txn, event)?;
+        }
+    }
+    for event in &bundle.registries {
+        // OR REPLACE: a re-indexed block rewrites the same row. The key carries
+        // the factory, so this only ever replaces that factory's own claim.
+        exec_cached(
+            txn,
+            "INSERT OR REPLACE INTO registries (address, factory, creator, name, description,
+                                                block_number, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                hex_blob(&event.registry),
+                hex_blob(&event.factory),
+                hex_blob(&event.creator),
+                event.name,
+                event.description,
+                event.block_number,
+                event.created_at,
+            ],
+        )?;
+    }
     for tx in &bundle.txs {
         if let Some(addr) = &tx.contract_address {
-            txn.execute(
+            exec_cached(
+                txn,
                 "INSERT OR IGNORE INTO contract_labels (address, name, abi, is_token, is_precompile, created_at)
                  VALUES (?1, '', '[]', 0, 0, ?2)",
                 params![addr, now_ts()],
@@ -435,27 +532,10 @@ pub fn get_latest_block(db: &Db) -> Option<Block> {
     )
 }
 
-/// Number of indexed block rows (the history-completion metric).
-pub fn get_block_count(db: &Db) -> i64 {
-    query_count(
-        &lock(db),
-        "get_block_count",
-        "SELECT COUNT(*) FROM blocks",
-        [],
-    )
-}
-
 /// Record the chain head observed by the indexer (for index-progress display).
 pub fn set_chain_head(db: &Db, head: i64) {
     let conn = lock(db);
     let _ = set_kv(&conn, "chain_head", &head.to_string());
-}
-
-/// The last chain head observed by the indexer; `0` when unknown.
-pub fn get_chain_head(db: &Db) -> i64 {
-    get_kv(db, "chain_head")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
 }
 
 /// Lowest stored block height; `None` when the table is empty.
@@ -485,7 +565,8 @@ pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
 // ---------------------------------------------------------------------------
 
 fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
-    conn.execute(
+    exec_cached(
+        conn,
         r#"
         INSERT INTO transactions (
             hash, block_number, position, from_addr, to_addr, status,
@@ -623,7 +704,8 @@ pub fn get_address_transaction_count(db: &Db, address: &str) -> i64 {
 
 fn upsert_token_meta(conn: &Connection, meta: &crate::tokens::TokenMeta) -> Result<()> {
     let ts = now_ts();
-    conn.execute(
+    exec_cached(
+        conn,
         r#"
         INSERT INTO token_metadata (address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 0, ?7, ?7)
@@ -744,7 +826,8 @@ pub fn get_token_by_symbol_or_name(db: &Db, q: &str) -> Option<TokenMetadata> {
 /// and `false` when it duplicated an existing (block_number, log_index) —
 /// the unique key that makes re-writing an already-indexed block idempotent.
 fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<bool> {
-    let inserted = conn.execute(
+    let inserted = exec_cached(
+        conn,
         "INSERT OR IGNORE INTO transfer_events (tx_hash, block_number, log_index, token_addr, from_addr, to_addr, amount, timestamp, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
@@ -788,12 +871,14 @@ fn adjust_balance(
     .unwrap_or_else(|| "0".into());
     let new = bigint(&current) + delta;
     if new.sign() == num_bigint::Sign::NoSign {
-        conn.execute(
+        exec_cached(
+            conn,
             "DELETE FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
             params![token, holder],
         )?;
     } else {
-        conn.execute(
+        exec_cached(
+            conn,
             "INSERT INTO token_balances (token_addr, holder_addr, balance, updated_at)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(token_addr, holder_addr) DO UPDATE SET
@@ -821,12 +906,11 @@ fn refresh_holder_counts(conn: &Connection, transfers: &[&TransferEvent]) -> Res
         if !seen.insert(t.token_addr.clone()) {
             continue;
         }
-        let count = conn.query_row(
-            "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
-            params![t.token_addr],
-            |r| r.get::<_, i64>(0),
-        )?;
-        conn.execute(
+        let count = conn
+            .prepare_cached("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1")?
+            .query_row(params![t.token_addr], |r| r.get::<_, i64>(0))?;
+        exec_cached(
+            conn,
             "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
             params![count, now_ts(), hex_blob(&t.token_addr)],
         )?;
@@ -1000,6 +1084,309 @@ pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -
         page,
         per_page,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Anchored events
+// ---------------------------------------------------------------------------
+
+const ANCHORED_COLS: &str = "tx_hash, block_number, log_index, namespace, key, commitment, \
+                             metadata, timestamp, created_at";
+
+/// Insert one `Anchored` log. Returns `true` when the row was newly inserted
+/// and `false` when it duplicated an existing (block_number, log_index) — a
+/// re-indexed block, whose events must not move the namespace stats again.
+fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<bool> {
+    let inserted = exec_cached(
+        conn,
+        "INSERT OR IGNORE INTO anchored_events (tx_hash, block_number, log_index, namespace, key,
+                                                commitment, metadata, timestamp, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            hex_blob(&event.tx_hash),
+            event.block_number,
+            event.log_index,
+            hex_blob(&event.namespace),
+            hex_blob(&event.key),
+            hex_blob(&event.commitment),
+            hex_blob(&event.metadata),
+            event.timestamp,
+            event.created_at,
+        ],
+    )?;
+    Ok(inserted != 0)
+}
+
+/// Fold one freshly-inserted anchor into its namespace's summary row. Runs in
+/// the same transaction as the insert, so the stats never drift from the log.
+fn refresh_anchored_namespace(conn: &Connection, event: &AnchoredEvent) -> Result<()> {
+    // The event's own row is already in, so a second row under the pair means
+    // the key existed before this anchor.
+    let key_existed =
+        conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM anchored_events
+                           WHERE namespace=?1 AND key=?2 LIMIT 1 OFFSET 1)",
+        )?
+        .query_row(
+            params![hex_blob(&event.namespace), hex_blob(&event.key)],
+            |r| r.get::<_, i64>(0),
+        )? != 0;
+    exec_cached(
+        conn,
+        "INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
+         VALUES (?1, 1, ?2, ?3, ?4)
+         ON CONFLICT(namespace) DO UPDATE SET
+             anchor_count = anchor_count + 1,
+             key_count = key_count + excluded.key_count,
+             last_block = MAX(last_block, excluded.last_block),
+             last_timestamp = MAX(last_timestamp, excluded.last_timestamp)",
+        params![
+            hex_blob(&event.namespace),
+            i64::from(!key_existed),
+            event.block_number,
+            event.timestamp,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Recompute every namespace's summary row from the log — idempotent, run once
+/// at startup for databases that predate the table; after that each block
+/// maintains it incrementally. One transaction: a crash mid-rebuild would
+/// otherwise leave the summary empty while the log it summarises is full.
+pub fn sync_anchored_namespaces(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DELETE FROM anchored_namespaces;
+         INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
+         SELECT namespace, COUNT(*), COUNT(DISTINCT key), MAX(block_number), MAX(timestamp)
+         FROM anchored_events GROUP BY namespace;
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
+/// Whether the summary table needs the rebuild above: anchors on record but no
+/// summary rows to show for them (a database that predates the table).
+pub fn anchored_summary_is_stale(conn: &Connection) -> bool {
+    let exists = |what, sql| query_count(conn, what, sql, []) != 0;
+    exists(
+        "anchored_summary_is_stale events",
+        "SELECT EXISTS(SELECT 1 FROM anchored_events LIMIT 1)",
+    ) && !exists(
+        "anchored_summary_is_stale namespaces",
+        "SELECT EXISTS(SELECT 1 FROM anchored_namespaces LIMIT 1)",
+    )
+}
+
+fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
+    Ok(AnchoredEvent {
+        tx_hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),
+        block_number: row.get(1)?,
+        log_index: row.get(2)?,
+        namespace: blob_addr(&row.get::<_, Vec<u8>>(3)?),
+        key: blob_hex(&row.get::<_, Vec<u8>>(4)?),
+        commitment: blob_hex(&row.get::<_, Vec<u8>>(5)?),
+        metadata: blob_hex(&row.get::<_, Vec<u8>>(6)?),
+        timestamp: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+/// The configured factory's registry at `namespace`, if that is what it is.
+pub fn get_registry(db: &Db, factory: &str, namespace: &str) -> Option<Value> {
+    query_opt(
+        &lock(db),
+        "get_registry",
+        "SELECT name, description, creator, block_number FROM registries
+         WHERE address=?1 AND factory=?2",
+        params![hex_blob(namespace), hex_blob(factory)],
+        |r| {
+            Ok(json!({
+                "name": r.get::<_, String>(0)?,
+                "description": r.get::<_, String>(1)?,
+                "creator": blob_addr(&r.get::<_, Vec<u8>>(2)?),
+                "block_number": r.get::<_, i64>(3)?,
+            }))
+        },
+    )
+}
+
+/// Namespaces that have anchored anything, busiest first. `factory` labels the
+/// ones that are its registries; unset, nothing is labelled.
+pub fn get_anchored_namespaces(
+    db: &Db,
+    factory: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Vec<Value> {
+    query_rows(
+        &lock(db),
+        "get_anchored_namespaces",
+        "SELECT n.namespace, n.anchor_count, n.key_count, n.last_block, n.last_timestamp,
+                r.name
+         FROM anchored_namespaces n
+         LEFT JOIN registries r ON r.address = n.namespace AND r.factory = ?3
+         ORDER BY n.anchor_count DESC, n.last_block DESC, n.namespace
+         LIMIT ?1 OFFSET ?2",
+        // NULL when no factory is configured: `r.factory = NULL` matches
+        // nothing, where an empty blob could match a row that stored one.
+        params![
+            i64::from(per_page),
+            page_offset(page, per_page),
+            factory.map(hex_blob)
+        ],
+        |r| {
+            Ok(json!({
+                "namespace": blob_addr(&r.get::<_, Vec<u8>>(0)?),
+                "anchor_count": r.get::<_, i64>(1)?,
+                "key_count": r.get::<_, i64>(2)?,
+                "last_block": r.get::<_, i64>(3)?,
+                "name": r.get::<_, Option<String>>(5)?,
+                "last_timestamp": r.get::<_, i64>(4)?,
+            }))
+        },
+    )
+}
+
+/// What the /anchoring header and its pager each need: `(namespaces, anchors)`.
+/// One statement over the summary table, so the two numbers shown side by side
+/// are read at the same instant.
+pub fn count_anchored_summary(db: &Db) -> (i64, i64) {
+    query_opt(
+        &lock(db),
+        "count_anchored_summary",
+        "SELECT COUNT(*), COALESCE(SUM(anchor_count), 0) FROM anchored_namespaces",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap_or((0, 0))
+}
+
+/// Keys one namespace has anchored, for paging its listing — the summary row
+/// the insert path maintains, not a count over its anchors.
+pub fn count_namespace_keys(db: &Db, namespace: &str) -> i64 {
+    query_count(
+        &lock(db),
+        "count_namespace_keys",
+        // Wrapped in a subquery so a namespace with nothing anchored answers
+        // zero rather than no row at all.
+        "SELECT COALESCE((SELECT key_count FROM anchored_namespaces WHERE namespace=?1), 0)",
+        params![hex_blob(namespace)],
+    )
+}
+
+/// Keys a namespace has anchored, each at its head row — what `latest` returns.
+///
+/// Two steps rather than one window function over the namespace: the group-by
+/// is answered from `idx_anchored_ns_key` alone, then only the page's heads are
+/// read as rows, so no page view drags every revision's metadata through a sort.
+pub fn get_namespace_keys(db: &Db, namespace: &str, page: u32, per_page: u32) -> Vec<Value> {
+    query_rows(
+        &lock(db),
+        "get_namespace_keys",
+        // The inner query walks `idx_anchored_ns_key` and never leaves it: the
+        // page's keys and their revision counts come out of the index alone.
+        // Only those rows are then joined to their head, so the payloads of
+        // superseded revisions are never read.
+        "SELECT k.key, k.revisions, h.commitment, h.metadata, h.block_number, h.timestamp, h.tx_hash
+         FROM (SELECT key, COUNT(*) AS revisions, MAX(block_number) AS last_block
+               FROM anchored_events WHERE namespace=?1
+               GROUP BY key
+               ORDER BY last_block DESC, key
+               LIMIT ?2 OFFSET ?3) k
+         JOIN anchored_events h ON h.id = (SELECT id FROM anchored_events
+                                           WHERE namespace=?1 AND key=k.key
+                                           ORDER BY block_number DESC, log_index DESC
+                                           LIMIT 1)
+         ORDER BY k.last_block DESC, k.key",
+        params![
+            hex_blob(namespace),
+            i64::from(per_page),
+            page_offset(page, per_page)
+        ],
+        |r| {
+            Ok(json!({
+                "key": blob_hex(&r.get::<_, Vec<u8>>(0)?),
+                "revisions": r.get::<_, i64>(1)?,
+                "commitment": blob_hex(&r.get::<_, Vec<u8>>(2)?),
+                "metadata": blob_hex(&r.get::<_, Vec<u8>>(3)?),
+                "block_number": r.get::<_, i64>(4)?,
+                "timestamp": r.get::<_, i64>(5)?,
+                "tx_hash": blob_hex(&r.get::<_, Vec<u8>>(6)?),
+            }))
+        },
+    )
+}
+
+/// The head revision of one `(namespace, key)` — what `latest` returns.
+pub fn get_key_head(db: &Db, namespace: &str, key: &str) -> Option<AnchoredEvent> {
+    query_opt(
+        &lock(db),
+        "get_key_head",
+        &format!(
+            "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1 AND key=?2
+             ORDER BY block_number DESC, log_index DESC LIMIT 1"
+        ),
+        params![hex_blob(namespace), hex_blob(key)],
+        row_to_anchored,
+    )
+}
+
+/// One page of a key's revisions, newest first. Paged like every other listing:
+/// nothing bounds how often a key is re-anchored, and each row carries its
+/// whole metadata payload.
+pub fn get_key_history(
+    db: &Db,
+    namespace: &str,
+    key: &str,
+    page: u32,
+    per_page: u32,
+) -> Vec<AnchoredEvent> {
+    query_rows(
+        &lock(db),
+        "get_key_history",
+        &format!(
+            "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1 AND key=?2
+             ORDER BY block_number DESC, log_index DESC LIMIT ?3 OFFSET ?4"
+        ),
+        params![
+            hex_blob(namespace),
+            hex_blob(key),
+            i64::from(per_page),
+            page_offset(page, per_page)
+        ],
+        row_to_anchored,
+    )
+}
+
+/// Revisions on record for one key, for paging the history above.
+pub fn count_key_revisions(db: &Db, namespace: &str, key: &str) -> i64 {
+    query_count(
+        &lock(db),
+        "count_key_revisions",
+        "SELECT COUNT(*) FROM anchored_events WHERE namespace=?1 AND key=?2",
+        params![hex_blob(namespace), hex_blob(key)],
+    )
+}
+
+pub fn get_recent_anchored(db: &Db, limit: usize) -> Vec<AnchoredEvent> {
+    query_rows(
+        &lock(db),
+        "get_recent_anchored",
+        &format!(
+            "SELECT {ANCHORED_COLS} FROM anchored_events
+             ORDER BY block_number DESC, log_index DESC LIMIT ?1"
+        ),
+        params![limit as i64],
+        row_to_anchored,
+    )
+}
+
+/// Total anchors ever indexed. Summed over the summary table — one row per
+/// namespace, maintained with each insert — rather than counted over the log.
+pub fn count_anchored(db: &Db) -> i64 {
+    count_anchored_summary(db).1
 }
 
 // ---------------------------------------------------------------------------
