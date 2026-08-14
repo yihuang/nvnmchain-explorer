@@ -1,6 +1,6 @@
 use nvnmchain_explorer::decoder::{
-    checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
-    flatten_trace, TRANSFER_TOPIC,
+    checksum_address, decode_abi_args, decode_event, decode_function_call, extract_balance_changes,
+    extract_calls, flatten_trace, TRANSFER_TOPIC,
 };
 use nvnmchain_explorer::models::{BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
@@ -856,4 +856,115 @@ fn witness_overload_decodes_the_argument_after_the_tuple() {
         )
     );
     assert_eq!(call.params[3].value, format!("0x{:064x}", 0xab));
+}
+
+/// Replace one argument word (counted after the selector), so a variant
+/// fixture cannot drift from the base it claims to match.
+fn with_arg_word(calldata: &str, index: usize, word: &str) -> String {
+    let (selector, args) = calldata.split_at(10);
+    let mut words: Vec<&str> = args
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    assert_eq!(word.len(), 64, "a replacement word is 32 bytes of hex");
+    words[index] = word;
+    format!("{selector}{}", words.concat())
+}
+
+/// A hostile length claim fails fast against the data instead of spinning.
+#[test]
+fn array_length_is_bounded_by_the_calldata() {
+    // Argument word 8 is the `TokenLimit[]` length; one limit is encoded.
+    let hostile = with_arg_word(
+        AUTHORIZE_KEY_CALLDATA,
+        8,
+        "000000000000000000000000000000000000000000000000ffffffffffffffff",
+    );
+    let call = decode_function_call(&hostile).expect("authorizeKey");
+    assert_eq!(call.name.as_deref(), Some("authorizeKey"));
+    // All-or-nothing: the refused list keeps its names and types, values empty.
+    let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert!(call.params.iter().all(|p| p.value.is_empty()));
+}
+
+/// A fixed-size array of dynamic elements has no length prefix, just offsets.
+#[test]
+fn fixed_size_array_of_dynamic_elements_has_no_length_prefix() {
+    let calldata = [
+        format!("{:064x}", 0x20),   // argument -> array
+        format!("{:064x}", 0x40),   // element 0 -> "hi"
+        format!("{:064x}", 0x80),   // element 1 -> "yo"
+        format!("{:064x}", 2),      //
+        format!("{:0<64}", "6869"), // "hi"
+        format!("{:064x}", 2),      //
+        format!("{:0<64}", "796f"), // "yo"
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["string[2]"], &bytes),
+        vec!["[hi, yo]".to_string()]
+    );
+}
+
+/// Dynamic `bytes` and `string`: offsets to a length word and padded payload.
+#[test]
+fn bytes_and_string_arguments_decode() {
+    let calldata = [
+        format!("{:064x}", 0x40),       // -> bytes
+        format!("{:064x}", 0x80),       // -> string
+        format!("{:064x}", 4),          //
+        format!("{:0<64}", "deadbeef"), //
+        format!("{:064x}", 2),          //
+        format!("{:0<64}", "6869"),     // "hi"
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["bytes", "string"], &bytes),
+        vec!["0xdeadbeef".to_string(), "hi".to_string()]
+    );
+}
+
+/// A length the payload cannot back decodes to nothing rather than whatever
+/// follows.
+#[test]
+fn a_length_longer_than_its_payload_decodes_nothing() {
+    let calldata = [
+        format!("{:064x}", 0x20),
+        format!("{:064x}", 100),        // claims 100 bytes
+        format!("{:0<64}", "deadbeef"), // 32 are present
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(decode_abi_args(&["bytes"], &bytes), Vec::<String>::new());
+}
+
+/// A static array sits inline at its element width — no offset, no length.
+#[test]
+fn fixed_size_array_of_static_elements_is_inline() {
+    let calldata = [
+        format!("{:064x}", 1),
+        format!("{:064x}", 2),
+        format!("{:064x}", 3),
+    ]
+    .concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["uint256[3]"], &bytes),
+        vec!["[1, 2, 3]".to_string()]
+    );
+}
+
+/// Truncated calldata is refused outright rather than zero-padded.
+#[test]
+fn a_truncated_static_array_decodes_nothing() {
+    let calldata = [format!("{:064x}", 1), format!("{:064x}", 2)].concat();
+    let bytes = hex::decode(calldata).expect("fixture hex");
+    assert_eq!(
+        decode_abi_args(&["uint256[3]"], &bytes),
+        Vec::<String>::new()
+    );
 }
