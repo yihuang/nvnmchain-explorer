@@ -422,6 +422,48 @@ fn fresh_schema_has_all_columns() {
 }
 
 #[test]
+fn a_database_on_the_old_registry_key_is_rekeyed() {
+    // `registries` shipped keyed on address alone, which let any contract's
+    // RegistryDeployed log replace a trusted factory's row. Existing databases
+    // carry that key until init_db drops it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("legacy.db");
+    let legacy = rusqlite::Connection::open(&path).expect("open");
+    legacy
+        .execute_batch(
+            "CREATE TABLE registries (
+                 address BLOB PRIMARY KEY,
+                 factory BLOB NOT NULL,
+                 creator BLOB NOT NULL,
+                 name TEXT NOT NULL DEFAULT '',
+                 description TEXT NOT NULL DEFAULT '',
+                 block_number INTEGER NOT NULL,
+                 log_index INTEGER NOT NULL DEFAULT 0,
+                 timestamp INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .expect("legacy schema");
+    drop(legacy);
+
+    let key_columns = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('registries') WHERE pk > 0",
+            [],
+            |r| r.get(0),
+        )
+        .expect("pragma")
+    };
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
+    assert_eq!(key_columns(&conn), 2, "rekeyed on (address, factory)");
+    drop(conn);
+
+    // ...and opening it again leaves the rekeyed table alone.
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("reopen");
+    assert_eq!(key_columns(&conn), 2, "the migration does not repeat");
+}
+
+#[test]
 fn blob_hex_round_trip() {
     // Block with one transaction (so the tx row is exercised too).
     let (_dir, db) = temp_db("blob.db");
@@ -755,6 +797,10 @@ fn huge_page_numbers_do_not_panic() {
         db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
     );
     assert!(db::get_all_tokens(&db, u32::MAX, 25).is_empty());
+    let ns = format!("0x{}", "cc".repeat(20));
+    assert!(db::get_anchored_namespaces(&db, None, u32::MAX, 25).is_empty());
+    assert!(db::get_namespace_keys(&db, &ns, u32::MAX, 25).is_empty());
+    assert!(db::get_key_history(&db, &ns, &format!("0x{}", "dd".repeat(32)), u32::MAX, 25).is_empty());
 }
 
 /// `authorizeKey(keyId, WebAuthn, KeyRestrictions{expiry, enforceLimits, one

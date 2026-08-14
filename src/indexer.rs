@@ -289,22 +289,27 @@ fn apply_receipt(
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
 
-        // Before the named-event decode, which does not know RegistryDeployed:
-        // the parser matches by topic itself, and the emitting factory rides in
-        // the row — reads decide which factory to trust, the way transfer rows
-        // record their token.
-        if let Some(event) = registry_deployed(log, tx, log_index) {
-            registries.push(event);
-            continue;
-        }
         let Some(decoded) = decode_event(log) else {
             continue;
         };
-        if decoded.name.as_deref() == Some("Anchored") {
+        // Both anchoring events are matched on topic0 rather than the decoded
+        // display name, which is a UI label: renaming one must not silently
+        // stop indexing it.
+        if decoded.topic0 == crate::decoder::REGISTRY_DEPLOYED_TOPIC {
+            // The emitting factory rides in the row — reads decide which
+            // factory to trust, the way transfer rows record their token.
+            if let Some(event) = registry_deployed(&decoded, tx, log_index) {
+                registries.push(event);
+            }
+            continue;
+        }
+        if decoded.topic0 == crate::anchoring::ANCHORED_TOPIC {
             // Only the precompile's own log carries a trustworthy namespace:
             // the caller it records is the sender it saw, which a contract
-            // emitting the same signature could claim to be anyone.
-            if checksum_address(&decoded.contract) == ANCHORING_ADDRESS {
+            // emitting the same signature could claim to be anyone. Compared
+            // case-insensitively: the gate must not turn on how either address
+            // happens to be spelled.
+            if decoded.contract.eq_ignore_ascii_case(ANCHORING_ADDRESS) {
                 match anchored_event(&decoded, tx, log_index) {
                     Some(event) => anchored.push(event),
                     None => warn!("undecodable Anchored log {log_index} in {}", tx.hash),
@@ -401,39 +406,39 @@ pub fn anchored_event(
     })
 }
 
-/// One `RegistryDeployed` log as a storable row, or `None` when it does not
-/// carry its addresses. Strings decode leniently — an empty name labels as
-/// empty rather than dropping the registry from the listing.
+/// One decoded `RegistryDeployed` log as a storable row, or `None` when it does
+/// not carry its addresses — a row keyed on a malformed address would be
+/// unreachable, and an empty factory would match the "no factory configured"
+/// read. Strings decode leniently: an empty name labels as empty rather than
+/// dropping the registry from the listing.
 pub fn registry_deployed(
-    log: &Value,
+    decoded: &crate::decoder::DecodedEvent,
     tx: &Transaction,
     log_index: i64,
 ) -> Option<RegistryDeployed> {
-    let topics = log.get("topics")?.as_array()?;
-    if topics.first()?.as_str()? != crate::decoder::REGISTRY_DEPLOYED_TOPIC {
+    let arg = |name: &str| {
+        decoded
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.value.clone())
+    };
+    let address = |name: &str| arg(name).filter(|a| crate::decoder::is_valid_address(a));
+    let factory = checksum_address(&decoded.contract);
+    if !crate::decoder::is_valid_address(&factory) {
         return None;
     }
-    let data = log.get("data").and_then(Value::as_str).unwrap_or("0x");
     Some(RegistryDeployed {
-        factory: checksum_address(log.get("address")?.as_str()?),
-        registry: topic_address(topics.get(1)?)?,
-        creator: topic_address(topics.get(2)?)?,
-        name: crate::decoder::string_from_data(data, 0),
-        description: crate::decoder::string_from_data(data, 1),
+        factory,
+        registry: address("registry")?,
+        creator: address("creator")?,
+        name: arg("name").unwrap_or_default(),
+        description: arg("description").unwrap_or_default(),
         block_number: tx.block_number,
         log_index,
         timestamp: tx.timestamp,
         created_at: db::now_ts(),
     })
-}
-
-/// The address right-aligned in an indexed topic, or `None` off a 32-byte word.
-fn topic_address(topic: &Value) -> Option<String> {
-    let hexed = topic.as_str()?.strip_prefix("0x").unwrap_or_default();
-    if hexed.len() != 64 {
-        return None;
-    }
-    Some(checksum_address(&hexed[24..]))
 }
 
 /// Fetch + persist one block (used by tests and simple callers).
@@ -794,10 +799,13 @@ pub async fn run_forever(
             }
         }
         // Seed the /anchoring summary for databases that predate it; after
-        // this each block maintains it incrementally.
+        // this each block maintains it incrementally. Guarded, because the
+        // recompute reads every anchor ever written while holding the lock.
         let conn = db::lock(&rebuild_db);
-        if let Err(e) = db::sync_anchored_namespaces(&conn) {
-            warn!("anchored namespace sync failed: {e:#}");
+        if db::anchored_summary_is_stale(&conn) {
+            if let Err(e) = db::sync_anchored_namespaces(&conn) {
+                warn!("anchored namespace sync failed: {e:#}");
+            }
         }
     });
 
@@ -882,9 +890,10 @@ async fn stats_loop(
         match compute_and_store_stats(&db) {
             Ok(stats) => {
                 *cell.write().unwrap_or_else(|e| e.into_inner()) = stats.clone();
-                // Live viewers get the refresh too. Droppable: anyone who
-                // misses one is corrected by the next tick.
-                let _ = events.send(json!({ "stats": stats }));
+                // Live viewers get the refresh too, tagged the way block
+                // payloads are. Droppable: anyone who misses one is corrected
+                // by the next tick.
+                let _ = events.send(json!({ "type": "stats", "stats": stats }));
             }
             Err(e) => warn!("stats recompute failed: {e:#}"),
         }
@@ -971,6 +980,15 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
     } else {
         0.0
     };
+    // Rides along so the nav's anchoring gate is a memory read on every page
+    // view rather than a query. One tick of lag on the tab appearing.
+    let anchored_total: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(anchor_count), 0) FROM anchored_namespaces",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
 
     let stats = serde_json::json!({
         "latest_block": latest_block,
@@ -984,9 +1002,92 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
         "gas_util_pct": gas_util_pct,
         "chain_head": chain_head,
         "index_pct": index_pct,
+        "anchored_total": anchored_total,
         "updated_at": now,
     });
     // Still written to kv: it seeds the in-memory copy across a restart.
     db::set_kv(&conn, "stats", &stats.to_string())?;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `Anchored` log as a node reports it, from `emitter`.
+    fn anchored_log(emitter: &str, caller: &str) -> Value {
+        let commitment = "22".repeat(32);
+        json!({
+            "address": emitter,
+            "topics": [
+                crate::anchoring::ANCHORED_TOPIC,
+                format!("0x{}{}", "00".repeat(12), caller),
+                format!("0x{}", "11".repeat(32)),
+            ],
+            // abi.encode(bytes32 commitment, bytes metadata), metadata empty.
+            "data": format!("0x{commitment}{:064x}{:064x}", 0x40, 0),
+            "logIndex": "0x0",
+        })
+    }
+
+    fn tx_with_logs(logs: Vec<Value>) -> (Transaction, Vec<AnchoredEvent>) {
+        let mut tx = Transaction {
+            hash: format!("0x{}", "ab".repeat(32)),
+            block_number: 7,
+            position: 0,
+            from_addr: format!("0x{}", "33".repeat(20)),
+            to_addr: Some(ANCHORING_ADDRESS.to_string()),
+            status: 1,
+            gas_used: 0,
+            base_fee: "0".into(),
+            contract_address: None,
+            fee_token: None,
+            fee_amount: "0".into(),
+            input: "0x".into(),
+            raw: None,
+            trace_data: None,
+            receipt_data: None,
+            timestamp: 1_700,
+            created_at: 0,
+        };
+        let receipt = json!({"status": "0x1", "logs": logs});
+        let (mut anchored, mut transfers, mut registries) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut tokens, mut next_log_index) = (HashSet::new(), 0u64);
+        apply_receipt(
+            &mut tx,
+            &receipt,
+            &mut transfers,
+            &mut anchored,
+            &mut registries,
+            &mut tokens,
+            &mut next_log_index,
+        );
+        (tx, anchored)
+    }
+
+    #[test]
+    fn only_the_precompiles_own_anchored_logs_are_indexed() {
+        // The whole trust argument for a namespace: the precompile reports the
+        // caller it actually saw. Any contract can emit the same signature.
+        let caller = "44".repeat(20);
+        let (_, anchored) = tx_with_logs(vec![anchored_log(ANCHORING_ADDRESS, &caller)]);
+        assert_eq!(anchored.len(), 1, "the precompile's own log is an anchor");
+        assert_eq!(anchored[0].namespace, checksum_address(&caller));
+
+        let impostor = format!("0x{}", "cc".repeat(20));
+        let (_, anchored) = tx_with_logs(vec![anchored_log(&impostor, &caller)]);
+        assert!(anchored.is_empty(), "a claimed namespace is not a namespace");
+    }
+
+    #[test]
+    fn the_precompile_is_recognised_however_its_address_is_spelled() {
+        // The gate compares addresses, not spellings: a node reporting the
+        // log address in lowercase still gets its anchors indexed.
+        let caller = "44".repeat(20);
+        let (_, anchored) = tx_with_logs(vec![anchored_log(
+            &ANCHORING_ADDRESS.to_lowercase(),
+            &caller,
+        )]);
+        assert_eq!(anchored.len(), 1);
+    }
 }

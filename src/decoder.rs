@@ -545,7 +545,13 @@ pub const APPROVAL_TOPIC: &str =
 pub const REGISTRY_DEPLOYED_TOPIC: &str =
     "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576";
 
-fn address_from_topic(topic: &str) -> String {
+/// Whether `addr` is 20 hex-encoded bytes — the shape, not the checksum.
+pub fn is_valid_address(addr: &str) -> bool {
+    let s = addr.strip_prefix("0x").unwrap_or(addr);
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn address_from_topic(topic: &str) -> String {
     let hexed = topic.strip_prefix("0x").unwrap_or(topic);
     let addr = &hexed[hexed.len().saturating_sub(40)..];
     checksum_address(addr)
@@ -555,26 +561,6 @@ fn uint256_from_data(data: &str, offset: usize) -> String {
     let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
     let chunk = bytes.get(offset * 32..offset * 32 + 32).unwrap_or(&[]);
     big_from_word(chunk).to_string()
-}
-
-/// An ABI `string` argument out of the data section: the word at `slot` is the
-/// offset of its tail, which starts with a length. Empty on any malformed shape.
-pub fn string_from_data(data: &str, slot: usize) -> String {
-    let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
-    let word = |at: usize| -> Option<usize> {
-        let w = bytes.get(at..at + 32)?;
-        if w[..24].iter().any(|b| *b != 0) {
-            return None;
-        }
-        Some(u64::from_be_bytes(w[24..].try_into().ok()?) as usize)
-    };
-    let read = || -> Option<String> {
-        let tail = word(slot * 32)?;
-        let len = word(tail)?;
-        let text = bytes.get(tail + 32..tail + 32 + len)?;
-        Some(String::from_utf8_lossy(text).into_owned())
-    };
-    read().unwrap_or_default()
 }
 
 fn bytes32_from_data(data: &str, offset: usize) -> String {
@@ -738,6 +724,61 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
                         ty: "uint256".into(),
                         name: "amount".into(),
                         value: uint256_from_data(&data, 0),
+                        indexed: false,
+                    },
+                ],
+            ))
+        }
+        REGISTRY_DEPLOYED_TOPIC => {
+            const REGISTRY_DEPLOYED_SIGNATURE: &str =
+                "RegistryDeployed(address,address,string,string,string)";
+            if topics.len() < 3 {
+                return Some(DecodedEvent {
+                    name: Some("RegistryDeployed".into()),
+                    signature: Some(REGISTRY_DEPLOYED_SIGNATURE.into()),
+                    contract,
+                    params: Vec::new(),
+                    topic0,
+                    log_index,
+                    transaction_hash,
+                });
+            }
+            // The two addresses are indexed; `data` is the three strings.
+            let raw = hex::decode(data.strip_prefix("0x").unwrap_or(&data)).unwrap_or_default();
+            let values = decode_abi_args(&["string", "string", "string"], &raw);
+            let text = |at: usize| values.get(at).cloned().unwrap_or_default();
+            Some(make(
+                "RegistryDeployed",
+                REGISTRY_DEPLOYED_SIGNATURE,
+                vec![
+                    DecodedParam {
+                        ty: "address".into(),
+                        name: "registry".into(),
+                        value: address_from_topic(topics[1].as_str().unwrap_or("")),
+                        indexed: true,
+                    },
+                    DecodedParam {
+                        ty: "address".into(),
+                        name: "creator".into(),
+                        value: address_from_topic(topics[2].as_str().unwrap_or("")),
+                        indexed: true,
+                    },
+                    DecodedParam {
+                        ty: "string".into(),
+                        name: "name".into(),
+                        value: text(0),
+                        indexed: false,
+                    },
+                    DecodedParam {
+                        ty: "string".into(),
+                        name: "description".into(),
+                        value: text(1),
+                        indexed: false,
+                    },
+                    DecodedParam {
+                        ty: "string".into(),
+                        name: "metadata".into(),
+                        value: text(2),
                         indexed: false,
                     },
                 ],

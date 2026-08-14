@@ -64,14 +64,16 @@
 </div>
 {% endif %}
 
+{% if total_pages > 1 %}
 <div class="flex justify-center gap-3 mt-5 text-xs items-center">
     {% if page > 1 %}
     <a href="/anchoring?page={{ page - 1 }}" class="badge badge-info hover:text-blue-300">← Previous</a>
     {% endif %}
-    <span class="text-dim">Page {{ page }}</span>
-    {% if namespaces | length == per_page %}
+    <span class="text-dim">Page {{ page }} of {{ total_pages }}</span>
+    {% if page < total_pages %}
     <a href="/anchoring?page={{ page + 1 }}" class="badge badge-info hover:text-blue-300">Next →</a>
     {% endif %}
 </div>
+{% endif %}
 
 {% endblock %}

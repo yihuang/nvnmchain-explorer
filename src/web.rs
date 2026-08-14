@@ -98,7 +98,9 @@ fn html_or_json(
     }
 }
 
-/// Common context keys every page needs (latest block + native symbol).
+/// Common context keys every page needs. Every rendered template extends
+/// `base.html`, so every one of these must be present or the render fails —
+/// build page contexts through here rather than by hand.
 fn page_ctx(state: &AppState, extra: Value) -> Value {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -107,17 +109,42 @@ fn page_ctx(state: &AppState, extra: Value) -> Value {
     );
     map.insert("native_symbol".into(), json!(state.cfg.native_symbol));
     map.insert("anchoring_url".into(), json!(state.cfg.anchoring_url));
-    // A kv read, not a COUNT: the indexer keeps the total.
-    map.insert(
-        "anchored_total".into(),
-        json!(db::count_anchored(&state.db)),
-    );
+    // The search box echoes it; only the search page has one to echo.
+    map.insert("query".into(), json!(""));
+    // From the stats blob, so the nav's anchoring gate costs no query.
+    map.insert("anchored_total".into(), json!(anchored_total(state)));
     if let Value::Object(o) = extra {
         for (k, v) in o {
             map.insert(k, v);
         }
     }
     Value::Object(map)
+}
+
+/// Anchors on record, read out of the stats blob without copying it — this
+/// runs on every page render.
+fn anchored_total(state: &AppState) -> i64 {
+    state
+        .stats
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get("anchored_total")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+/// The 1-based page a listing was asked for.
+fn page_param(query: &HashMap<String, String>) -> u32 {
+    query
+        .get("page")
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Pages needed to show `total` rows, never fewer than one.
+fn total_pages(total: i64, per_page: u32) -> u32 {
+    ((total as f64) / (per_page as f64)).ceil().max(1.0) as u32
 }
 
 /// Compact method badge for a transaction: decoded name > signature > selector.
@@ -298,11 +325,20 @@ pub async fn home(
         .get("total_blocks")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    let chain_head = stats.get("chain_head").and_then(Value::as_i64).unwrap_or(0);
-    let index_pct = stats
-        .get("index_pct")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
+    // A blob written before the head rode along in it (an upgrade, seeded from
+    // kv) has no chain_head; the kv row it came from does, so the bar shows
+    // real progress rather than 0% until the first recompute.
+    let chain_head = stats
+        .get("chain_head")
+        .and_then(Value::as_i64)
+        .filter(|head| *head > 0)
+        .or_else(|| db::get_kv(&state.db, "chain_head").and_then(|v| v.parse().ok()))
+        .unwrap_or(0);
+    let index_pct = if chain_head > 0 {
+        (indexed_count as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
     let ctx = page_ctx(
         &state,
         json!({
@@ -310,15 +346,12 @@ pub async fn home(
             "recent_blocks": recent_blocks,
             "recent_txs": recent_txs,
             "latest_num": latest_num,
-            "indexed_count": indexed_count,
             "chain_head": chain_head,
-            "index_pct": index_pct,
             "indexed_display": comma_num(indexed_count),
             "head_display": comma_num(chain_head),
-            "index_pct_display": format!("{:.1}", index_pct),
+            "index_pct_display": format!("{index_pct:.1}"),
             "spark_tx": spark_tx,
             "spark_gas": spark_gas,
-            "query": "",
         }),
     );
     html_or_json(&state, &headers, &query, "home.html", &ctx)
@@ -366,14 +399,13 @@ struct SseState {
 const SSE_MAX_REPLAY: usize = 4096;
 
 fn sse_event(payload: &Value) -> Result<Event, std::convert::Infallible> {
-    // Stats refreshes share the block channel; the payload key names the SSE
-    // event. A stats message lost to broadcast lag is not replayed -- the next
-    // tick supersedes it -- so the block replay logic below ignores them.
-    let name = if payload.get("stats").is_some() {
-        "stats"
-    } else {
-        "block"
-    };
+    // Stats refreshes share the block channel; each payload names its own kind,
+    // so a block that grows a `stats` field stays a block. A stats message lost
+    // to broadcast lag is not replayed -- the next tick supersedes it.
+    let name = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("block");
     Ok(Event::default().event(name).data(payload.to_string()))
 }
 
@@ -410,20 +442,28 @@ async fn sse_step(
         match received {
             Ok(block) => {
                 if let Some(n) = block.pointer("/block/number").and_then(Value::as_i64) {
+                    // Blocks still in the channel after a replay have already
+                    // been delivered from the DB; sending them again would
+                    // duplicate rows and walk `last_num` backwards.
+                    if n <= state.last_num {
+                        continue;
+                    }
                     state.last_num = n;
                 }
                 return Some((sse_event(&block), state));
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
+            Err(broadcast::error::RecvError::Lagged(_)) => {
                 // This client fell behind (browser throttled / connection
                 // stalled). The writer emits in number order, so the missed
                 // blocks are exactly `last_num + 1 ..= tip`; replay them from
-                // the DB instead of skipping them.
+                // the DB instead of skipping them. The dropped-message count is
+                // no use as a bound -- stats refreshes share this channel and
+                // are counted too -- so the tip bounds the window.
                 let tip = db::get_latest_block(&state.db)
                     .map(|b| b.number)
                     .unwrap_or(state.last_num);
                 let start = state.last_num + 1;
-                let end = tip.min(start + (n.min(SSE_MAX_REPLAY as u64) as i64) - 1);
+                let end = tip.min(start + SSE_MAX_REPLAY as i64 - 1);
                 for num in start..=end.max(start - 1) {
                     if let Some(b) = db::get_block_by_number(&state.db, num) {
                         let txs = db::get_block_transactions(&state.db, num);
@@ -500,7 +540,6 @@ pub async fn block_page(
             "gas_pct": gas_pct,
             "base_fee_gwei": format_token_amount(&block.base_fee, 9),
             "burnt_fees": burnt,
-            "query": "",
         }),
     );
     html_or_json(&state, &headers, &query, "block.html", &ctx)
@@ -512,11 +551,8 @@ pub async fn blocks_page(
     headers: HeaderMap,
 ) -> Response {
     let per_page: i64 = 25;
-    let page: i64 = query
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    // Bounded before the arithmetic below multiplies it.
+    let page = i64::from(page_param(&query));
     let from: Option<i64> = query.get("from").and_then(|f| f.parse().ok());
     let latest = db::get_latest_block(&state.db);
     let latest_num = latest.as_ref().map(|b| b.number).unwrap_or(0);
@@ -534,17 +570,19 @@ pub async fn blocks_page(
         i -= 1;
     }
 
-    let ctx = json!({
-        "blocks": blocks,
-        "latest_num": latest_num,
-        "total_blocks": latest_num + 1,
-        "per_page": per_page,
-        "page": page,
-        "first_num": blocks.first().and_then(|b| b.get("number")).and_then(Value::as_i64),
-        "last_num": blocks.last().and_then(|b| b.get("number")).and_then(Value::as_i64),
-        "latest_block": latest,
-        "query": "",
-    });
+    let ctx = page_ctx(
+        &state,
+        json!({
+            "blocks": blocks,
+            "latest_num": latest_num,
+            "total_blocks": latest_num + 1,
+            "per_page": per_page,
+            "page": page,
+            "first_num": blocks.first().and_then(|b| b.get("number")).and_then(Value::as_i64),
+            "last_num": blocks.last().and_then(|b| b.get("number")).and_then(Value::as_i64),
+            "latest_block": latest,
+        }),
+    );
     html_or_json(&state, &headers, &query, "blocks.html", &ctx)
 }
 
@@ -824,7 +862,6 @@ pub async fn tx_page(
             "fee_token_meta": fee_token_meta,
             "method": method,
             "active_tab": query.get("tab").cloned().unwrap_or_else(|| "overview".into()),
-            "query": "",
         }),
     );
     html_or_json(&state, &headers, &query, "tx.html", &ctx)
@@ -857,11 +894,7 @@ pub async fn address_page(
         .get("tab")
         .cloned()
         .unwrap_or_else(|| "transactions".into());
-    let page: u32 = query
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    let page = page_param(&query);
     let per_page: u32 = 25;
 
     let (transactions, html_transactions, tx_count, total_pages, transfer_count) =
@@ -930,7 +963,6 @@ pub async fn address_page(
             "total_pages": total_pages,
             "per_page": per_page,
             "active_tab": tab,
-            "query": "",
         }),
     );
     html_or_json(&state, &headers, &query, "address.html", &ctx)
@@ -986,11 +1018,7 @@ pub async fn token_page(
         .get("tab")
         .cloned()
         .unwrap_or_else(|| "transfers".into());
-    let page: u32 = query
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    let page = page_param(&query);
     let per_page: u32 = 25;
     let transfers = if tab == "transfers" {
         db::get_token_transfers(&state.db, &checksummed, page, per_page)
@@ -1010,7 +1038,6 @@ pub async fn token_page(
             "page": page,
             "per_page": per_page,
             "active_tab": tab,
-            "query": "",
         }),
     );
     html_or_json(&state, &headers, &query, "token.html", &ctx)
@@ -1021,11 +1048,7 @@ pub async fn tokens_page(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let page: u32 = query
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    let page = page_param(&query);
     let per_page: u32 = 25;
     let tokens = db::get_all_tokens(&state.db, page, per_page);
     let total = db::get_token_count(&state.db);
@@ -1038,7 +1061,6 @@ pub async fn tokens_page(
             "page": page,
             "total_pages": total_pages,
             "per_page": per_page,
-            "query": "",
         }),
     );
     html_or_json(&state, &headers, &query, "tokens.html", &ctx)
@@ -1080,21 +1102,25 @@ pub async fn anchoring_page(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let page: u32 = query
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    let page = page_param(&query);
     let per_page: u32 = 25;
+    // The panel is the same on every page; only the first one shows it.
+    let recent = if page == 1 {
+        anchored_rows(&db::get_recent_anchored(&state.db, 10))
+    } else {
+        Vec::new()
+    };
     let ctx = page_ctx(
         &state,
         json!({
             "namespaces": db::get_anchored_namespaces(&state.db, state.cfg.registry_factory.as_deref(), page, per_page),
-            "recent": anchored_rows(&db::get_recent_anchored(&state.db, 10)),
+            "recent": recent,
+            // Commitments for the header line, namespaces for the pager: the
+            // table lists one row per namespace.
             "total": db::count_anchored(&state.db),
             "page": page,
             "per_page": per_page,
-            "query": "",
+            "total_pages": total_pages(db::count_anchored_namespaces(&state.db), per_page),
         }),
     );
     html_or_json(&state, &headers, &query, "anchoring.html", &ctx)
@@ -1112,11 +1138,7 @@ pub async fn anchoring_namespace_page(
         return invalid_namespace(&state, &headers, &query, &namespace);
     }
     let namespace = checksummed;
-    let page: u32 = query
-        .get("page")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1)
-        .max(1);
+    let page = page_param(&query);
     let per_page: u32 = 25;
     let keys = db::get_namespace_keys(&state.db, &namespace, page, per_page);
     // Labelled when the configured factory deployed this namespace.
@@ -1133,7 +1155,7 @@ pub async fn anchoring_namespace_page(
             "keys": keys,
             "page": page,
             "per_page": per_page,
-            "query": "",
+            "total_pages": total_pages(db::count_namespace_keys(&state.db, &namespace), per_page),
         }),
     );
     html_or_json(&state, &headers, &query, "anchoring_namespace.html", &ctx)
@@ -1152,21 +1174,27 @@ pub async fn anchoring_key_page(
         return invalid_namespace(&state, &headers, &query, &namespace);
     }
     let namespace = checksummed;
-    let history = db::get_key_history(&state.db, &namespace, &key);
-    let Some(head) = history.first() else {
+    // The head is its own read: it belongs on every page of the history, and
+    // nothing bounds how long that history gets.
+    let Some(head) = db::get_key_head(&state.db, &namespace, &key) else {
         return not_found(&state, &headers, &query, "Anchored key", &key);
     };
-    let self_verifying = is_self_verifying(&head.commitment, &head.metadata);
-    let rows = anchored_rows(&history);
+    let page = page_param(&query);
+    let per_page: u32 = 25;
+    let revisions = db::count_key_revisions(&state.db, &namespace, &key);
+    let history = db::get_key_history(&state.db, &namespace, &key, page, per_page);
     let ctx = page_ctx(
         &state,
         json!({
             "namespace": namespace,
             "key": head.key,
-            "head": rows[0],
-            "self_verifying": self_verifying,
-            "history": rows,
-            "query": "",
+            "self_verifying": is_self_verifying(&head.commitment, &head.metadata),
+            "head": serde_json::to_value(&head).unwrap_or(Value::Null),
+            "history": anchored_rows(&history),
+            "revisions": revisions,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages(revisions, per_page),
         }),
     );
     html_or_json(&state, &headers, &query, "anchoring_key.html", &ctx)
@@ -1246,12 +1274,7 @@ pub async fn search_page(
             .to_string();
         return Redirect::to(&url).into_response();
     }
-    let ctx = json!({
-        "query": q,
-        "results": [],
-        "latest_block": db::get_latest_block(&state.db),
-        "native_symbol": state.cfg.native_symbol,
-    });
+    let ctx = page_ctx(&state, json!({"query": q, "results": []}));
     render_html(&state.tera, "search.html", &ctx)
 }
 
@@ -1278,7 +1301,9 @@ fn not_found(
 }
 
 fn not_found_html(state: &AppState, kind: &str, id: &str, message: &str) -> Response {
-    let ctx = json!({"type": kind, "id": id, "message": message});
+    // Through page_ctx like any other page: 404.html extends the layout, so a
+    // hand-built context renders nothing and the reader gets bare text.
+    let ctx = page_ctx(state, json!({"type": kind, "id": id, "message": message}));
     match tera::Context::from_serialize(&ctx) {
         Ok(tera_ctx) => match state.tera.render("404.html", &tera_ctx) {
             Ok(html) => (StatusCode::NOT_FOUND, Html(html)).into_response(),
@@ -1298,10 +1323,7 @@ fn not_found_html(state: &AppState, kind: &str, id: &str, message: &str) -> Resp
 // Helpers
 // ---------------------------------------------------------------------------
 
-pub fn is_valid_address(addr: &str) -> bool {
-    let s = addr.strip_prefix("0x").unwrap_or(addr);
-    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
+pub use crate::decoder::is_valid_address;
 
 fn parse_hex_i64(s: &str) -> i64 {
     if let Some(h) = s.strip_prefix("0x") {

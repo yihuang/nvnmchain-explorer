@@ -180,7 +180,7 @@ fn anchored_log_becomes_a_row() {
     );
     assert_eq!(event.namespace, REGISTRY);
 
-    let history = db::get_key_history(&db, REGISTRY, REGISTRY_KEY);
+    let history = db::get_key_history(&db, REGISTRY, REGISTRY_KEY, 1, 25);
     assert_eq!(history.len(), 1);
     let row = &history[0];
     assert_eq!(row.namespace, REGISTRY);
@@ -233,7 +233,7 @@ fn reindexing_a_block_does_not_duplicate() {
         REGISTRY_METADATA,
     );
     assert_eq!(db::count_anchored(&db), 1);
-    assert_eq!(db::get_key_history(&db, REGISTRY, REGISTRY_KEY).len(), 1);
+    assert_eq!(db::get_key_history(&db, REGISTRY, REGISTRY_KEY, 1, 25).len(), 1);
 }
 
 #[test]
@@ -243,7 +243,7 @@ fn history_is_newest_first_and_the_head_is_the_last_write() {
     index_anchor(&db, 200, &key, &format!("0x{}", "01".repeat(32)), "0x");
     index_anchor(&db, 201, &key, &format!("0x{}", "02".repeat(32)), "0x");
 
-    let history = db::get_key_history(&db, REGISTRY, &key);
+    let history = db::get_key_history(&db, REGISTRY, &key, 1, 25);
     assert_eq!(
         history.iter().map(|r| r.block_number).collect::<Vec<_>>(),
         vec![201, 200]
@@ -281,13 +281,11 @@ fn namespaces_are_partitioned_by_caller() {
         &tx,
         1,
     );
-    let txs = [tx];
-    let events = [mine, theirs];
     let bundle = BlockBundle {
         block,
-        txs: txs.to_vec(),
+        txs: vec![tx],
         transfers: vec![],
-        anchored: events.to_vec(),
+        anchored: vec![mine, theirs],
         tokens: vec![],
         registries: vec![],
     };
@@ -296,11 +294,11 @@ fn namespaces_are_partitioned_by_caller() {
     // Same key, different callers: the writes never collide.
     let other = nvnmchain_explorer::decoder::checksum_address(&other);
     assert_eq!(
-        db::get_key_history(&db, REGISTRY, &key)[0].commitment,
+        db::get_key_history(&db, REGISTRY, &key, 1, 25)[0].commitment,
         format!("0x{}", "07".repeat(32))
     );
     assert_eq!(
-        db::get_key_history(&db, &other, &key)[0].commitment,
+        db::get_key_history(&db, &other, &key, 1, 25)[0].commitment,
         format!("0x{}", "08".repeat(32))
     );
 
@@ -383,20 +381,18 @@ fn a_deployment_labels_its_namespace_for_the_configured_factory_only() {
         0,
     );
     // ...and its factory announced it.
-    let deployed = nvnmchain_explorer::indexer::registry_deployed(
-        &registry_deployed_log(FACTORY, REGISTRY, "docs"),
-        &tx,
-        1,
-    )
-    .expect("deployment parses");
+    let log = registry_deployed_log(FACTORY, REGISTRY, "docs");
+    let decoded = decode_event(&log).expect("decoded log");
+    assert_eq!(decoded.name.as_deref(), Some("RegistryDeployed"));
+    let deployed =
+        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx, 1).expect("deployment parses");
     assert_eq!(deployed.registry, REGISTRY);
     assert_eq!(deployed.name, "docs");
     assert_eq!(deployed.description, "docs about docs");
 
-    let txs = [tx];
     let bundle = BlockBundle {
         block,
-        txs: txs.to_vec(),
+        txs: vec![tx],
         transfers: vec![],
         anchored: vec![anchor],
         tokens: vec![],
@@ -427,6 +423,39 @@ fn a_deployment_labels_its_namespace_for_the_configured_factory_only() {
     assert!(db::get_registry(&db, &other, REGISTRY).is_none());
 }
 
+#[test]
+fn an_impostors_deployment_cannot_unlabel_a_registry() {
+    // RegistryDeployed is recorded from whoever emits it, so a contract can
+    // announce someone else's address. Recording that claim must not overwrite
+    // the trusted factory's: the row is keyed by both.
+    let (_dir, db) = temp_db();
+    let block = test_block(500);
+    let tx = test_tx(&block);
+    let deployed = |factory: &str, name: &str| {
+        let log = registry_deployed_log(factory, REGISTRY, name);
+        let decoded = decode_event(&log).expect("decoded log");
+        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx, 0).expect("parses")
+    };
+    let impostor = format!("0x{}", "ee".repeat(20));
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx.clone()],
+        transfers: vec![],
+        anchored: vec![],
+        tokens: vec![],
+        registries: vec![deployed(FACTORY, "docs"), deployed(&impostor, "not docs")],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
+
+    let trusted = db::get_registry(&db, FACTORY, REGISTRY).expect("the real deployment survives");
+    assert_eq!(trusted["name"], json!("docs"));
+    // The claim is still on record, readable only by trusting its emitter.
+    assert_eq!(
+        db::get_registry(&db, &impostor, REGISTRY).expect("recorded")["name"],
+        json!("not docs")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -445,11 +474,12 @@ async fn serve() -> (tempfile::TempDir, String) {
     );
 
     let cfg = nvnmchain_explorer::config::Settings::from_env();
+    let tera = web::build_tera(db.clone()).expect("templates");
     let state = AppState {
         db,
         rpc: nvnmchain_explorer::rpc::ChainRpc::from_settings(&cfg).expect("rpc"),
         cfg,
-        tera: web::build_tera(temp_db().1).expect("templates"),
+        tera,
         block_events: tokio::sync::broadcast::channel(16).0,
         stats: std::sync::Arc::new(std::sync::RwLock::new(serde_json::Value::Null)),
         shutdown: tokio::sync::watch::channel(false).1,
@@ -564,6 +594,34 @@ async fn malformed_namespace_and_unknown_key_are_rejected() {
         .await
         .expect("missing key");
     assert_eq!(missing.status(), 404);
+}
+
+/// Every page extends the layout, so a context assembled by hand is a page
+/// that cannot render. These are the routes that build one without a listing
+/// to page — the ones a template-only change breaks silently.
+#[tokio::test]
+async fn pages_without_rows_still_render_the_layout() {
+    let (_dir, base) = serve().await;
+    let client = reqwest::Client::new();
+
+    for (path, status) in [
+        ("/search?q=matchesnothing", 200),
+        ("/anchoring/not-an-address", 404),
+        ("/blocks", 200),
+        ("/tx/0xdeadbeef", 404),
+    ] {
+        let resp = client
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+        assert_eq!(resp.status(), status, "GET {path}");
+        let body = resp.text().await.expect("body");
+        assert!(
+            body.contains("</nav>"),
+            "GET {path} rendered the layout, not a bare fallback"
+        );
+    }
 }
 
 /// The layout, rendered with whatever `page_ctx` would have put in it.

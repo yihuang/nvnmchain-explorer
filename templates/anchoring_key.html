@@ -22,7 +22,9 @@
         </div>
         <div class="kv-row">
             <div class="kv-label">Metadata</div>
-            <div class="kv-value mono text-xs pre-wrap">{{ head.metadata }}</div>
+            {# Truncated: a payload is whatever the caller anchored, and the
+               whole of it belongs in the decoder linked below, not the layout. #}
+            <div class="kv-value mono text-xs pre-wrap break-all">{{ truncate_hash(h=head.metadata, prefix=512, suffix=6) }}</div>
         </div>
         <div class="kv-row">
             <div class="kv-label">Anchored in</div>
@@ -43,13 +45,13 @@
 </p>
 {% endif %}
 
-<h2 class="section-title mb-2">Revisions ({{ history | length }})</h2>
+<h2 class="section-title mb-2">Revisions ({{ revisions }})</h2>
 <div class="card overflow-x-auto">
     <div class="min-w-[720px]">
         <div class="flex table-header">
             <div class="w-24 px-3">Block</div>
             <div class="w-52 px-3">Commitment</div>
-            <div class="flex-1 px-3">Commitment</div>
+            <div class="flex-1 px-3">Metadata</div>
             <div class="w-40 px-3">Transaction</div>
             <div class="w-24 px-3 text-right">Age</div>
         </div>
@@ -59,7 +61,8 @@
                 <a href="/block/{{ row.block_number }}" class="text-blue-400 hover:text-blue-300">{{ row.block_number }}</a>
             </div>
             <div class="w-52 px-3 py-3 mono truncate text-dim">{{ truncate_hash(h=row.commitment, prefix=10, suffix=6) }}</div>
-            <div class="flex-1 px-3 py-3 truncate text-dim">{{ truncate_hash(h=row.commitment, prefix=10, suffix=6) }}</div>
+            {# The superseded revisions live only here: the precompile keeps the head. #}
+            <div class="flex-1 px-3 py-3 mono truncate text-dim">{{ truncate_hash(h=row.metadata, prefix=10, suffix=6) }}</div>
             <div class="w-40 px-3 py-3 mono truncate">
                 <a href="{{ get_tx_url(tx_hash=row.tx_hash) }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=row.tx_hash) }}</a>
             </div>
@@ -68,5 +71,17 @@
         {% endfor %}
     </div>
 </div>
+
+{% if total_pages > 1 %}
+<div class="flex justify-center gap-3 mt-5 text-xs items-center">
+    {% if page > 1 %}
+    <a href="/anchoring/{{ namespace }}/{{ key }}?page={{ page - 1 }}" class="badge badge-info hover:text-blue-300">← Previous</a>
+    {% endif %}
+    <span class="text-dim">Page {{ page }} of {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <a href="/anchoring/{{ namespace }}/{{ key }}?page={{ page + 1 }}" class="badge badge-info hover:text-blue-300">Next →</a>
+    {% endif %}
+</div>
+{% endif %}
 
 {% endblock %}

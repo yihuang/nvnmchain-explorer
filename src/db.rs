@@ -140,6 +140,20 @@ pub fn init_db(path: &str) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // `registries` first keyed on address alone, which let any contract's
+    // RegistryDeployed log replace the row a trusted factory wrote. Every row
+    // is re-derivable by indexing, so databases on the old key start over.
+    let address_keyed_alone = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('registries') WHERE pk > 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        == 1;
+    if address_keyed_alone {
+        conn.execute("DROP TABLE registries", [])?;
+    }
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS blocks (
@@ -269,9 +283,10 @@ pub fn init_db(path: &str) -> Result<Connection> {
 
         -- RegistryDeployed rows, factory recorded rather than filtered: reads
         -- trust only the configured factory, the way transfer rows carry their
-        -- token. One row per registry -- a contract deploys once.
+        -- token. Keyed by both, so a contract emitting the signature over
+        -- someone else's address writes its own row instead of replacing theirs.
         CREATE TABLE IF NOT EXISTS registries (
-            address BLOB PRIMARY KEY,
+            address BLOB NOT NULL,
             factory BLOB NOT NULL,
             creator BLOB NOT NULL,
             name TEXT NOT NULL DEFAULT '',
@@ -279,7 +294,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
             block_number INTEGER NOT NULL,
             log_index INTEGER NOT NULL DEFAULT 0,
             timestamp INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL DEFAULT 0
+            created_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (address, factory)
         );
 
         CREATE TABLE IF NOT EXISTS kv (
@@ -436,8 +452,8 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
         }
     }
     for event in &bundle.registries {
-        // OR REPLACE: a re-indexed block rewrites the same row, and a registry
-        // address deploys exactly once.
+        // OR REPLACE: a re-indexed block rewrites the same row. The key carries
+        // the factory, so this only ever replaces that factory's own claim.
         exec_cached(
             txn,
             "INSERT OR REPLACE INTO registries (address, factory, creator, name, description,
@@ -526,7 +542,6 @@ pub fn set_chain_head(db: &Db, head: i64) {
     let _ = set_kv(&conn, "chain_head", &head.to_string());
 }
 
-/// The last chain head observed by the indexer; `0` when unknown.
 /// Lowest stored block height; `None` when the table is empty.
 pub fn get_min_block_number(db: &Db) -> Option<i64> {
     query_opt(
@@ -1137,36 +1152,35 @@ fn refresh_anchored_namespace(conn: &Connection, event: &AnchoredEvent) -> Resul
             event.timestamp,
         ],
     )?;
-    // Total anchors, without a COUNT over the log: bumped only for fresh
-    // inserts, in the same transaction, so it never drifts.
-    exec_cached(
-        conn,
-        "INSERT INTO kv (key, value, updated_at) VALUES ('anchored_total', '1', ?1)
-         ON CONFLICT(key) DO UPDATE SET
-             value = CAST(value AS INTEGER) + 1, updated_at = excluded.updated_at",
-        params![now_ts()],
-    )?;
     Ok(())
 }
 
 /// Recompute every namespace's summary row from the log — idempotent, run once
 /// at startup for databases that predate the table; after that each block
-/// maintains it incrementally.
+/// maintains it incrementally. One transaction: a crash mid-rebuild would
+/// otherwise leave the summary empty while the log it summarises is full.
 pub fn sync_anchored_namespaces(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM anchored_namespaces", [])?;
-    conn.execute(
-        "INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DELETE FROM anchored_namespaces;
+         INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
          SELECT namespace, COUNT(*), COUNT(DISTINCT key), MAX(block_number), MAX(timestamp)
-         FROM anchored_events GROUP BY namespace",
-        [],
-    )?;
-    conn.execute(
-        "INSERT INTO kv (key, value, updated_at)
-         VALUES ('anchored_total', (SELECT COUNT(*) FROM anchored_events), ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        params![now_ts()],
+         FROM anchored_events GROUP BY namespace;
+         COMMIT;",
     )?;
     Ok(())
+}
+
+/// Whether the summary table needs the rebuild above: anchors on record but no
+/// summary rows to show for them (a database that predates the table).
+pub fn anchored_summary_is_stale(conn: &Connection) -> bool {
+    let exists = |sql: &str| {
+        conn.query_row(sql, [], |r| r.get::<_, i64>(0))
+            .map(|n| n != 0)
+            .unwrap_or(false)
+    };
+    exists("SELECT EXISTS(SELECT 1 FROM anchored_events LIMIT 1)")
+        && !exists("SELECT EXISTS(SELECT 1 FROM anchored_namespaces LIMIT 1)")
 }
 
 fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
@@ -1185,8 +1199,9 @@ fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
 
 /// The configured factory's registry at `namespace`, if that is what it is.
 pub fn get_registry(db: &Db, factory: &str, namespace: &str) -> Option<Value> {
-    let conn = lock(db);
-    conn.query_row(
+    query_opt(
+        &lock(db),
+        "get_registry",
         "SELECT name, description, creator, block_number FROM registries
          WHERE address=?1 AND factory=?2",
         params![hex_blob(namespace), hex_blob(factory)],
@@ -1199,9 +1214,6 @@ pub fn get_registry(db: &Db, factory: &str, namespace: &str) -> Option<Value> {
             }))
         },
     )
-    .optional()
-    .ok()
-    .flatten()
 }
 
 /// Namespaces that have anchored anything, busiest first. `factory` labels the
@@ -1212,107 +1224,175 @@ pub fn get_anchored_namespaces(
     page: u32,
     per_page: u32,
 ) -> Vec<Value> {
-    let conn = lock(db);
-    let offset = (page.saturating_sub(1) * per_page) as i64;
-    let Ok(mut stmt) = conn.prepare(
+    query_rows(
+        &lock(db),
+        "get_anchored_namespaces",
         "SELECT n.namespace, n.anchor_count, n.key_count, n.last_block, n.last_timestamp,
                 r.name
          FROM anchored_namespaces n
          LEFT JOIN registries r ON r.address = n.namespace AND r.factory = ?3
          ORDER BY n.anchor_count DESC, n.last_block DESC, n.namespace
          LIMIT ?1 OFFSET ?2",
-    ) else {
-        return Vec::new();
-    };
-    let factory_blob = factory.map(hex_blob).unwrap_or_default();
-    let Ok(rows) = stmt.query_map(params![per_page as i64, offset, factory_blob], |r| {
-        Ok(json!({
-            "namespace": crate::decoder::checksum_address(&blob_hex(&r.get::<_, Vec<u8>>(0)?)),
-            "anchor_count": r.get::<_, i64>(1)?,
-            "key_count": r.get::<_, i64>(2)?,
-            "last_block": r.get::<_, i64>(3)?,
-            "name": r.get::<_, Option<String>>(5)?,
-            "last_timestamp": r.get::<_, i64>(4)?,
-        }))
-    }) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+        // NULL when no factory is configured: `r.factory = NULL` matches
+        // nothing, where an empty blob could match a row that stored one.
+        params![
+            i64::from(per_page),
+            page_offset(page, per_page),
+            factory.map(hex_blob)
+        ],
+        |r| {
+            Ok(json!({
+                "namespace": crate::decoder::checksum_address(&blob_hex(&r.get::<_, Vec<u8>>(0)?)),
+                "anchor_count": r.get::<_, i64>(1)?,
+                "key_count": r.get::<_, i64>(2)?,
+                "last_block": r.get::<_, i64>(3)?,
+                "name": r.get::<_, Option<String>>(5)?,
+                "last_timestamp": r.get::<_, i64>(4)?,
+            }))
+        },
+    )
+}
+
+/// Namespaces on record, for paging the listing above.
+pub fn count_anchored_namespaces(db: &Db) -> i64 {
+    query_count(
+        &lock(db),
+        "count_anchored_namespaces",
+        "SELECT COUNT(*) FROM anchored_namespaces",
+        [],
+    )
+}
+
+/// Keys one namespace has anchored, for paging its listing — the summary row
+/// the insert path maintains, not a count over its anchors.
+pub fn count_namespace_keys(db: &Db, namespace: &str) -> i64 {
+    query_count(
+        &lock(db),
+        "count_namespace_keys",
+        // Wrapped in a subquery so a namespace with nothing anchored answers
+        // zero rather than no row at all.
+        "SELECT COALESCE((SELECT key_count FROM anchored_namespaces WHERE namespace=?1), 0)",
+        params![hex_blob(namespace)],
+    )
 }
 
 /// Keys a namespace has anchored, each at its head row — what `latest` returns.
+///
+/// Two steps rather than one window function over the namespace: the group-by
+/// is answered from `idx_anchored_ns_key` alone, then only the page's heads are
+/// read as rows, so no page view drags every revision's metadata through a sort.
 pub fn get_namespace_keys(db: &Db, namespace: &str, page: u32, per_page: u32) -> Vec<Value> {
     let conn = lock(db);
-    let offset = (page.saturating_sub(1) * per_page) as i64;
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT key, commitment, metadata, block_number, timestamp, tx_hash, revisions
-         FROM (
-             SELECT *,
-                    COUNT(*) OVER (PARTITION BY key) AS revisions,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY key ORDER BY block_number DESC, log_index DESC
-                    ) AS rn
-             FROM anchored_events
-             WHERE namespace = ?1
-         )
-         WHERE rn = 1
-         ORDER BY block_number DESC, log_index DESC
+    let ns = hex_blob(namespace);
+    let keys: Vec<(Vec<u8>, i64)> = query_rows(
+        &conn,
+        "get_namespace_keys",
+        "SELECT key, COUNT(*) AS revisions, MAX(block_number) AS last_block
+         FROM anchored_events WHERE namespace=?1
+         GROUP BY key
+         ORDER BY last_block DESC, key
          LIMIT ?2 OFFSET ?3",
-    ) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(params![hex_blob(namespace), per_page as i64, offset], |r| {
-        Ok(json!({
-            "key": blob_hex(&r.get::<_, Vec<u8>>(0)?),
-            "commitment": blob_hex(&r.get::<_, Vec<u8>>(1)?),
-            "metadata": blob_hex(&r.get::<_, Vec<u8>>(2)?),
-            "block_number": r.get::<_, i64>(3)?,
-            "timestamp": r.get::<_, i64>(4)?,
-            "tx_hash": blob_hex(&r.get::<_, Vec<u8>>(5)?),
-            "revisions": r.get::<_, i64>(6)?,
-        }))
-    }) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+        params![ns, i64::from(per_page), page_offset(page, per_page)],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+    keys.into_iter()
+        .filter_map(|(key, revisions)| {
+            query_opt(
+                &conn,
+                "get_namespace_keys head",
+                "SELECT commitment, metadata, block_number, timestamp, tx_hash
+                 FROM anchored_events WHERE namespace=?1 AND key=?2
+                 ORDER BY block_number DESC, log_index DESC LIMIT 1",
+                params![ns, key],
+                |r| {
+                    Ok(json!({
+                        "key": blob_hex(&key),
+                        "commitment": blob_hex(&r.get::<_, Vec<u8>>(0)?),
+                        "metadata": blob_hex(&r.get::<_, Vec<u8>>(1)?),
+                        "block_number": r.get::<_, i64>(2)?,
+                        "timestamp": r.get::<_, i64>(3)?,
+                        "tx_hash": blob_hex(&r.get::<_, Vec<u8>>(4)?),
+                        "revisions": revisions,
+                    }))
+                },
+            )
+        })
+        .collect()
 }
 
-/// Every revision of one `(namespace, key)`, newest first — the head is row zero.
-pub fn get_key_history(db: &Db, namespace: &str, key: &str) -> Vec<AnchoredEvent> {
-    let conn = lock(db);
-    let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1 AND key=?2
-         ORDER BY block_number DESC, log_index DESC"
-    )) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(params![hex_blob(namespace), hex_blob(key)], row_to_anchored)
-    else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+/// The head revision of one `(namespace, key)` — what `latest` returns.
+pub fn get_key_head(db: &Db, namespace: &str, key: &str) -> Option<AnchoredEvent> {
+    query_opt(
+        &lock(db),
+        "get_key_head",
+        &format!(
+            "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1 AND key=?2
+             ORDER BY block_number DESC, log_index DESC LIMIT 1"
+        ),
+        params![hex_blob(namespace), hex_blob(key)],
+        row_to_anchored,
+    )
+}
+
+/// One page of a key's revisions, newest first. Paged like every other listing:
+/// nothing bounds how often a key is re-anchored, and each row carries its
+/// whole metadata payload.
+pub fn get_key_history(
+    db: &Db,
+    namespace: &str,
+    key: &str,
+    page: u32,
+    per_page: u32,
+) -> Vec<AnchoredEvent> {
+    query_rows(
+        &lock(db),
+        "get_key_history",
+        &format!(
+            "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1 AND key=?2
+             ORDER BY block_number DESC, log_index DESC LIMIT ?3 OFFSET ?4"
+        ),
+        params![
+            hex_blob(namespace),
+            hex_blob(key),
+            i64::from(per_page),
+            page_offset(page, per_page)
+        ],
+        row_to_anchored,
+    )
+}
+
+/// Revisions on record for one key, for paging the history above.
+pub fn count_key_revisions(db: &Db, namespace: &str, key: &str) -> i64 {
+    query_count(
+        &lock(db),
+        "count_key_revisions",
+        "SELECT COUNT(*) FROM anchored_events WHERE namespace=?1 AND key=?2",
+        params![hex_blob(namespace), hex_blob(key)],
+    )
 }
 
 pub fn get_recent_anchored(db: &Db, limit: usize) -> Vec<AnchoredEvent> {
-    let conn = lock(db);
-    let Ok(mut stmt) = conn.prepare(&format!(
-        "SELECT {ANCHORED_COLS} FROM anchored_events
-         ORDER BY block_number DESC, log_index DESC LIMIT ?1"
-    )) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(params![limit as i64], row_to_anchored) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    query_rows(
+        &lock(db),
+        "get_recent_anchored",
+        &format!(
+            "SELECT {ANCHORED_COLS} FROM anchored_events
+             ORDER BY block_number DESC, log_index DESC LIMIT ?1"
+        ),
+        params![limit as i64],
+        row_to_anchored,
+    )
 }
 
-/// Total anchors ever indexed — the kv counter the summary fold maintains,
-/// so this is a point read rather than a COUNT over the log.
+/// Total anchors ever indexed. Summed over the summary table — one row per
+/// namespace, maintained with each insert — rather than counted over the log.
 pub fn count_anchored(db: &Db) -> i64 {
-    get_kv(db, "anchored_total")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    query_count(
+        &lock(db),
+        "count_anchored",
+        "SELECT COALESCE(SUM(anchor_count), 0) FROM anchored_namespaces",
+        [],
+    )
 }
 
 // ---------------------------------------------------------------------------

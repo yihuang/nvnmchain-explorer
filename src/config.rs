@@ -72,6 +72,23 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// The configured RegistryFactory, normalised to the form the stored rows use.
+/// Anything that is not an address is refused loudly: it would otherwise store
+/// as bytes matching nothing, and the operator would see an explorer that runs
+/// perfectly while labelling nothing.
+fn registry_factory() -> Option<String> {
+    let raw = env::var("REGISTRY_FACTORY").ok()?;
+    let addr = raw.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    if !crate::decoder::is_valid_address(addr) {
+        tracing::warn!("REGISTRY_FACTORY {addr:?} is not an address; registries stay unlabelled");
+        return None;
+    }
+    Some(crate::decoder::checksum_address(addr))
+}
+
 impl Settings {
     pub fn from_env() -> Self {
         Self {
@@ -92,9 +109,7 @@ impl Settings {
             anchoring_url: env::var("ANCHORING_URL")
                 .ok()
                 .filter(|url| !url.trim().is_empty()),
-            registry_factory: env::var("REGISTRY_FACTORY")
-                .ok()
-                .filter(|addr| !addr.trim().is_empty()),
+            registry_factory: registry_factory(),
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0),
         }
