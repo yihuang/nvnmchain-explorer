@@ -18,10 +18,10 @@ use tracing::{info, warn};
 use crate::config::Settings;
 use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event, flatten_trace};
-use crate::models::{Block, Transaction, TransferEvent};
+use crate::models::{BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
-use crate::tokens::{fetch_token_metadata, TokenMeta};
+use crate::tokens::fetch_token_metadata;
 
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
@@ -44,14 +44,6 @@ impl IndexerConfig {
             stats_interval: Duration::from_secs_f64(s.stats_interval_seconds.max(1.0)),
         }
     }
-}
-
-/// Everything needed to persist one block in a single SQLite transaction.
-pub struct BlockBundle {
-    pub block: Block,
-    pub txs: Vec<Transaction>,
-    pub transfers: Vec<TransferEvent>,
-    pub tokens: Vec<TokenMeta>,
 }
 
 /// Fetch a block and everything attached to it: transactions, receipts
@@ -351,13 +343,7 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
     let Some(bundle) = fetch_block_bundle(rpc, block_num).await? else {
         return Ok(());
     };
-    db::save_block_bundle(
-        db,
-        &bundle.block,
-        &bundle.txs,
-        &bundle.transfers,
-        &bundle.tokens,
-    )?;
+    db::save_block_bundle(db, &bundle)?;
     Ok(())
 }
 
@@ -707,6 +693,11 @@ pub async fn run_forever(
     // which re-reads each freshly indexed range from the DB in number order
     // (concurrent fetches complete out of order, so the writer cannot emit
     // gaplessly, and backfill history must not reach the live feed at all).
+    // How many queued bundles may share one commit. Only bounds how much one
+    // transaction holds: a writer that is keeping up sees an empty queue and
+    // commits per block; batching engages only once it falls behind.
+    const MAX_BATCH: usize = 64;
+
     let writer = tokio::spawn(async move {
         while let Some(bundle) = bundle_rx.recv().await {
             // On shutdown, stop draining the queue: in-flight bundles are
@@ -714,15 +705,18 @@ pub async fn run_forever(
             if *writer_shutdown.borrow() {
                 break;
             }
-            if let Err(e) = db::save_block_bundle(
-                &writer_db,
-                &bundle.block,
-                &bundle.txs,
-                &bundle.transfers,
-                &bundle.tokens,
-            ) {
-                warn!("db write failed for block {}: {e:#}", bundle.block.number);
-                continue;
+            // Fold in whatever is already queued; `try_recv` never waits, so
+            // this adds no latency.
+            let mut batch = vec![bundle];
+            while batch.len() < MAX_BATCH {
+                let Ok(next) = bundle_rx.try_recv() else {
+                    break;
+                };
+                batch.push(next);
+            }
+            if let Err(e) = db::save_block_bundles(&writer_db, &batch) {
+                let (first, last) = (batch[0].block.number, batch[batch.len() - 1].block.number);
+                warn!("db write failed for blocks {first}..={last}: {e:#}");
             }
         }
     });

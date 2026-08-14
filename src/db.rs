@@ -8,7 +8,7 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use crate::models::{Block, TokenMetadata, Transaction, TransferEvent};
+use crate::models::{Block, BlockBundle, TokenMetadata, Transaction, TransferEvent};
 
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -40,6 +40,10 @@ pub fn now_ts() -> i64 {
 pub fn init_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path).with_context(|| format!("open db {path}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // NORMAL fsyncs on checkpoint instead of per commit (WAL's FULL default).
+    // A power loss can lose the last few commits but never corrupts, and the
+    // index is derived data: the next start re-fetches the tail from the chain.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(
@@ -226,39 +230,51 @@ pub fn save_block(db: &Db, block: &Block) -> Result<()> {
     upsert_block(&conn, block)
 }
 
-/// Persist one indexed block atomically: the block, its transactions,
-/// transfer events, and any token metadata in a single SQLite transaction.
-pub fn save_block_bundle(
-    db: &Db,
-    block: &Block,
-    txs: &[Transaction],
-    transfers: &[TransferEvent],
-    tokens: &[crate::tokens::TokenMeta],
-) -> Result<()> {
+/// Persist one indexed block atomically.
+pub fn save_block_bundle(db: &Db, bundle: &BlockBundle) -> Result<()> {
+    save_block_bundles(db, std::slice::from_ref(bundle))
+}
+
+/// Persist several blocks in one transaction. A commit costs the same whether
+/// it carries one block or sixty, so queued blocks should share one instead of
+/// paying per block. Blocks are written in the order given.
+pub fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> {
+    if bundles.is_empty() {
+        return Ok(());
+    }
     let mut conn = lock(db);
-    let txn = conn.transaction().context("begin block transaction")?;
-    upsert_block(&txn, block)?;
-    for tx in txs {
-        upsert_transaction(&txn, tx)?;
+    let txn = conn.transaction().context("begin block batch")?;
+    for bundle in bundles {
+        write_block(&txn, bundle)?;
+    }
+    txn.commit().context("commit block batch")?;
+    Ok(())
+}
+
+/// One block's worth of writes, inside a caller-owned transaction.
+fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
+    upsert_block(txn, &bundle.block)?;
+    for tx in &bundle.txs {
+        upsert_transaction(txn, tx)?;
     }
     // Transfers are keyed by (block_number, log_index): re-writing an
     // already-indexed block inserts nothing the second time, and only
     // freshly-inserted transfers move balances / holder counts.
-    let mut inserted: Vec<&TransferEvent> = Vec::with_capacity(transfers.len());
-    for transfer in transfers {
-        if insert_transfer(&txn, transfer)? {
+    let mut inserted: Vec<&TransferEvent> = Vec::with_capacity(bundle.transfers.len());
+    for transfer in &bundle.transfers {
+        if insert_transfer(txn, transfer)? {
             inserted.push(transfer);
         }
     }
     // Upsert token metadata first so `refresh_holder_counts` below can
     // UPDATE the holder_count of freshly-seen tokens instead of seeding
     // them with the INSERT's literal 0.
-    for meta in tokens {
-        upsert_token_meta(&txn, meta)?;
+    for meta in &bundle.tokens {
+        upsert_token_meta(txn, meta)?;
     }
-    apply_transfer_balances(&txn, &inserted)?;
-    refresh_holder_counts(&txn, &inserted)?;
-    for tx in txs {
+    apply_transfer_balances(txn, &inserted)?;
+    refresh_holder_counts(txn, &inserted)?;
+    for tx in &bundle.txs {
         if let Some(addr) = &tx.contract_address {
             txn.execute(
                 "INSERT OR IGNORE INTO contract_labels (address, name, abi, is_token, is_precompile, created_at)
@@ -267,7 +283,6 @@ pub fn save_block_bundle(
             )?;
         }
     }
-    txn.commit().context("commit block transaction")?;
     Ok(())
 }
 
