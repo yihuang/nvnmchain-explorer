@@ -9,6 +9,11 @@ use nvnmchain_explorer::tokens::{
 };
 use serde_json::json;
 
+/// A fixture address from one repeated byte: `addr("22")` is `0x2222…2222`.
+fn addr(byte: &str) -> String {
+    checksum_address(&format!("0x{}", byte.repeat(20)))
+}
+
 fn transfer_calldata(to: &str, amount: u128) -> String {
     format!(
         "0xa9059cbb000000000000000000000000{}{:064x}",
@@ -675,4 +680,52 @@ fn huge_page_numbers_do_not_panic() {
         db::get_token_transfers(&db, &format!("0x{}", "aa".repeat(20)), u32::MAX, 25).is_empty()
     );
     assert!(db::get_all_tokens(&db, u32::MAX, 25).is_empty());
+}
+
+/// `authorizeKey(keyId, WebAuthn, KeyRestrictions{expiry, enforceLimits, one
+/// TokenLimit, allowAnyCalls: false, no CallScopes})`, encoded by `cast`.
+/// One 32-byte argument word per line; `->` marks an offset.
+const AUTHORIZE_KEY_CALLDATA: &str = concat!(
+    "0x980a6025",
+    "0000000000000000000000001111111111111111111111111111111111111111", // keyId
+    "0000000000000000000000000000000000000000000000000000000000000002", // signatureType: WebAuthn
+    "0000000000000000000000000000000000000000000000000000000000000060", // -> restrictions
+    "0000000000000000000000000000000000000000000000000000000070dbd880", // restrictions.expiry
+    "0000000000000000000000000000000000000000000000000000000000000001", // restrictions.enforceLimits
+    "00000000000000000000000000000000000000000000000000000000000000a0", // -> limits
+    "0000000000000000000000000000000000000000000000000000000000000000", // restrictions.allowAnyCalls
+    "0000000000000000000000000000000000000000000000000000000000000120", // -> allowedCalls
+    "0000000000000000000000000000000000000000000000000000000000000001", // limits.len
+    "0000000000000000000000002222222222222222222222222222222222222222", // limits[0].token
+    "00000000000000000000000000000000000000000000000000000000000003e8", // limits[0].amount
+    "0000000000000000000000000000000000000000000000000000000000015180", // limits[0].period
+    "0000000000000000000000000000000000000000000000000000000000000000", // allowedCalls.len
+);
+
+#[test]
+fn revoke_key_decodes() {
+    let revoke = format!("0x5ae7ab32{}{}", "00".repeat(12), "33".repeat(20));
+    let call = decode_function_call(&revoke).expect("revokeKey");
+    assert_eq!(call.name.as_deref(), Some("revokeKey"));
+    assert_eq!(call.params.len(), 1);
+    assert_eq!(call.params[0].name, "keyId");
+    assert_eq!(call.params[0].value, addr("33"));
+}
+
+#[test]
+fn authorize_key_restrictions_decode() {
+    // The old bare-`tuple` spelling decoded this parameter to nothing at all.
+    let call = decode_function_call(AUTHORIZE_KEY_CALLDATA).expect("authorizeKey");
+    let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert_eq!(call.params[0].value, addr("11"));
+    assert_eq!(call.params[1].value, "2");
+    // expiry, enforceLimits, one TokenLimit, allowAnyCalls, no CallScopes.
+    assert_eq!(
+        call.params[2].value,
+        format!(
+            "(1893456000, true, [({}, 1000, 86400)], false, [])",
+            addr("22")
+        )
+    );
 }

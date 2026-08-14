@@ -5,6 +5,8 @@
 //! top that renders addresses checksummed and integers decimal. Built-in
 //! TIP-20 / ERC-20 token metadata and labels round it out.
 
+use std::{collections::HashMap, sync::LazyLock};
+
 use ethers_core::abi::{
     decode as abi_decode, HumanReadableParser, ParamType, Token, Uint as EthersUint,
 };
@@ -337,19 +339,22 @@ fn tip20_fns() -> &'static [FnDef] {
     ]
 }
 
-fn additional_sigs() -> &'static [(&'static str, &'static str)] {
-    // selector -> "signature with parameter names"
+/// Functions known by signature alone, in the named form the UI shows. The
+/// selector is derived from this string when [`BY_SELECTOR`] is built, so
+/// there is no hand-written selector to fall out of step.
+fn additional_sigs() -> &'static [&'static str] {
     &[
-        ("0x70a08231", "balanceOf(address account)"),
-        ("0x18160ddd", "totalSupply()"),
-        ("0x06fdde03", "name()"),
-        ("0x95d89b41", "symbol()"),
-        ("0x313ce567", "decimals()"),
-        ("0xdd62ed3e", "allowance(address owner, address spender)"),
-        ("0x40c10f19", "mint(address to, uint256 amount)"),
-        ("0x42966c68", "burn(uint256 amount)"),
-        ("0x0b631400", "authorizeKey(address,uint8,tuple)"),
-        ("0x18783a95", "revokeKey(address keyId)"),
+        "balanceOf(address account)",
+        "totalSupply()",
+        "name()",
+        "symbol()",
+        "decimals()",
+        "allowance(address owner, address spender)",
+        // AccountKeychain. `KeyRestrictions` is spelled as the tuple it
+        // expands to, since the selector hashes the expansion.
+        "authorizeKey(address keyId, uint8 signatureType, \
+         (uint64,bool,(address,uint256,uint64)[],bool,(address,(bytes4,address[])[])[]) restrictions)",
+        "revokeKey(address keyId)",
     ]
 }
 
@@ -358,19 +363,92 @@ fn selector_hex(sig: &str) -> String {
     format!("0x{}", hex::encode(&hash[..4]))
 }
 
-fn param_types_and_names_from_sig(sig: &str) -> Vec<(String, String)> {
-    // Parse a human-readable signature like `balanceOf(address account)` with
-    // ethers' parser; the optional `function` keyword is also accepted. A
-    // bare `tuple` (no components) lexes as an empty tuple. Any failure
-    // degrades to an unlabeled call with no params.
-    match HumanReadableParser::parse_function(sig) {
-        Ok(fun) => fun
-            .inputs
-            .iter()
-            .map(|p| (p.kind.to_string(), p.name.clone()))
-            .collect(),
-        Err(_) => Vec::new(),
+/// How a recognised selector is decoded: a TIP-20 entry, or a signature-list
+/// entry parsed when the table is built.
+enum Known {
+    Tip20(&'static FnDef),
+    Sig(SigEntry),
+}
+
+/// A signature-list entry, parsed once at table build.
+struct SigEntry {
+    name: String,
+    canonical: String,
+    inputs: Vec<(String, String)>,
+}
+
+impl Known {
+    /// Name, canonical signature, and `(type, name)` inputs.
+    fn parts(&self) -> (&str, &str, Vec<(&str, &str)>) {
+        match self {
+            Known::Tip20(def) => (
+                def.name,
+                def.canonical,
+                def.inputs.iter().map(|&(t, n)| (t, n)).collect(),
+            ),
+            Known::Sig(entry) => (
+                &entry.name,
+                &entry.canonical,
+                entry
+                    .inputs
+                    .iter()
+                    .map(|(t, n)| (t.as_str(), n.as_str()))
+                    .collect(),
+            ),
+        }
     }
+}
+
+/// Selector -> function, hashed once rather than on every decode. TIP-20
+/// entries take precedence.
+static BY_SELECTOR: LazyLock<HashMap<String, Known>> =
+    LazyLock::new(|| build_table(tip20_fns(), additional_sigs()));
+
+/// Split out so precedence can be tested against a deliberate collision.
+fn build_table(tip20: &'static [FnDef], sigs: &'static [&'static str]) -> HashMap<String, Known> {
+    let mut by_selector = HashMap::new();
+    for def in tip20 {
+        by_selector.insert(selector_hex(def.canonical), Known::Tip20(def));
+    }
+    for &sig in sigs {
+        // Selector, canonical form, and parameter names all derive from the
+        // one spelling; an unparsable signature is skipped (caught by test).
+        let Ok(fun) = HumanReadableParser::parse_function(sig) else {
+            continue;
+        };
+        let selector = format!("0x{}", hex::encode(fun.short_signature()));
+        let types: Vec<String> = fun.inputs.iter().map(|p| p.kind.to_string()).collect();
+        by_selector.entry(selector).or_insert_with(|| {
+            Known::Sig(SigEntry {
+                canonical: format!("{}({})", fun.name, types.join(",")),
+                inputs: types
+                    .into_iter()
+                    .zip(fun.inputs.iter().map(|p| p.name.clone()))
+                    .collect(),
+                name: fun.name,
+            })
+        });
+    }
+    by_selector
+}
+
+/// Pair each declared input with its value; a missing one renders empty so
+/// the call's shape stays visible.
+fn decoded_params(inputs: &[(&str, &str)], values: &[String]) -> Vec<DecodedParam> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(i, (ty, name))| DecodedParam {
+            ty: ty.to_string(),
+            name: if name.is_empty() {
+                format!("arg{i}")
+            } else {
+                name.to_string()
+            },
+            value: values.get(i).cloned().unwrap_or_default(),
+            indexed: false,
+        })
+        .collect()
 }
 
 /// Decode 0x-prefixed calldata into a call descriptor (None for empty/trivial).
@@ -383,66 +461,28 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     if raw.len() < 4 {
         return None;
     }
-    let selector = &raw[..4];
+    let (selector, args) = raw.split_at(4);
     let sel_hex = format!("0x{}", hex::encode(selector));
-    let args = &raw[4..];
 
-    for def in tip20_fns() {
-        if selector_hex(def.canonical) == sel_hex {
-            let types: Vec<&str> = def.inputs.iter().map(|(t, _)| *t).collect();
+    // Both tables report the canonical signature; the names are on `params`.
+    let (name, signature, params) = match BY_SELECTOR.get(&sel_hex) {
+        Some(known) => {
+            let (name, canonical, inputs) = known.parts();
+            let types: Vec<&str> = inputs.iter().map(|&(t, _)| t).collect();
             let values = decode_abi_args(&types, args);
-            let params: Vec<DecodedParam> = def
-                .inputs
-                .iter()
-                .enumerate()
-                .map(|(i, (t, n))| DecodedParam {
-                    ty: t.to_string(),
-                    name: n.to_string(),
-                    value: values.get(i).cloned().unwrap_or_default(),
-                    indexed: false,
-                })
-                .collect();
-            return Some(DecodedCall {
-                name: Some(def.name.to_string()),
-                signature: Some(def.canonical.to_string()),
-                params,
-                selector: sel_hex,
-                raw_args: format!("0x{}", hex::encode(args)),
-            });
+            (
+                Some(name.to_string()),
+                Some(canonical.to_string()),
+                decoded_params(&inputs, &values),
+            )
         }
-    }
-
-    if let Some((_, sig)) = additional_sigs().iter().find(|(s, _)| s == &sel_hex) {
-        let inputs = param_types_and_names_from_sig(sig);
-        let type_refs: Vec<&str> = inputs.iter().map(|(t, _)| t.as_str()).collect();
-        let values = decode_abi_args(&type_refs, args);
-        let params: Vec<DecodedParam> = inputs
-            .iter()
-            .enumerate()
-            .map(|(i, (t, n))| DecodedParam {
-                ty: t.clone(),
-                name: if n.is_empty() {
-                    format!("arg{i}")
-                } else {
-                    n.clone()
-                },
-                value: values.get(i).cloned().unwrap_or_default(),
-                indexed: false,
-            })
-            .collect();
-        return Some(DecodedCall {
-            name: Some(sig.split('(').next().unwrap_or("").to_string()),
-            signature: Some(sig.to_string()),
-            params,
-            selector: sel_hex,
-            raw_args: format!("0x{}", hex::encode(args)),
-        });
-    }
+        None => (None, None, Vec::new()),
+    };
 
     Some(DecodedCall {
-        name: None,
-        signature: None,
-        params: Vec::new(),
+        name,
+        signature,
+        params,
         selector: sel_hex,
         raw_args: format!("0x{}", hex::encode(args)),
     })
@@ -933,26 +973,37 @@ mod tests {
         assert!(decode_abi_args(&["not-a-type"], &[0u8; 32]).is_empty());
     }
 
+    /// A signature-list entry must not shadow a TIP-20 entry; the live tables
+    /// share no selector, so build one that collides.
     #[test]
-    fn decode_authorize_key_signature_with_bare_tuple() {
-        // `authorizeKey(address,uint8,tuple)` parses via HumanReadableParser
-        // (bare `tuple` lexes as an empty tuple) instead of falling through
-        // to the unknown-selector branch.
-        // args: address(0), uint8(1), tuple offset -> 0x60 (points past the 3-word head).
-        let call = decode_function_call(concat!(
-            "0x0b631400",
-            "0000000000000000000000000000000000000000000000000000000000000000", // address
-            "0000000000000000000000000000000000000000000000000000000000000001", // uint8
-            "0000000000000000000000000000000000000000000000000000000000000060", // tuple offset
-        ))
-        .expect("decoded");
-        assert_eq!(call.name.as_deref(), Some("authorizeKey"));
-        assert_eq!(call.params.len(), 3);
-        assert_eq!(call.params[0].ty, "address");
-        assert_eq!(call.params[1].ty, "uint8");
-        assert_eq!(call.params[1].value, "1");
-        // A bare `tuple` lexes as an empty tuple, rendered canonically as `()`.
-        assert_eq!(call.params[2].ty, "()");
-        assert_eq!(call.params[2].value, "()");
+    fn tip20_wins_when_both_tables_claim_a_selector() {
+        static TIP20: [FnDef; 1] = [FnDef {
+            name: "burn",
+            canonical: "burn(uint256)",
+            inputs: &[("uint256", "amount")],
+        }];
+        let table = build_table(&TIP20, &["burn(uint256 value)"]);
+        match table.get(&selector_hex("burn(uint256)")) {
+            Some(Known::Tip20(def)) => assert_eq!(def.inputs[0].1, "amount"),
+            Some(Known::Sig(entry)) => {
+                panic!(
+                    "signature list shadowed the TIP-20 entry: {}",
+                    entry.canonical
+                )
+            }
+            None => panic!("burn(uint256) missing from the table"),
+        }
+    }
+
+    /// The table build skips an unparsable signature, which would silently
+    /// stop it from matching; catch that here.
+    #[test]
+    fn every_signature_parses() {
+        for &sig in additional_sigs() {
+            assert!(
+                HumanReadableParser::parse_function(sig).is_ok(),
+                "`{sig}` does not parse as a human-readable signature"
+            );
+        }
     }
 }
