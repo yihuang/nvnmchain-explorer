@@ -140,7 +140,7 @@ fn decode_transfer_event() {
     let log = json!({
         "address": format!("0x{}", "cc".repeat(20)),
         "topics": [
-            TRANSFER_TOPIC,
+            TRANSFER_TOPIC.as_str(),
             format!("0x{}{}", "00".repeat(12), from.trim_start_matches("0x")),
             format!("0x{}{}", "00".repeat(12), to.trim_start_matches("0x")),
         ],
@@ -297,7 +297,7 @@ fn balance_changes_from_receipt() {
         "logs": [{
             "address": format!("0x{}", "cc".repeat(20)),
             "topics": [
-                TRANSFER_TOPIC,
+                TRANSFER_TOPIC.as_str(),
                 format!("0x{}{}", "00".repeat(12), from.trim_start_matches("0x")),
                 format!("0x{}{}", "00".repeat(12), to.trim_start_matches("0x")),
             ],

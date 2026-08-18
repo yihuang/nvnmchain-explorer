@@ -533,20 +533,31 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
 // Event decoding
 // ---------------------------------------------------------------------------
 
-pub const TRANSFER_TOPIC: &str =
-    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-pub const TRANSFER_WITH_MEMO_TOPIC: &str =
-    "0xab2461e5dc8495f413774182e5eb0e9f0f30a81bf32c4b7a4a1d70c3c4e2f0a";
-pub const APPROVAL_TOPIC: &str =
-    "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+/// The signatures of the logs the explorer decodes.
+pub const TRANSFER_SIGNATURE: &str = "Transfer(address,address,uint256)";
+pub const TRANSFER_WITH_MEMO_SIGNATURE: &str = "TransferWithMemo(address,address,uint256,bytes32)";
+pub const APPROVAL_SIGNATURE: &str = "Approval(address,address,uint256)";
 pub const ANCHORED_SIGNATURE: &str = "Anchored(address,bytes32,bytes32,bytes)";
-/// `keccak256(ANCHORED_SIGNATURE)` — asserted in the tests so it cannot drift.
-pub const ANCHORED_TOPIC: &str =
-    "0x778db4d46fc7a84c4e5105dcb250cb47092b78648868d3efaf18e1205b25801d";
-/// `RegistryDeployed(address,address,string,string,string)` — the factory
-/// announcing a registry. Asserted against its signature in the tests.
-pub const REGISTRY_DEPLOYED_TOPIC: &str =
-    "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576";
+/// The factory announcing a registry.
+pub const REGISTRY_DEPLOYED_SIGNATURE: &str =
+    "RegistryDeployed(address,address,string,string,string)";
+
+/// `keccak256` of the signature beside it, in the lowercase `0x…` form the
+/// chain reports `topic0` in.
+///
+/// Derived, never written out: a mistyped hash does not fail loudly, it
+/// silently matches nothing. `TRANSFER_WITH_MEMO_TOPIC` was 63 hex digits, so
+/// no memo transfer was ever indexed.
+pub static TRANSFER_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(TRANSFER_SIGNATURE.as_bytes()));
+pub static TRANSFER_WITH_MEMO_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(TRANSFER_WITH_MEMO_SIGNATURE.as_bytes()));
+pub static APPROVAL_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(APPROVAL_SIGNATURE.as_bytes()));
+pub static ANCHORED_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(ANCHORED_SIGNATURE.as_bytes()));
+pub static REGISTRY_DEPLOYED_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(REGISTRY_DEPLOYED_SIGNATURE.as_bytes()));
 
 /// Lowercase `0x…` form, so hex from the chain and hex we derive compare equal.
 pub fn normalize_hex(value: &str) -> String {
@@ -573,12 +584,6 @@ fn uint256_from_data(data: &str, offset: usize) -> String {
     let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
     let chunk = bytes.get(offset * 32..offset * 32 + 32).unwrap_or(&[]);
     big_from_word(chunk).to_string()
-}
-
-fn bytes32_from_data(data: &str, offset: usize) -> String {
-    let bytes = hex::decode(data.strip_prefix("0x").unwrap_or(data)).unwrap_or_default();
-    let chunk = bytes.get(offset * 32..offset * 32 + 32).unwrap_or(&[]);
-    hex_bytes(chunk)
 }
 
 pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
@@ -618,19 +623,15 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
         };
 
     match topic0.as_str() {
-        TRANSFER_TOPIC => {
+        t if t == *TRANSFER_TOPIC => {
             if topics.len() < 3 {
-                return Some(make(
-                    "Transfer",
-                    "Transfer(address,address,uint256)",
-                    Vec::new(),
-                ));
+                return Some(make("Transfer", TRANSFER_SIGNATURE, Vec::new()));
             }
             let from = topics[1].as_str().unwrap_or("");
             let to = topics[2].as_str().unwrap_or("");
             Some(make(
                 "Transfer",
-                "Transfer(address,address,uint256)",
+                TRANSFER_SIGNATURE,
                 vec![
                     DecodedParam {
                         ty: "address".into(),
@@ -653,11 +654,11 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
                 ],
             ))
         }
-        TRANSFER_WITH_MEMO_TOPIC => {
+        t if t == *TRANSFER_WITH_MEMO_TOPIC => {
             if topics.len() < 3 {
                 return Some(make(
                     "TransferWithMemo",
-                    "TransferWithMemo(address,address,uint256,bytes32)",
+                    TRANSFER_WITH_MEMO_SIGNATURE,
                     Vec::new(),
                 ));
             }
@@ -665,7 +666,7 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
             let to = topics[2].as_str().unwrap_or("");
             Some(make(
                 "TransferWithMemo",
-                "TransferWithMemo(address,address,uint256,bytes32)",
+                TRANSFER_WITH_MEMO_SIGNATURE,
                 vec![
                     DecodedParam {
                         ty: "address".into(),
@@ -688,25 +689,27 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
                     DecodedParam {
                         ty: "bytes32".into(),
                         name: "memo".into(),
-                        value: bytes32_from_data(&data, 1),
-                        indexed: false,
+                        // Indexed in the TIP-20 ABI, so it rides in a topic;
+                        // the data holds only `amount`.
+                        value: topics
+                            .get(3)
+                            .and_then(Value::as_str)
+                            .map(normalize_hex)
+                            .unwrap_or_default(),
+                        indexed: true,
                     },
                 ],
             ))
         }
-        APPROVAL_TOPIC => {
+        t if t == *APPROVAL_TOPIC => {
             if topics.len() < 3 {
-                return Some(make(
-                    "Approval",
-                    "Approval(address,address,uint256)",
-                    Vec::new(),
-                ));
+                return Some(make("Approval", APPROVAL_SIGNATURE, Vec::new()));
             }
             let owner = topics[1].as_str().unwrap_or("");
             let spender = topics[2].as_str().unwrap_or("");
             Some(make(
                 "Approval",
-                "Approval(address,address,uint256)",
+                APPROVAL_SIGNATURE,
                 vec![
                     DecodedParam {
                         ty: "address".into(),
@@ -729,9 +732,7 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
                 ],
             ))
         }
-        REGISTRY_DEPLOYED_TOPIC => {
-            const REGISTRY_DEPLOYED_SIGNATURE: &str =
-                "RegistryDeployed(address,address,string,string,string)";
+        t if t == *REGISTRY_DEPLOYED_TOPIC => {
             if topics.len() < 3 {
                 return Some(make(
                     "RegistryDeployed",
@@ -780,7 +781,7 @@ pub fn decode_event(log: &Value) -> Option<DecodedEvent> {
                 ],
             ))
         }
-        ANCHORED_TOPIC => {
+        t if t == *ANCHORED_TOPIC => {
             if topics.len() < 3 {
                 return Some(make("Anchored", ANCHORED_SIGNATURE, Vec::new()));
             }
@@ -1042,6 +1043,62 @@ pub fn parse_decimal_or_hex(s: &str) -> i128 {
 mod tests {
     use super::*;
     use ethers_core::abi::encode as abi_encode;
+
+    /// Deriving stops a topic being mistyped; pinning the values stops a
+    /// signature being edited without noticing.
+    #[test]
+    fn topics_are_what_the_chain_reports() {
+        for (topic, expected) in [
+            (
+                &*TRANSFER_TOPIC,
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            ),
+            (
+                &*TRANSFER_WITH_MEMO_TOPIC,
+                "0x57bc7354aa85aed339e000bccffabbc529466af35f0772c8f8ee1145927de7f0",
+            ),
+            (
+                &*APPROVAL_TOPIC,
+                "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
+            ),
+            (
+                &*ANCHORED_TOPIC,
+                "0x778db4d46fc7a84c4e5105dcb250cb47092b78648868d3efaf18e1205b25801d",
+            ),
+            (
+                &*REGISTRY_DEPLOYED_TOPIC,
+                "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576",
+            ),
+        ] {
+            assert_eq!(topic, expected);
+        }
+    }
+
+    /// The bug: a memo transfer decoded as an unknown log, so none was ever
+    /// indexed.
+    #[test]
+    fn a_memo_transfer_decodes() {
+        let address = |byte: &str| format!("0x{}{}", "00".repeat(12), byte.repeat(20));
+        let memo = format!("0x{}", "ab".repeat(32));
+        let log = json!({
+            "address": format!("0x{}", "cc".repeat(20)),
+            // `memo` is indexed, so a real log carries it as a fourth topic
+            // and `data` holds `amount` alone.
+            "topics": [
+                TRANSFER_WITH_MEMO_TOPIC.as_str(),
+                address("11"),
+                address("22"),
+                memo,
+            ],
+            "data": format!("0x{:064x}", 1234u64),
+        });
+        let event = decode_event(&log).expect("decoded");
+        assert_eq!(event.name.as_deref(), Some("TransferWithMemo"));
+        assert_eq!(event.params[2].value, "1234");
+        assert_eq!(event.params[3].name, "memo");
+        assert_eq!(event.params[3].value, memo);
+        assert!(event.params[3].indexed);
+    }
 
     #[test]
     fn decode_abi_args_dynamic_string() {
