@@ -351,7 +351,7 @@ fn apply_receipt(
         // an impostor's payload is never worth decoding.
         let topic0 = log.pointer("/topics/0").and_then(Value::as_str);
         let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
-        if topic0 == Some(crate::decoder::ANCHORED_TOPIC)
+        if topic0 == Some(crate::decoder::ANCHORED_TOPIC.as_str())
             && !emitter.eq_ignore_ascii_case(ANCHORING_ADDRESS)
         {
             continue;
@@ -363,7 +363,7 @@ fn apply_receipt(
         // Both anchoring events are matched on topic0 rather than the decoded
         // display name, which is a UI label: renaming one must not silently
         // stop indexing it.
-        if decoded.topic0 == crate::decoder::REGISTRY_DEPLOYED_TOPIC {
+        if decoded.topic0 == *crate::decoder::REGISTRY_DEPLOYED_TOPIC {
             // The emitting factory rides in the row — reads decide which
             // factory to trust, the way transfer rows record their token.
             if let Some(event) = registry_deployed(&decoded, tx) {
@@ -371,7 +371,7 @@ fn apply_receipt(
             }
             continue;
         }
-        if decoded.topic0 == crate::decoder::ANCHORED_TOPIC {
+        if decoded.topic0 == *crate::decoder::ANCHORED_TOPIC {
             match anchored_event(&decoded, tx, log_index) {
                 Some(event) => anchored.push(event),
                 None => warn!("undecodable Anchored log {log_index} in {}", tx.hash),
@@ -1056,7 +1056,7 @@ mod tests {
         json!({
             "address": emitter,
             "topics": [
-                crate::decoder::ANCHORED_TOPIC,
+                crate::decoder::ANCHORED_TOPIC.as_str(),
                 format!("0x{}{}", "00".repeat(12), caller),
                 format!("0x{}", "11".repeat(32)),
             ],
@@ -1205,7 +1205,7 @@ mod tests {
                 "address": token,
                 "logIndex": "0x0",
                 "topics": [
-                    TRANSFER_TOPIC,
+                    TRANSFER_TOPIC.as_str(),
                     format!("0x{}{}", "00".repeat(12), from.trim_start_matches("0x")),
                     format!("0x{}{}", "00".repeat(12), to.trim_start_matches("0x")),
                 ],

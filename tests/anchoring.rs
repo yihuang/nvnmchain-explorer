@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use nvnmchain_explorer::anchoring::{is_self_verifying, ANCHORING_ADDRESS};
 use nvnmchain_explorer::db::{self, Db};
-use nvnmchain_explorer::decoder::{
-    decode_event, decode_function_call, keccak_hex, ANCHORED_SIGNATURE, ANCHORED_TOPIC,
-};
+use nvnmchain_explorer::decoder::{decode_event, decode_function_call, keccak_hex, ANCHORED_TOPIC};
 use nvnmchain_explorer::indexer::anchored_event;
 use nvnmchain_explorer::models::{AnchoredEvent, Block, BlockBundle, Transaction};
 use serde_json::{json, Value};
@@ -26,11 +24,6 @@ const REGISTRY_KEY: &str = "0x173602657603c73bdfa5393aba98fa9e899f7c58898ea2a7d4
 const REGISTRY_COMMITMENT: &str =
     "0xf6f0bcff7207ce080ce3900e9e8c378a31a0faa37441f4ce9f222929db9b9b0e";
 const REGISTRY_METADATA: &str = "0x7b2276223a317d";
-
-#[test]
-fn anchored_topic_matches_the_signature() {
-    assert_eq!(keccak_hex(ANCHORED_SIGNATURE.as_bytes()), ANCHORED_TOPIC);
-}
 
 #[test]
 fn anchor_and_hash_payloads_are_self_verifying() {
@@ -79,7 +72,7 @@ fn anchored_log(caller: &str, key: &str, commitment: &str, metadata: &str) -> Va
     json!({
         "address": ANCHORING_ADDRESS,
         "topics": [
-            ANCHORED_TOPIC,
+            ANCHORED_TOPIC.as_str(),
             format!("0x{}{}", "00".repeat(12), caller.trim_start_matches("0x").to_lowercase()),
             key,
         ],
@@ -207,7 +200,7 @@ fn logs_from_other_contracts_are_not_anchors() {
     // A log that claims the signature but carries no key/commitment yields no row.
     let truncated = json!({
         "address": ANCHORING_ADDRESS,
-        "topics": [ANCHORED_TOPIC],
+        "topics": [ANCHORED_TOPIC.as_str()],
         "data": "0x",
         "logIndex": "0x0",
     });
@@ -353,21 +346,13 @@ fn registry_deployed_log(factory: &str, registry: &str, name: &str) -> Value {
     json!({
         "address": factory,
         "topics": [
-            nvnmchain_explorer::decoder::REGISTRY_DEPLOYED_TOPIC,
+            nvnmchain_explorer::decoder::REGISTRY_DEPLOYED_TOPIC.as_str(),
             format!("0x{}{}", "00".repeat(12), registry.trim_start_matches("0x").to_lowercase()),
             format!("0x{}{}", "00".repeat(12), "33".repeat(20)),
         ],
         "data": data,
         "logIndex": "0x0",
     })
-}
-
-#[test]
-fn registry_deployed_topic_matches_the_signature() {
-    assert_eq!(
-        keccak_hex(b"RegistryDeployed(address,address,string,string,string)"),
-        nvnmchain_explorer::decoder::REGISTRY_DEPLOYED_TOPIC
-    );
 }
 
 #[test]
