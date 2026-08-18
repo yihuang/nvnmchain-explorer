@@ -979,40 +979,44 @@ pub async fn address_page(
     let page = page_param(&query);
     let per_page = PER_PAGE;
 
-    let (transactions, html_transactions, tx_count, total_pages, transfer_count) =
-        if tab == "transfers" {
-            let mut transfers = db::get_address_transfers(&state.db, &checksummed, page, per_page);
-            enrich_transfers(&state, &mut transfers);
-            let total = transfers.len() as i64;
-            (transfers.clone(), transfers, 0, 0, total)
-        } else {
-            let txs = db::get_address_transactions(&state.db, &checksummed, page, per_page);
-            let count = db::get_address_transaction_count(&state.db, &checksummed);
-            let total_pages = total_pages(count, per_page);
-            let html_txs: Vec<Value> = txs
-                .iter()
-                .map(|t| {
-                    json!({
-                        "tx_hash": t.hash,
-                        "tx_from": t.from_addr,
-                        "tx_to": t.to_addr,
-                        "tx_timestamp": t.timestamp,
-                        "tx_status": t.status,
-                        "tx_block": t.block_number,
-                        "tx_method": tx_method_badge(&t.input),
-                    })
+    // Both totals on every tab: the header shows them side by side, and the
+    // pager needs the total for whichever tab is open.
+    let tx_count = db::get_address_transaction_count(&state.db, &checksummed);
+    let transfer_count = db::get_address_transfer_count(&state.db, &checksummed);
+
+    let (transactions, html_transactions) = if tab == "transfers" {
+        let mut transfers = db::get_address_transfers(&state.db, &checksummed, page, per_page);
+        enrich_transfers(&state, &mut transfers);
+        (transfers.clone(), transfers)
+    } else {
+        let txs = db::get_address_transactions(&state.db, &checksummed, page, per_page);
+        let html_txs: Vec<Value> = txs
+            .iter()
+            .map(|t| {
+                json!({
+                    "tx_hash": t.hash,
+                    "tx_from": t.from_addr,
+                    "tx_to": t.to_addr,
+                    "tx_timestamp": t.timestamp,
+                    "tx_status": t.status,
+                    "tx_block": t.block_number,
+                    "tx_method": tx_method_badge(&t.input),
                 })
-                .collect();
-            (
-                txs.into_iter()
-                    .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
-                    .collect::<Vec<Value>>(),
-                html_txs,
-                count,
-                total_pages,
-                0,
-            )
-        };
+            })
+            .collect();
+        (
+            txs.into_iter()
+                .map(|t| serde_json::to_value(t).unwrap_or(Value::Null))
+                .collect::<Vec<Value>>(),
+            html_txs,
+        )
+    };
+    let total_pages = match tab.as_str() {
+        "transfers" => total_pages(transfer_count, per_page),
+        // Holdings is not paged: an address holds few enough tokens.
+        "holdings" => 1,
+        _ => total_pages(tx_count, per_page),
+    };
 
     let addr_info = identify_address(&checksummed);
     let is_token_addr = db::get_token_metadata(&state.db, &checksummed).is_some()
