@@ -1086,6 +1086,17 @@ pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -
     )
 }
 
+/// Every transfer an address sent or received. Counted, not inferred from the
+/// current page: a page is 25 rows whatever the total is.
+pub fn get_address_transfer_count(db: &Db, address: &str) -> i64 {
+    query_count(
+        &lock(db),
+        "get_address_transfer_count",
+        "SELECT COUNT(*) FROM transfer_events WHERE from_addr=?1 OR to_addr=?1",
+        params![hex_blob(address)],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Anchored events
 // ---------------------------------------------------------------------------
