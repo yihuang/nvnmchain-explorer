@@ -110,7 +110,7 @@ fn tempo_contracts() -> Vec<(&'static str, JsonAbi)> {
 }
 
 /// Everything the registry answers, built once.
-struct Registry {
+pub(crate) struct Registry {
     /// Registration order, so a lookup can say which ABI a match came from.
     contracts: Vec<&'static str>,
     /// Selector -> (contract index, function).
@@ -131,7 +131,7 @@ fn function_signature(f: &Function) -> String {
     signature_of(&f.name, f.inputs.iter().map(|p| p.kind.clone()))
 }
 
-fn event_signature(e: &Event) -> String {
+pub(crate) fn event_signature(e: &Event) -> String {
     signature_of(&e.name, e.inputs.iter().map(|p| p.kind.clone()))
 }
 
@@ -205,6 +205,13 @@ impl Registry {
         registry
     }
 
+    /// Every event the registry can decode, in no particular order. Exists
+    /// for the test that holds the phrasing table to it.
+    #[cfg(test)]
+    pub(crate) fn events(&self) -> impl Iterator<Item = &Event> {
+        self.events.values().map(|(_, event)| event)
+    }
+
     fn contract_name(&self, index: usize) -> &'static str {
         self.contracts.get(index).copied().unwrap_or("")
     }
@@ -215,7 +222,7 @@ impl Registry {
             .map(|(i, f)| (self.contract_name(*i), f))
     }
 
-    fn event(&self, topic0: &[u8; 32]) -> Option<(&'static str, &Event)> {
+    pub(crate) fn event(&self, topic0: &[u8; 32]) -> Option<(&'static str, &Event)> {
         self.events
             .get(topic0)
             .map(|(i, e)| (self.contract_name(*i), e))
@@ -228,7 +235,7 @@ impl Registry {
     }
 }
 
-static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::build);
+pub(crate) static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::build);
 
 // ---------------------------------------------------------------------------
 // Raw RLP transaction parsing (tempo primitives / alloy fork)
@@ -333,6 +340,18 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
 
 pub fn keccak_hex(input: &[u8]) -> String {
     format!("0x{}", hex::encode(keccak256(input)))
+}
+
+/// `0x12345678…9abc` — a hash or address short enough to read in a line.
+pub fn truncate_hash(h: &str, prefix: usize, suffix: usize) -> String {
+    if h.is_empty() {
+        return String::new();
+    }
+    if h.len() > prefix + suffix + 3 {
+        format!("{}…{}", &h[..prefix + 2], &h[h.len() - suffix..])
+    } else {
+        h.to_string()
+    }
 }
 
 /// EIP-55 checksummed address from any 40-hex-digit input (with or without 0x).
