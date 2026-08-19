@@ -312,12 +312,21 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances(holder_addr);
         "#,
     )?;
+    // The holdings of one token, in listing order — holder counts become
+    // covering scans and the holders page needs no sort. Built from HOLDING
+    // itself: a partial index only serves queries whose filter it provably
+    // implies, and identical text is the proof.
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_tb_holding
+         ON token_balances(token_addr, LENGTH(balance) DESC, balance DESC)
+         WHERE {HOLDING};"
+    ))?;
     Ok(conn)
 }
 
 /// Row offset of a 1-based page. Widened before multiplying: `page` comes
 /// straight from the query string, and u32 math overflows at page ~171M.
-fn page_offset(page: u32, per_page: u32) -> i64 {
+pub fn page_offset(page: u32, per_page: u32) -> i64 {
     i64::from(page.saturating_sub(1)) * i64::from(per_page)
 }
 
@@ -845,6 +854,14 @@ fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<bool> 
     Ok(inserted != 0)
 }
 
+/// What a holders listing counts and shows. Served by `idx_tb_holding`,
+/// which `init_db` builds from this same string.
+///
+/// A negative balance means indexing began after the holder was funded — the
+/// outbound transfers were seen, the inbound ones never were. That is not a
+/// holding, and since balances sort by digit count it would head the list.
+const HOLDING: &str = "balance NOT LIKE '-%'";
+
 fn bigint(s: &str) -> num_bigint::BigInt {
     num_bigint::BigInt::parse_bytes(s.as_bytes(), 10).unwrap_or_else(|| num_bigint::BigInt::from(0))
 }
@@ -907,7 +924,9 @@ fn refresh_holder_counts(conn: &Connection, transfers: &[&TransferEvent]) -> Res
             continue;
         }
         let count = conn
-            .prepare_cached("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1")?
+            .prepare_cached(&format!(
+                "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"
+            ))?
             .query_row(params![t.token_addr], |r| r.get::<_, i64>(0))?;
         exec_cached(
             conn,
@@ -949,7 +968,7 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
     }
     for token in touched {
         let count = conn.query_row(
-            "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
+            &format!("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"),
             params![token],
             |r| r.get::<_, i64>(0),
         )?;
@@ -1094,6 +1113,30 @@ pub fn get_address_transfer_count(db: &Db, address: &str) -> i64 {
         "get_address_transfer_count",
         "SELECT COUNT(*) FROM transfer_events WHERE from_addr=?1 OR to_addr=?1",
         params![hex_blob(address)],
+    )
+}
+
+/// One page of a token's holders as `(address, balance)`, largest first.
+///
+/// Balances are decimal strings, so numeric order is length then lexical:
+/// `BigInt::to_string` never zero-pads, and negatives are excluded, so the two
+/// keys together are exact.
+pub fn get_token_holders(
+    db: &Db,
+    token_addr: &str,
+    page: u32,
+    per_page: u32,
+) -> Vec<(String, String)> {
+    query_rows(
+        &lock(db),
+        "get_token_holders",
+        &format!(
+            "SELECT holder_addr, balance FROM token_balances
+             WHERE token_addr=?1 AND {HOLDING}
+             ORDER BY LENGTH(balance) DESC, balance DESC LIMIT ?2 OFFSET ?3"
+        ),
+        params![token_addr, per_page as i64, page_offset(page, per_page)],
+        |r| Ok((addr_from_value(r.get_ref(0)?), r.get(1)?)),
     )
 }
 
@@ -1441,7 +1484,7 @@ pub fn get_token_holder_count(db: &Db, token_addr: &str) -> i64 {
     query_count(
         &lock(db),
         "get_token_holder_count",
-        "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
+        &format!("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"),
         params![token_addr],
     )
 }
@@ -1456,7 +1499,7 @@ pub fn sync_holder_counts(conn: &Connection) -> Result<()> {
         .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())?;
     for token in tokens {
         let count = conn.query_row(
-            "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1",
+            &format!("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"),
             params![token],
             |r| r.get::<_, i64>(0),
         )?;

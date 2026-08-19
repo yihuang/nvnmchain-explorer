@@ -150,6 +150,34 @@
         }
         .tab:hover { color: var(--text); }
         .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+        /* Copy affordance. The button is quiet until its row is hovered, so a
+           table of a hundred addresses does not read as a table of buttons. */
+        .addr { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+        .addr > a { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .copy-btn {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 20px; height: 20px; flex-shrink: 0;
+            border: none; border-radius: 6px; padding: 0; cursor: pointer;
+            background: transparent; color: var(--faint);
+            opacity: 0; transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+        }
+        .t-row:hover .copy-btn, .kv-value:hover .copy-btn, .card-body:hover .copy-btn,
+        .copy-btn:focus-visible { opacity: 1; }
+        .copy-btn:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+        .copy-btn .copy-done { display: none; color: var(--green); font-size: 12px; font-weight: 700; }
+        .copy-btn.copied { opacity: 1; }
+        .copy-btn.copied svg { display: none; }
+        .copy-btn.copied .copy-done { display: inline; }
+        /* What the chain knows an address as — a precompile, a token, an alias. */
+        .addr-tag {
+            flex-shrink: 0;
+            font-family: 'Inter', sans-serif;
+            font-size: 10px; font-weight: 600;
+            letter-spacing: 0.02em;
+            padding: 1px 6px; border-radius: 999px;
+            background: rgba(129,140,248,0.14); color: #a5b4fc;
+            max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
         /* The verdict card at the top of a transaction. */
         .summary-headline { font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
         .summary-mark {
@@ -297,5 +325,41 @@
             </span>
         </div>
     </footer>
+    <script>
+        // One delegated listener for every copy button on the page.
+        document.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-copy]');
+            if (!button) return;
+            event.preventDefault();
+            copyText(button.dataset.copy).then((ok) => {
+                if (!ok) return;
+                button.classList.add('copied');
+                setTimeout(() => button.classList.remove('copied'), 1200);
+            });
+        });
+
+        // The async clipboard API needs a secure context; an explorer served
+        // over plain HTTP on a private network is a normal deployment, so fall
+        // back to the selection-based copy there.
+        async function copyText(text) {
+            if (navigator.clipboard && window.isSecureContext) {
+                try {
+                    await navigator.clipboard.writeText(text);
+                    return true;
+                } catch (e) { /* fall through */ }
+            }
+            const field = document.createElement('textarea');
+            field.value = text;
+            field.setAttribute('readonly', '');
+            field.style.position = 'fixed';
+            field.style.opacity = '0';
+            document.body.appendChild(field);
+            field.select();
+            let ok = false;
+            try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+            document.body.removeChild(field);
+            return ok;
+        }
+    </script>
 </body>
 </html>

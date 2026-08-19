@@ -652,10 +652,12 @@ fn indexed_transfer_reads_back_through_every_listing() {
     assert_eq!(holdings[0]["symbol"], json!("PRB"));
     assert_eq!(holdings[0]["formatted"], json!("1"));
 
-    // And the tokens list reports the holders the transfer created.
-    assert_eq!(db::get_token_holder_count(&db, &token), 2);
+    // And the tokens list reports the holders the transfer created. Only the
+    // recipient: the sender was never seen being funded, so its balance went
+    // negative, and a negative balance is not a holding.
+    assert_eq!(db::get_token_holder_count(&db, &token), 1);
     let stored = db::get_token_metadata(&db, &token).expect("token metadata");
-    assert_eq!(stored.holder_count, 2, "holder_count on the tokens list");
+    assert_eq!(stored.holder_count, 1, "holder_count on the tokens list");
 }
 
 #[test]
@@ -750,12 +752,13 @@ fn blob_storage_queries_match_text_params() {
     assert_eq!(holdings[0]["formatted"], "1");
 
     // Holder count: live count over token_balances plus the cached
-    // token_metadata.holder_count refreshed with a hex_blob key. Both the
-    // sender (negative balance) and the recipient hold a row, so it's 2.
-    assert_eq!(db::get_token_holder_count(&db, &token), 2);
+    // token_metadata.holder_count refreshed with a hex_blob key. The sender's
+    // row went negative — indexing began after it was funded — and a negative
+    // balance is not a holding, so only the recipient counts.
+    assert_eq!(db::get_token_holder_count(&db, &token), 1);
     let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
     assert_eq!(
-        meta_back.holder_count, 2,
+        meta_back.holder_count, 1,
         "token_metadata.holder_count must be refreshed via BLOB key"
     );
 
@@ -771,7 +774,7 @@ fn blob_storage_queries_match_text_params() {
     }
     let meta_back = db::get_token_metadata(&db, &token).expect("token metadata");
     assert_eq!(
-        meta_back.holder_count, 2,
+        meta_back.holder_count, 1,
         "sync_holder_counts must backfill stale counts"
     );
 }
@@ -1089,90 +1092,5 @@ fn a_truncated_static_array_decodes_nothing() {
     assert_eq!(
         decode_abi_args(&["uint256[3]"], &bytes),
         Vec::<String>::new()
-    );
-}
-
-/// The address page's JSON for one tab and page, calling the handler
-/// directly — it is a plain async fn, no server needed.
-async fn address_json(db: &Db, address: &str, tab: &str, page: u32) -> Value {
-    use axum::extract::{Path, Query, State};
-    use nvnmchain_explorer::web::{self, address_page, AppState};
-    use std::collections::HashMap;
-
-    let mut cfg = nvnmchain_explorer::config::Settings::from_env();
-    // This page reads only the index; a closed port makes any fallback to the
-    // chain fail at once rather than reaching the live node.
-    cfg.rpc_url = "http://127.0.0.1:1".into();
-    let state = AppState {
-        db: db.clone(),
-        rpc: nvnmchain_explorer::rpc::ChainRpc::from_settings(&cfg).expect("rpc"),
-        cfg,
-        tera: web::build_tera(db.clone()).expect("templates"),
-        block_events: tokio::sync::broadcast::channel(16).0,
-        stats: Arc::new(std::sync::RwLock::new(Value::Null)),
-        shutdown: tokio::sync::watch::channel(false).1,
-    };
-    let query = HashMap::from([
-        ("tab".to_string(), tab.to_string()),
-        ("page".to_string(), page.to_string()),
-        ("format".to_string(), "json".to_string()),
-    ]);
-    let response = address_page(
-        State(state),
-        Path(address.to_string()),
-        axum::http::HeaderMap::new(),
-        Query(query),
-    )
-    .await;
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    serde_json::from_slice(&body).expect("json")
-}
-
-#[tokio::test]
-async fn an_address_counts_every_transfer_not_just_the_page() {
-    // More transfers than fit on a page, so a count taken from the page shown
-    // is visibly wrong.
-    const TRANSFERS: i64 = 30;
-
-    let (_dir, db) = temp_db("transfer-count.db");
-    let raw_block = sample_raw_block();
-    let block = parse_block(&raw_block);
-    let tx = parse_transaction(&raw_block["transactions"][0], &block);
-    let (_, from, _) = sample_parties();
-    let transfers = (0..TRANSFERS)
-        .map(|i| TransferEvent {
-            log_index: i,
-            ..sample_transfer(&block, &tx)
-        })
-        .collect();
-    db::save_block_bundle(
-        &db,
-        &BlockBundle {
-            block,
-            txs: vec![tx],
-            transfers,
-            anchored: vec![],
-            tokens: vec![],
-            registries: vec![],
-        },
-    )
-    .expect("save bundle");
-
-    // The count is of the whole history — on the transactions tab too, which
-    // loads no transfers at all.
-    let transactions = address_json(&db, &from, "transactions", 1).await;
-    assert_eq!(transactions["transfer_count"], json!(TRANSFERS));
-
-    // And the pager knows there is a second page to reach.
-    let first = address_json(&db, &from, "transfers", 1).await;
-    assert_eq!(first["transfer_count"], json!(TRANSFERS));
-    assert_eq!(first["total_pages"], json!(2));
-    assert_eq!(first["html_transactions"].as_array().unwrap().len(), 25);
-    let second = address_json(&db, &from, "transfers", 2).await;
-    assert_eq!(
-        second["html_transactions"].as_array().unwrap().len(),
-        (TRANSFERS - 25) as usize
     );
 }

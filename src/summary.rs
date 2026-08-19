@@ -808,8 +808,8 @@ fn value_of(params: &[DecodedParam], name: &str) -> Option<String> {
         .map(|p| p.value.clone())
 }
 
-fn token_display(tokens: &Tokens, address: &str) -> Option<TokenDisplay> {
-    tokens.get(&address.to_lowercase()).cloned()
+fn token_display<'t>(tokens: &'t Tokens, address: &str) -> Option<&'t TokenDisplay> {
+    tokens.get(&address.to_lowercase())
 }
 
 /// An amount in the token's own units. Without metadata the raw integer
@@ -841,7 +841,7 @@ fn render_slot(slot: &Slot, event: &DecodedEvent, tokens: &Tokens) -> Option<Str
         Slot::Token(name) => {
             let address = value_of(params, name)?;
             match token_display(tokens, &address) {
-                Some(meta) if !meta.symbol.is_empty() => meta.symbol,
+                Some(meta) if !meta.symbol.is_empty() => meta.symbol.clone(),
                 _ => truncate(&address),
             }
         }
@@ -970,11 +970,12 @@ fn refine(known: &mut KnownEvent, event: &DecodedEvent, sender: Option<&str>) {
         }
         "order placed" => {
             let side = if flag("isBid") { "Buy" } else { "Sell" };
-            let kind = if flag("isFlipOrder") { "Flip" } else { "Limit" };
             if flag("isFlipOrder") {
                 known.kind = "flip order placed".into();
+                known.action = format!("Flip {side}");
+            } else {
+                known.action = format!("Limit {side}");
             }
-            known.action = format!("{kind} {side}");
         }
         "order flipped" => {
             let side = if flag("isBid") { "Buy" } else { "Sell" };
@@ -1046,12 +1047,9 @@ pub fn build_summary(
     }
 
     // Fee transfers happen on every transaction; they are never the point of
-    // one, so they only lead when nothing else did anything.
-    let leading = events
-        .iter()
-        .find(|e| is_preferred(e) && !e.is_fee)
-        .or_else(|| events.iter().find(|e| is_preferred(e)))
-        .or_else(|| events.first());
+    // one, so they only lead when nothing else did anything. Ties go to
+    // receipt order.
+    let leading = events.iter().min_by_key(|e| (!is_preferred(e), e.is_fee));
 
     let Some(event) = leading else {
         return TxSummary {
@@ -1115,7 +1113,7 @@ fn failure_summary(failure: &Failure, events: &[KnownEvent], tokens: &Tokens) ->
                 .map(String::from)
                 .or_else(|| Some(humanize_identifier(&d.name)))
         })
-        .or_else(|| humanize_raw_reason(failure.reason.as_deref()));
+        .or_else(|| failure.reason.as_deref().and_then(humanize_raw_reason));
 
     let mut details = Vec::new();
     match (failure.contract.as_deref(), failure.function.as_deref()) {
@@ -1246,8 +1244,8 @@ fn humanize_identifier(value: &str) -> String {
 
 /// The node's message without its boilerplate, or `None` when what is left is
 /// a hex blob.
-fn humanize_raw_reason(value: Option<&str>) -> Option<String> {
-    let cleaned = value?
+fn humanize_raw_reason(value: &str) -> Option<String> {
+    let cleaned = value
         .trim()
         .trim_start_matches("execution reverted")
         .trim_start_matches("reverted")
