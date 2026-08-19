@@ -150,6 +150,42 @@
         }
         .tab:hover { color: var(--text); }
         .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+        /* Search suggestions. */
+        .search-box { position: relative; }
+        .suggestions {
+            position: absolute;
+            top: calc(100% + 6px);
+            left: 0; right: 0;
+            z-index: 60;
+            background: var(--panel-2);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            box-shadow: 0 16px 40px rgba(0,0,0,0.45);
+            overflow: hidden;
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+        .suggestion {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 14px;
+            cursor: pointer;
+            border-bottom: 1px solid rgba(29,29,46,0.7);
+        }
+        .suggestion:last-child { border-bottom: none; }
+        .suggestion:hover, .suggestion[aria-selected="true"] { background: rgba(110,168,255,0.1); }
+        .suggestion-label { font-size: 13px; font-weight: 600; color: var(--text); }
+        .suggestion-sub {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px; color: var(--faint);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .suggestion-kind {
+            margin-left: auto; flex-shrink: 0;
+            font-size: 10px; font-weight: 600; letter-spacing: 0.06em;
+            text-transform: uppercase; color: var(--faint);
+        }
         /* Copy affordance. The button is quiet until its row is hovered, so a
            table of a hundred addresses does not read as a table of buttons. */
         .addr { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
@@ -303,8 +339,12 @@
                 </div>
             </div>
             <div class="pb-4">
-                <form action="/search" method="GET" class="max-w-2xl mx-auto">
-                    <input type="text" name="q" placeholder="Search block, transaction, address or token…" class="search-input" value="{{ query | default(value='') }}">
+                <form action="/search" method="GET" class="max-w-2xl mx-auto search-box" role="search">
+                    <input type="text" name="q" id="search-input" placeholder="Search block, transaction, address or token…"
+                           class="search-input" value="{{ query | default(value='') }}"
+                           autocomplete="off" role="combobox" aria-expanded="false"
+                           aria-controls="search-suggestions" aria-autocomplete="list">
+                    <div id="search-suggestions" class="suggestions" role="listbox" hidden></div>
                 </form>
             </div>
         </div>
@@ -360,6 +400,119 @@
             document.body.removeChild(field);
             return ok;
         }
+
+        // Search suggestions. Every answer comes from the index, so a keystroke
+        // costs one cheap request; a request still in flight when the next
+        // keystroke lands is abandoned rather than raced.
+        (() => {
+            const input = document.getElementById('search-input');
+            const panel = document.getElementById('search-suggestions');
+            if (!input || !panel) return;
+
+            let items = [];
+            let active = -1;
+            let debounce;
+            let inFlight;
+
+            function close() {
+                panel.hidden = true;
+                panel.innerHTML = '';
+                input.setAttribute('aria-expanded', 'false');
+                items = [];
+                active = -1;
+            }
+
+            function select(index) {
+                active = index;
+                for (const [i, item] of items.entries()) {
+                    item.setAttribute('aria-selected', i === index ? 'true' : 'false');
+                }
+                if (index >= 0) items[index].scrollIntoView({ block: 'nearest' });
+            }
+
+            function render(results) {
+                if (!results.length) return close();
+                panel.innerHTML = '';
+                for (const result of results) {
+                    const row = document.createElement('a');
+                    row.className = 'suggestion';
+                    row.setAttribute('role', 'option');
+                    row.setAttribute('aria-selected', 'false');
+                    row.href = result.url;
+
+                    const text = document.createElement('div');
+                    text.style.minWidth = '0';
+                    const label = document.createElement('div');
+                    label.className = 'suggestion-label';
+                    label.textContent = result.label;
+                    const sub = document.createElement('div');
+                    sub.className = 'suggestion-sub';
+                    sub.textContent = result.sublabel;
+                    text.append(label, sub);
+
+                    const kind = document.createElement('span');
+                    kind.className = 'suggestion-kind';
+                    kind.textContent = result.type;
+
+                    row.append(text, kind);
+                    panel.append(row);
+                }
+                items = [...panel.querySelectorAll('.suggestion')];
+                active = -1;
+                panel.hidden = false;
+                input.setAttribute('aria-expanded', 'true');
+            }
+
+            async function suggest(query) {
+                if (inFlight) inFlight.abort();
+                inFlight = new AbortController();
+                try {
+                    const response = await fetch(
+                        `/api/search?q=${encodeURIComponent(query)}`,
+                        { signal: inFlight.signal },
+                    );
+                    if (!response.ok) return close();
+                    const body = await response.json();
+                    // A slower answer to an older query must not replace the
+                    // suggestions for what is in the box now.
+                    if (body.query.trim() !== input.value.trim()) return;
+                    render(body.results || []);
+                } catch (e) {
+                    if (e.name !== 'AbortError') close();
+                }
+            }
+
+            input.addEventListener('input', () => {
+                const query = input.value.trim();
+                clearTimeout(debounce);
+                if (!query) return close();
+                debounce = setTimeout(() => suggest(query), 140);
+            });
+
+            input.addEventListener('keydown', (event) => {
+                if (panel.hidden || !items.length) return;
+                if (event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    select((active + 1) % items.length);
+                } else if (event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    select((active - 1 + items.length) % items.length);
+                } else if (event.key === 'Enter' && active >= 0) {
+                    // Only when something is highlighted; otherwise the form
+                    // submits and /search decides, as it always has.
+                    event.preventDefault();
+                    window.location.href = items[active].href;
+                } else if (event.key === 'Escape') {
+                    close();
+                }
+            });
+
+            input.addEventListener('blur', () => setTimeout(close, 120));
+            input.addEventListener('focus', () => {
+                const query = input.value.trim();
+                if (query) suggest(query);
+            });
+        })();
     </script>
 </body>
 </html>

@@ -827,6 +827,48 @@ pub fn get_token_by_symbol_or_name(db: &Db, q: &str) -> Option<TokenMetadata> {
     )
 }
 
+/// Tokens whose symbol or name contains `q`, best matches first: exact symbol,
+/// symbol prefix, name prefix, then the rest. Ranked in SQL so the ordering is
+/// one scan.
+pub fn search_tokens(db: &Db, q: &str, limit: u32) -> Vec<TokenMetadata> {
+    // One character matches too much to rank; two is where a partial name
+    // starts meaning something (the precompile search draws the same line).
+    let q = q.to_lowercase();
+    if q.len() < 2 {
+        return Vec::new();
+    }
+    // `q` is bound, never interpolated; the wildcards are added here so a
+    // literal `%` a reader types is matched as one rather than as a wildcard.
+    let escaped = q
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    query_rows(
+        &lock(db),
+        "search_tokens",
+        &format!(
+            "SELECT {TOKEN_COLS} FROM token_metadata
+             WHERE lower(symbol) LIKE ?2 ESCAPE '\\' OR lower(name) LIKE ?2 ESCAPE '\\'
+             ORDER BY
+                 CASE
+                     WHEN lower(symbol) = ?1 THEN 0
+                     WHEN lower(symbol) LIKE ?3 ESCAPE '\\' THEN 1
+                     WHEN lower(name) LIKE ?3 ESCAPE '\\' THEN 2
+                     ELSE 3
+                 END,
+                 holder_count DESC, symbol
+             LIMIT ?4"
+        ),
+        params![
+            q,
+            format!("%{escaped}%"),
+            format!("{escaped}%"),
+            limit as i64,
+        ],
+        row_to_token,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Transfer events
 // ---------------------------------------------------------------------------

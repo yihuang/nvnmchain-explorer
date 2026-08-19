@@ -25,7 +25,7 @@ use crate::anchoring::is_self_verifying;
 use crate::config::Settings;
 use crate::contracts::{
     get_contract_name, get_known_token, get_precompile_name, identify_address, is_contract,
-    is_tip20_token,
+    is_tip20_token, search_precompiles,
 };
 use crate::db::{self, Db};
 use crate::decoder::{
@@ -1557,7 +1557,11 @@ pub async fn search_page(
         }
     }
     if found.is_none() {
-        if let Some(meta) = db::get_token_by_symbol_or_name(&state.db, &q) {
+        // Exact symbol or name first, then the best partial match — so
+        // pressing Enter lands where the suggestions said it would.
+        let matched = db::get_token_by_symbol_or_name(&state.db, &q)
+            .or_else(|| db::search_tokens(&state.db, &q, 1).into_iter().next());
+        if let Some(meta) = matched {
             found = Some(json!({
                 "type": "token",
                 "id": meta.address,
@@ -1579,6 +1583,134 @@ pub async fn search_page(
     }
     let ctx = page_ctx(&state, json!({"query": q, "results": []}));
     render_html(&state.tera, "search.html", &ctx)
+}
+
+/// Enough suggestions to be useful, few enough to read without scrolling.
+const SUGGESTION_LIMIT: usize = 8;
+
+/// Suggestions for what the reader is typing, for the search box.
+///
+/// Answered from the index — no RPC — so a keystroke costs a few lookups.
+/// Anything that is definitely a hash or an address is offered whether indexed
+/// or not: being told "not found" on the page beats no suggestion at all.
+pub async fn search_suggest(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let raw = query.get("q").cloned().unwrap_or_default();
+    let q = raw.trim();
+    if q.is_empty() {
+        return suggest_response(&raw, Vec::new());
+    }
+
+    let mut results: Vec<Value> = Vec::new();
+    // `type` is both the routing hint and the label on the row, so a
+    // precompile says so rather than calling itself an address.
+    let suggestion = |kind: &str, url: String, label: String, sublabel: String| json!({"type": kind, "url": url, "label": label, "sublabel": sublabel});
+
+    // A block number, if the chain has reached it. The digit check keeps
+    // `parse` from accepting a sign the reader did not mean as a number.
+    let number = q.strip_prefix('#').unwrap_or(q);
+    if number.chars().all(|c| c.is_ascii_digit()) {
+        if let Some(block) = number
+            .parse::<i64>()
+            .ok()
+            .and_then(|n| db::get_block_by_number(&state.db, n))
+        {
+            results.push(suggestion(
+                "block",
+                format!("/block/{}", block.number),
+                format!("Block #{}", block.number),
+                format!("{} transactions", block.tx_count),
+            ));
+        }
+    }
+
+    let checksummed = checksum_address(q);
+    if is_valid_address(&checksummed) {
+        let label = address_label(&state.db, &checksummed);
+        // A token address goes to the token page, where the reader can
+        // actually see the supply and the holders.
+        if db::get_token_metadata(&state.db, &checksummed).is_some() {
+            results.push(suggestion(
+                "token",
+                format!("/token/{checksummed}"),
+                label.clone().unwrap_or_else(|| "Token".into()),
+                checksummed.clone(),
+            ));
+        }
+        let virtual_note = parse_virtual(&checksummed)
+            .map(|parts| format!("Virtual address · user tag {}", parts.user_tag));
+        results.push(suggestion(
+            "address",
+            format!("/address/{checksummed}"),
+            label.unwrap_or_else(|| "Address".into()),
+            virtual_note.unwrap_or_else(|| checksummed.clone()),
+        ));
+    } else if is_hash(q) {
+        // 32 bytes: a transaction hash, or a block hash.
+        if let Some(block) = db::get_block_by_hash(&state.db, q) {
+            results.push(suggestion(
+                "block",
+                format!("/block/{}", block.number),
+                format!("Block #{}", block.number),
+                q.to_string(),
+            ));
+        } else {
+            let indexed = db::get_transaction(&state.db, q);
+            results.push(suggestion(
+                "transaction",
+                format!("/tx/{q}"),
+                "Transaction".into(),
+                match &indexed {
+                    Some(tx) => format!("Block #{}", tx.block_number),
+                    None => "Not indexed yet".into(),
+                },
+            ));
+        }
+    } else {
+        // A name: tokens the index knows, then the built-in contracts.
+        for meta in db::search_tokens(&state.db, q, SUGGESTION_LIMIT as u32) {
+            results.push(suggestion(
+                "token",
+                format!("/token/{}", meta.address),
+                if meta.name.is_empty() {
+                    meta.symbol.clone()
+                } else {
+                    meta.name.clone()
+                },
+                format!("{} · {}", meta.symbol, truncate_hash(&meta.address, 8, 6)),
+            ));
+        }
+        for (address, name) in search_precompiles(q, SUGGESTION_LIMIT) {
+            results.push(suggestion(
+                "precompile",
+                format!("/address/{address}"),
+                name,
+                address,
+            ));
+        }
+    }
+
+    results.truncate(SUGGESTION_LIMIT);
+    suggest_response(&raw, results)
+}
+
+/// The suggestions as JSON, cacheable for a moment: backspacing re-asks the
+/// queries just asked, and the browser can answer those itself.
+fn suggest_response(query: &str, results: Vec<Value>) -> Response {
+    (
+        [(header::CACHE_CONTROL, "private, max-age=15")],
+        Json(json!({"query": query, "results": results})),
+    )
+        .into_response()
+}
+
+/// Whether `value` is 32 hex-encoded bytes — a transaction or block hash.
+fn is_hash(value: &str) -> bool {
+    value
+        .strip_prefix("0x")
+        .is_some_and(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,6 +1985,7 @@ pub fn app(state: AppState) -> Router {
         .route("/anchoring/{namespace}", get(anchoring_namespace_page))
         .route("/anchoring/{namespace}/{key}", get(anchoring_key_page))
         .route("/search", get(search_page))
+        .route("/api/search", get(search_suggest))
         // Public explorer: allow cross-origin reads from any site (the wallet
         // is hosted on a different origin and needs `?format=json`).
         .layer(CorsLayer::permissive())

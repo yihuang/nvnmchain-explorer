@@ -446,3 +446,101 @@ async fn precompiles_are_labelled_without_a_database_row() {
         None
     );
 }
+
+// ---------------------------------------------------------------------------
+// Search suggestions
+// ---------------------------------------------------------------------------
+
+async fn suggest(base: &str, query: &str) -> Vec<Value> {
+    let body: Value = reqwest::get(format!("{base}/api/search?q={}", urlencoding_encode(query)))
+        .await
+        .unwrap_or_else(|e| panic!("suggest {query}: {e}"))
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("suggest {query} json: {e}"));
+    body["results"].as_array().cloned().unwrap_or_default()
+}
+
+/// Minimal percent-encoding for the few characters the fixtures use.
+fn urlencoding_encode(value: &str) -> String {
+    value.replace('#', "%23").replace(' ', "%20")
+}
+
+#[tokio::test]
+async fn the_search_box_suggests_what_is_being_typed() {
+    let (_dir, base) = serve().await;
+
+    // A token by name, before the whole name is typed.
+    let by_name = suggest(&base, "path").await;
+    assert_eq!(by_name[0]["type"], json!("token"));
+    assert_eq!(by_name[0]["label"], json!("pathUSD"));
+    assert_eq!(
+        by_name[0]["url"],
+        json!(format!("/token/{}", checksum_address(TOKEN)))
+    );
+
+    // A precompile by name, which no database row describes. Matched as a
+    // substring, so a partial second word still finds it.
+    for term in ["fee", "fee man", "manager"] {
+        let precompile = suggest(&base, term).await;
+        assert!(
+            precompile
+                .iter()
+                .any(|r| r["label"] == json!("Fee Manager") && r["type"] == json!("precompile")),
+            "`{term}` got {precompile:#?}"
+        );
+    }
+
+    // A block number, and only one the chain has reached.
+    let block = suggest(&base, "100").await;
+    assert_eq!(block[0]["type"], json!("block"));
+    assert_eq!(block[0]["url"], json!("/block/100"));
+    assert!(suggest(&base, "999999").await.is_empty());
+    // The same, typed the way a reader refers to a block.
+    assert_eq!(suggest(&base, "#100").await[0]["url"], json!("/block/100"));
+
+    // A transaction hash resolves whether or not it is indexed — being told
+    // "not found" on the page beats being offered nothing.
+    let indexed = suggest(&base, TX_HASH).await;
+    assert_eq!(indexed[0]["type"], json!("transaction"));
+    assert_eq!(indexed[0]["sublabel"], json!("Block #100"));
+    let unknown = suggest(&base, &format!("0x{}", "12".repeat(32))).await;
+    assert_eq!(unknown[0]["sublabel"], json!("Not indexed yet"));
+
+    // An address is offered as itself; a token address as both.
+    let token_address = suggest(&base, TOKEN).await;
+    assert_eq!(token_address[0]["type"], json!("token"));
+    assert_eq!(token_address[1]["type"], json!("address"));
+    assert_eq!(token_address[1]["label"], json!("pathUSD"));
+
+    assert!(suggest(&base, "").await.is_empty());
+}
+
+/// A TIP-1022 deposit address is searchable, and says what it is — nothing
+/// else in the explorer would tell the reader that.
+#[tokio::test]
+async fn a_virtual_address_is_recognised_in_search() {
+    let (_dir, base) = serve().await;
+    let address = nvnmchain_explorer::tempo_address::virtual_address(&[0xab; 4], &[0xcd; 6]);
+
+    let results = suggest(&base, &address).await;
+    assert_eq!(results[0]["type"], json!("address"));
+    assert_eq!(results[0]["label"], json!("Virtual 0xabababab"));
+    assert_eq!(
+        results[0]["sublabel"],
+        json!("Virtual address · user tag 0xcdcdcdcdcdcd")
+    );
+}
+
+/// A search term is bound, never interpolated: a wildcard a reader types is a
+/// character to match, not a pattern that matches everything.
+#[tokio::test]
+async fn search_terms_are_never_patterns() {
+    let (_dir, base) = serve().await;
+    // Leaked wildcards would make these match pathUSD; escaped, they cannot.
+    assert!(suggest(&base, "%path%").await.is_empty());
+    assert!(suggest(&base, "_ath").await.is_empty());
+    assert!(suggest(&base, "' OR 1=1 --").await.is_empty());
+    // And one character matches too much to rank at all.
+    assert!(suggest(&base, "p").await.is_empty());
+}
