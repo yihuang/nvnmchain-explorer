@@ -2971,6 +2971,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-json-abi",
  "alloy-primitives",
  "anyhow",
  "axum",
@@ -2985,6 +2986,7 @@ dependencies = [
  "serde_json",
  "sha3 0.10.9",
  "tempfile",
+ "tempo-contracts 1.10.1 (git+https://github.com/NVNM-Chain/nvnmchain-tempo?rev=1b54cc998ae1)",
  "tempo-primitives",
  "tera",
  "tokio",
@@ -5037,13 +5039,36 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "serde",
- "tempo-hardfork",
+ "tempo-hardfork 1.10.1 (git+https://github.com/tempoxyz/tempo?tag=tempo-alloy%401.10.1)",
+]
+
+[[package]]
+name = "tempo-contracts"
+version = "1.10.1"
+source = "git+https://github.com/NVNM-Chain/nvnmchain-tempo?rev=1b54cc998ae1#1b54cc998ae18a13154daf83cd3b2e436f8f5e4b"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "serde",
+ "tempo-hardfork 1.10.1 (git+https://github.com/NVNM-Chain/nvnmchain-tempo?rev=1b54cc998ae1)",
 ]
 
 [[package]]
 name = "tempo-hardfork"
 version = "1.10.1"
 source = "git+https://github.com/tempoxyz/tempo?tag=tempo-alloy%401.10.1#3e95ed3d80be0fad2973f1abd2fb403d6c33011a"
+dependencies = [
+ "alloy-eips",
+ "alloy-evm",
+ "alloy-hardforks",
+ "paste",
+ "serde",
+]
+
+[[package]]
+name = "tempo-hardfork"
+version = "1.10.1"
+source = "git+https://github.com/NVNM-Chain/nvnmchain-tempo?rev=1b54cc998ae1#1b54cc998ae18a13154daf83cd3b2e436f8f5e4b"
 dependencies = [
  "alloy-eips",
  "alloy-evm",
@@ -5081,7 +5106,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tempo-contracts",
+ "tempo-contracts 1.10.1 (git+https://github.com/tempoxyz/tempo?tag=tempo-alloy%401.10.1)",
 ]
 
 [[package]]
