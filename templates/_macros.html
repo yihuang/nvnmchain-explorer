@@ -16,3 +16,35 @@
 </div>
 {% endif %}
 {% endmacro pager %}
+
+{# A copy-to-clipboard button. The value rides in `data-copy`; one delegated
+   listener in base.html does the copying, so a page of a hundred rows adds a
+   hundred buttons and no handlers. #}
+{% macro copy(text, label="Copy") %}
+<button type="button" class="copy-btn" data-copy="{{ text }}" title="{{ label }}" aria-label="{{ label }}">
+    <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+        <rect x="5.5" y="5.5" width="8" height="8" rx="1.6"></rect>
+        <path d="M10.5 3.5v-1a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h1"></path>
+    </svg>
+    <span class="copy-done" aria-hidden="true">✓</span>
+</button>
+{% endmacro copy %}
+
+{# An address: linked, tagged with whatever the chain knows it as, and
+   copyable. `full` spells the whole address out; the default truncates. #}
+{% macro copy_address(address, full=false) %}
+<span class="addr">
+    <a href="{{ get_address_url(address=address) }}" class="text-blue-400 hover:text-blue-300">{% if full %}{{ address }}{% else %}{{ truncate_hash(h=address, prefix=8, suffix=6) }}{% endif %}</a>
+    {% set tag = address_label(address=address) %}
+    {% if tag %}<span class="addr-tag" title="{{ tag }}">{{ tag }}</span>{% endif %}
+    {{ self::copy(text=address, label="Copy address") }}
+</span>
+{% endmacro copy_address %}
+
+{# A transaction hash: linked, truncated, and copyable. #}
+{% macro copy_tx(hash) %}
+<span class="addr">
+    <a href="/tx/{{ hash }}" class="mono text-blue-400 hover:text-blue-300">{{ truncate_hash(h=hash, prefix=10, suffix=6) }}</a>
+    {{ self::copy(text=hash, label="Copy hash") }}
+</span>
+{% endmacro copy_tx %}

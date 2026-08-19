@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{checksum_address, keccak256, keccak_hex, TRANSFER_TOPIC};
-use nvnmchain_explorer::models::{Block, Transaction};
+use nvnmchain_explorer::models::{Block, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::tokens::TokenMeta;
 use serde_json::{json, Value};
 
@@ -149,6 +149,41 @@ fn unknown_log_receipt() -> Value {
     })
 }
 
+/// How many transfers the sender is party to — more than one page of 25, so
+/// a count taken from the current page is visibly wrong.
+const TRANSFER_COUNT: i64 = 30;
+
+/// A block of transfers out of the sender, one unit to each recipient, which
+/// makes the holders list and its shares easy to state exactly. The sender
+/// was never funded, so its balance goes negative — a non-holding.
+fn transfer_bundle() -> BlockBundle {
+    let mut block = block();
+    block.number = 101;
+    block.hash = format!("0x{}", "ef".repeat(32));
+    let transfers = (0..TRANSFER_COUNT)
+        .map(|i| TransferEvent {
+            id: 0,
+            tx_hash: TX_HASH.into(),
+            block_number: 101,
+            log_index: i,
+            token_addr: checksum_address(TOKEN),
+            from_addr: checksum_address(SENDER),
+            to_addr: checksum_address(&format!("0x{:040x}", i + 1)),
+            amount: "1000000".into(),
+            timestamp: 1_700_000_000,
+            created_at: 0,
+        })
+        .collect();
+    BlockBundle {
+        block,
+        txs: Vec::new(),
+        transfers,
+        anchored: Vec::new(),
+        tokens: Vec::new(),
+        registries: Vec::new(),
+    }
+}
+
 async fn serve() -> (tempfile::TempDir, String) {
     use nvnmchain_explorer::web::{self, AppState};
 
@@ -174,6 +209,9 @@ async fn serve() -> (tempfile::TempDir, String) {
         },
     )
     .expect("token");
+    // More transfers than fit on a page, so the counts and the pager have
+    // something to be wrong about.
+    db::save_block_bundle(&db, &transfer_bundle()).expect("transfers");
 
     let cfg = nvnmchain_explorer::config::Settings::from_env();
     let tera = web::build_tera(db.clone()).expect("templates");
@@ -304,4 +342,107 @@ async fn an_unknown_log_still_appears() {
     assert_eq!(events[0]["params"][0]["name"], json!("data"));
     // With nothing interpretable, the summary says exactly that.
     assert_eq!(page["summary"]["headline"], json!("Transaction succeeded."));
+}
+
+// ---------------------------------------------------------------------------
+// Address and token pages
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_address_counts_every_transfer_not_just_the_page() {
+    let (_dir, base) = serve().await;
+    let sender = checksum_address(SENDER);
+
+    // The count is of the whole history; a page holds 25 of them.
+    for tab in ["transactions", "transfers"] {
+        let page = get_json(&base, &format!("/address/{sender}?tab={tab}")).await;
+        assert_eq!(
+            page["transfer_count"],
+            json!(TRANSFER_COUNT),
+            "transfer count on the {tab} tab"
+        );
+        assert_eq!(page["tx_count"], json!(3), "tx count on the {tab} tab");
+    }
+
+    // And the pager knows there is a second page to reach.
+    let transfers = get_json(&base, &format!("/address/{sender}?tab=transfers")).await;
+    assert_eq!(transfers["total_pages"], json!(2));
+    assert_eq!(transfers["html_transactions"].as_array().unwrap().len(), 25);
+
+    let second = get_json(&base, &format!("/address/{sender}?tab=transfers&page=2")).await;
+    assert_eq!(
+        second["html_transactions"].as_array().unwrap().len(),
+        (TRANSFER_COUNT - 25) as usize
+    );
+}
+
+#[tokio::test]
+async fn a_token_lists_its_holders() {
+    let (_dir, base) = serve().await;
+    let token = checksum_address(TOKEN);
+    let page = get_json(&base, &format!("/token/{token}?tab=holders")).await;
+
+    // Every recipient holds one unit; the sender's balance is negative, and a
+    // negative balance is not a holding, so the list is exactly the recipients.
+    assert_eq!(page["holders"], json!(TRANSFER_COUNT));
+    let rows = page["holder_rows"].as_array().expect("holder rows");
+    assert_eq!(rows.len(), 25, "one page of holders");
+    assert_eq!(rows[0]["rank"], json!(1));
+    assert_eq!(rows[0]["formatted"], json!("1"));
+    // 1,000,000 of a 1,000,000,000 supply.
+    assert_eq!(rows[0]["share"], json!("0.1000"));
+    assert_eq!(page["total_pages"], json!(2));
+
+    let second = get_json(&base, &format!("/token/{token}?tab=holders&page=2")).await;
+    assert_eq!(
+        second["holder_rows"].as_array().unwrap()[0]["rank"],
+        json!(26)
+    );
+}
+
+/// Addresses are copied all day; every page that shows one must offer it.
+#[tokio::test]
+async fn addresses_are_copyable_and_labelled() {
+    let (_dir, base) = serve().await;
+    let token = checksum_address(TOKEN);
+
+    let body = reqwest::get(format!("{base}/tx/{TX_HASH}"))
+        .await
+        .expect("tx page")
+        .text()
+        .await
+        .expect("body");
+    assert!(
+        body.contains(&format!("data-copy=\"{TX_HASH}\"")),
+        "the transaction hash is copyable"
+    );
+    assert!(
+        body.contains(&format!("data-copy=\"{token}\"")),
+        "the addresses on it are copyable"
+    );
+    // And an address the chain has a name for carries it.
+    assert!(body.contains("addr-tag"), "known addresses are tagged");
+    assert!(body.contains(">pathUSD<"), "the token is named");
+}
+
+/// A precompile is named by the built-in table rather than by the database.
+#[tokio::test]
+async fn precompiles_are_labelled_without_a_database_row() {
+    use nvnmchain_explorer::web::address_label;
+
+    let (_dir, db) = temp_db("labels.db");
+    assert_eq!(
+        address_label(&db, "0xfeEC000000000000000000000000000000000000").as_deref(),
+        Some("Fee Manager")
+    );
+    // A TIP-1022 deposit address says so — nothing else on the page would.
+    let deposit = nvnmchain_explorer::tempo_address::virtual_address(&[0xab; 4], &[1; 6]);
+    assert_eq!(
+        address_label(&db, &deposit).as_deref(),
+        Some("Virtual 0xabababab")
+    );
+    assert_eq!(
+        address_label(&db, "0x1111111111111111111111111111111111111111"),
+        None
+    );
 }

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}Transaction {{ truncate_hash(h=tx.hash, prefix=8, suffix=4) }} ⋅ nvnmchain Explorer{% endblock %}
 {% block content %}
 
@@ -52,7 +53,9 @@
         <div class="space-y-3.5">
             <div class="kv-row">
                 <div class="kv-label">Hash</div>
-                <div class="kv-value mono text-xs break-all">{{ tx.hash }}</div>
+                <div class="kv-value mono text-xs break-all">
+                    {{ tx.hash }}{{ ui::copy(text=tx.hash, label="Copy transaction hash") }}
+                </div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Block</div>
@@ -67,13 +70,13 @@
             </div>
             <div class="kv-row">
                 <div class="kv-label">From</div>
-                <div class="kv-value mono text-xs"><a href="{{ get_address_url(address=tx.from_addr) }}" class="text-blue-400 break-all">{{ tx.from_addr }}</a></div>
+                <div class="kv-value mono text-xs">{{ ui::copy_address(address=tx.from_addr, full=true) }}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">To</div>
                 <div class="kv-value mono text-xs">
                     {% if tx.to_addr %}
-                    <a href="{{ get_address_url(address=tx.to_addr) }}" class="text-blue-400 break-all">{{ tx.to_addr }}</a>
+                    {{ ui::copy_address(address=tx.to_addr, full=true) }}
                     {% else %}
                     <span class="text-faint">Contract creation
                     {%- if tx.contract_address %}
@@ -97,7 +100,7 @@
                 <div class="kv-label">Fee Payer</div>
                 <div class="kv-value mono text-xs">
                     {% if fee_payer %}
-                    <a href="{{ get_address_url(address=fee_payer) }}" class="text-blue-400 break-all">{{ fee_payer }}</a>
+                    {{ ui::copy_address(address=fee_payer, full=true) }}
                     {% else %}—{% endif %}
                 </div>
             </div>
@@ -337,9 +340,9 @@
             <span class="mono text-xs ml-2">{{ event.topic0 | truncate(length=50) }}</span>
             {% endif %}
         </div>
-        <div class="text-xs">
+        <div class="text-xs mono">
             <span class="text-faint">Contract: </span>
-            <a href="{{ get_address_url(address=event.contract) }}" class="text-blue-400 mono">{{ event.contract }}</a>
+            {{ ui::copy_address(address=event.contract, full=true) }}
         </div>
         {% if event.params %}
         <div class="space-y-1 text-xs mt-1 ml-2">

@@ -23,7 +23,10 @@ use tower_http::cors::CorsLayer;
 
 use crate::anchoring::is_self_verifying;
 use crate::config::Settings;
-use crate::contracts::{get_contract_name, identify_address, is_contract, is_tip20_token};
+use crate::contracts::{
+    get_contract_name, get_known_token, get_precompile_name, identify_address, is_contract,
+    is_tip20_token,
+};
 use crate::db::{self, Db};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
@@ -31,6 +34,7 @@ use crate::decoder::{
 };
 use crate::rpc::ChainRpc;
 use crate::summary::{build_summary, known_events, Failure, TokenDisplay, Tokens};
+use crate::tempo_address::parse_virtual;
 use crate::tokens::{
     fetch_token_metadata, format_token_amount, format_token_amount_with_symbol, has_control_chars,
 };
@@ -365,6 +369,76 @@ fn fee_breakdown(
         "charged": charged,
         "has_charge": tx.fee_amount != "0" && tx.fee_token.is_some(),
     })
+}
+
+/// What to call an address, in the few characters a tag allows — the most
+/// specific name first: a precompile's own name, a token's symbol, an indexed
+/// contract label, that an address is a TIP-1022 forwarding alias.
+pub fn address_label(db: &Db, address: &str) -> Option<String> {
+    let checksummed = checksum_address(address);
+    if !is_valid_address(&checksummed) {
+        return None;
+    }
+    if let Some(name) = get_precompile_name(&checksummed) {
+        return Some(name);
+    }
+    if let Some(meta) = db::get_token_metadata(db, &checksummed) {
+        if !meta.symbol.is_empty() {
+            return Some(meta.symbol);
+        }
+        if !meta.name.is_empty() {
+            return Some(meta.name);
+        }
+    }
+    if let Some(known) = get_known_token(&checksummed) {
+        return Some(known.symbol);
+    }
+    if let Some(name) = db::get_contract_label(db, &checksummed).filter(|n| !n.is_empty()) {
+        return Some(name);
+    }
+    if let Some(parts) = parse_virtual(&checksummed) {
+        return Some(format!("Virtual {}", parts.master_id));
+    }
+    if is_tip20_token(&checksummed) {
+        return Some("TIP-20".into());
+    }
+    None
+}
+
+/// One page of a token's holders, with balances in the token's own units and
+/// each share of supply. The share is percent with four decimals, divided in
+/// big integers so a supply too large for an f64 still comes out exact.
+fn token_holders(
+    state: &AppState,
+    token: &str,
+    meta: &crate::models::TokenMetadata,
+    page: u32,
+    per_page: u32,
+) -> Vec<Value> {
+    let supply = BigInt::parse_bytes(meta.total_supply.as_bytes(), 10).unwrap_or_default();
+    db::get_token_holders(&state.db, token, page, per_page)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (address, balance))| {
+            let share = if supply > BigInt::from(0) {
+                // balance/supply as percent ×10⁴, then the point re-inserted.
+                let scaled = BigInt::parse_bytes(balance.as_bytes(), 10).unwrap_or_default()
+                    * BigInt::from(1_000_000)
+                    / &supply;
+                let scaled: i64 = scaled.try_into().unwrap_or(0);
+                format!("{}.{:04}", scaled / 10_000, scaled % 10_000)
+            } else {
+                String::new()
+            };
+            json!({
+                "rank": db::page_offset(page, per_page) + i as i64 + 1,
+                "address": address,
+                "formatted": format_token_amount(&balance, meta.decimals),
+                "balance": balance,
+                "share": share,
+            })
+        })
+        .collect()
 }
 
 /// Burnt fees for a block: base fee × gas used, as a wei decimal string.
@@ -1247,14 +1321,30 @@ pub async fn token_page(
 
     let holders = db::get_token_holder_count(&state.db, &checksummed);
     let transfer_count = db::get_token_transfer_count(&state.db, &checksummed);
+    // The balances are already indexed — the page just never showed them.
+    let holder_rows = if tab == "holders" {
+        token_holders(&state, &checksummed, &meta, page, per_page)
+    } else {
+        Vec::new()
+    };
+    let total_pages = total_pages(
+        if tab == "holders" {
+            holders
+        } else {
+            transfer_count
+        },
+        per_page,
+    );
     let ctx = page_ctx(
         &state,
         json!({
             "token": meta,
             "transfers": transfers,
+            "holder_rows": holder_rows,
             "holders": holders,
             "transfer_count": transfer_count,
             "page": page,
+            "total_pages": total_pages,
             "per_page": per_page,
             "active_tab": tab,
         }),
@@ -1665,12 +1755,13 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
         let ts = args.get("timestamp").and_then(Value::as_i64).unwrap_or(0);
         Ok(Value::String(format_time_ago(ts)))
     });
+    let block_db = db.clone();
     tera.register_function("get_block_url", move |args: &HashMap<String, Value>| {
         let id = args.get("block_id").and_then(Value::as_str).unwrap_or("");
         let url = if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
             format!("/block/{id}")
         } else {
-            db::get_block_by_hash(&db, id)
+            db::get_block_by_hash(&block_db, id)
                 .map(|b| format!("/block/{}", b.number))
                 .unwrap_or_else(|| format!("/block/{id}"))
         };
@@ -1688,6 +1779,15 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
             format!("/address/{a}")
         };
         Ok(Value::String(url))
+    });
+    // What the chain knows an address as, for the tag beside it.
+    let label_db = db;
+    tera.register_function("address_label", move |args: &HashMap<String, Value>| {
+        let address = args.get("address").and_then(Value::as_str).unwrap_or("");
+        Ok(match address_label(&label_db, address) {
+            Some(label) => Value::String(label),
+            None => Value::Null,
+        })
     });
     tera.register_function("get_token_url", |args: &HashMap<String, Value>| {
         let a = args.get("address").and_then(Value::as_str).unwrap_or("");

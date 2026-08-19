@@ -16,6 +16,7 @@
     <div class="card-body">
         <div class="flex items-center gap-2.5 mb-5 flex-wrap">
             <span class="mono text-sm break-all">{{ address }}</span>
+            {{ ui::copy(text=address, label="Copy address") }}
             {% if type == 'precompile' %}
             <span class="badge badge-precompile">{{ label | fallback(value='Precompile') }}</span>
             {% elif type == 'token' %}
@@ -72,7 +73,7 @@
         {% for tx in html_transactions %}
         <div class="t-row flex text-xs">
             <div class="flex-1 px-3 py-3">
-                <a href="/tx/{{ tx.tx_hash }}" class="mono text-blue-400 hover:text-blue-300">{{ truncate_hash(h=tx.tx_hash, prefix=10, suffix=6) }}</a>
+                {{ ui::copy_tx(hash=tx.tx_hash) }}
                 {% if tx.tx_status == 0 %}<span class="badge badge-error ml-1">fail</span>{% endif %}
             </div>
             <div class="w-24 px-3 py-3">
@@ -82,11 +83,11 @@
                 {% if tx.tx_method %}<span class="badge badge-method mono">{{ tx.tx_method }}</span>{% else %}<span class="text-faint">—</span>{% endif %}
             </div>
             <div class="w-44 px-3 py-3 hidden md:block mono truncate">
-                <a href="{{ get_address_url(address=tx.tx_from) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=tx.tx_from) }}</a>
+                {{ ui::copy_address(address=tx.tx_from) }}
             </div>
             <div class="w-44 px-3 py-3 hidden md:block mono truncate">
                 {% if tx.tx_to %}
-                <a href="{{ get_address_url(address=tx.tx_to) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=tx.tx_to) }}</a>
+                {{ ui::copy_address(address=tx.tx_to) }}
                 {% else %}<span class="text-faint">create</span>{% endif %}
             </div>
             <div class="w-20 px-3 py-3 text-right text-dim">{{ format_time_ago(timestamp=tx.tx_timestamp) }}</div>
@@ -114,13 +115,13 @@
         {% for t in html_transactions %}
         <div class="t-row flex text-xs">
             <div class="flex-1 px-3 py-3">
-                <a href="/tx/{{ t.tx_hash }}" class="mono text-blue-400 hover:text-blue-300">{{ truncate_hash(h=t.tx_hash, prefix=10, suffix=6) }}</a>
+                {{ ui::copy_tx(hash=t.tx_hash) }}
             </div>
             <div class="w-36 px-3 py-3 hidden md:block mono truncate">
-                <a href="{{ get_address_url(address=t.from_addr) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=t.from_addr) }}</a>
+                {{ ui::copy_address(address=t.from_addr) }}
             </div>
             <div class="w-36 px-3 py-3 hidden md:block mono truncate">
-                <a href="{{ get_address_url(address=t.to_addr) }}" class="text-dim hover:text-blue-300">{{ truncate_hash(h=t.to_addr) }}</a>
+                {{ ui::copy_address(address=t.to_addr) }}
             </div>
             <div class="w-40 px-3 py-3 text-right mono {% if t.to_addr == address %}value-positive{% else %}value-negative{% endif %}">
                 {{ t.amount_formatted | fallback(value=t.amount) }}
