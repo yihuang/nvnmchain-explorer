@@ -312,6 +312,15 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances(holder_addr);
         "#,
     )?;
+    // The holdings of one token, in listing order — holder counts become
+    // covering scans and the holders page needs no sort. Built from HOLDING
+    // itself: a partial index only serves queries whose filter it provably
+    // implies, and identical text is the proof.
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS idx_tb_holding
+         ON token_balances(token_addr, LENGTH(balance) DESC, balance DESC)
+         WHERE {HOLDING};"
+    ))?;
     Ok(conn)
 }
 
@@ -845,7 +854,8 @@ fn insert_transfer(conn: &Connection, transfer: &TransferEvent) -> Result<bool> 
     Ok(inserted != 0)
 }
 
-/// What a holders listing counts and shows.
+/// What a holders listing counts and shows. Served by `idx_tb_holding`,
+/// which `init_db` builds from this same string.
 ///
 /// A negative balance means indexing began after the holder was funded — the
 /// outbound transfers were seen, the inbound ones never were. That is not a
