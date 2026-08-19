@@ -23,13 +23,14 @@ use tower_http::cors::CorsLayer;
 
 use crate::anchoring::is_self_verifying;
 use crate::config::Settings;
-use crate::contracts::{identify_address, is_contract};
+use crate::contracts::{get_contract_name, identify_address, is_contract, is_tip20_token};
 use crate::db::{self, Db};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
-    flatten_trace,
+    flatten_trace, revert_data_in, DecodedEvent,
 };
 use crate::rpc::ChainRpc;
+use crate::summary::{build_summary, known_events, Failure, TokenDisplay, Tokens};
 use crate::tokens::{
     fetch_token_metadata, format_token_amount, format_token_amount_with_symbol, has_control_chars,
 };
@@ -253,6 +254,117 @@ pub async fn replay_tx_calls(
             Err(e) => Some(e.message.clone()),
         })
         .collect()
+}
+
+/// The tokens a log is about: the contract that emitted it, plus any its
+/// arguments name. Matched by address shape, since every event that names a
+/// token names it differently.
+fn tokens_mentioned(event: &DecodedEvent) -> Vec<String> {
+    std::iter::once(event.contract.clone())
+        .chain(
+            event
+                .params
+                .iter()
+                .filter(|p| p.ty == "address" && is_tip20_token(&p.value))
+                .map(|p| p.value.clone()),
+        )
+        .collect()
+}
+
+/// Symbol and decimals per address, keyed lowercase: a log and the database
+/// need not agree on checksum casing.
+fn token_display_map(state: &AppState, addresses: impl Iterator<Item = String>) -> Tokens {
+    let mut wanted: Vec<String> = addresses
+        .map(|a| checksum_address(&a))
+        .filter(|a| is_valid_address(a))
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+    db::get_tokens_metadata(&state.db, &wanted)
+        .into_iter()
+        .map(|(address, meta)| {
+            (
+                address.to_lowercase(),
+                TokenDisplay {
+                    symbol: meta.symbol,
+                    decimals: meta.decimals,
+                },
+            )
+        })
+        .collect()
+}
+
+/// What the call that reverted says about why. The deepest failed call is the
+/// one that objected — the ones above it only passed the failure up.
+fn failure_of(calls: &[Value], reason: Option<&str>) -> Failure {
+    let mut failure = Failure {
+        reason: reason.map(String::from),
+        ..Default::default()
+    };
+    let Some(call) = calls
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("failed"))
+        .max_by_key(|c| c.get("depth").and_then(Value::as_i64).unwrap_or(0))
+    else {
+        return failure;
+    };
+
+    let error = call.get("error").and_then(Value::as_str);
+    // Revert data arrives as the call's output, or inside the error message.
+    failure.revert_data = call
+        .get("output")
+        .and_then(Value::as_str)
+        .filter(|s| s.len() > 2 && s.starts_with("0x"))
+        .map(String::from)
+        .or_else(|| error.and_then(revert_data_in));
+    failure.reason = failure.reason.or_else(|| error.map(String::from));
+    failure.function = call
+        .pointer("/decoded/name")
+        .and_then(Value::as_str)
+        .map(String::from);
+    if let Some(to) = call.get("to").and_then(Value::as_str) {
+        let to = checksum_address(to);
+        failure.contract = Some(get_contract_name(&to).unwrap_or_else(|| truncate_hash(&to, 4, 4)));
+        failure.token = is_tip20_token(&to).then_some(to);
+    }
+    failure
+}
+
+/// Where the fee went: what the gas cost, how much was burnt, what the
+/// validator kept, and the TIP-20 amount charged. Big integers throughout —
+/// wei products overflow an i64.
+fn fee_breakdown(
+    tx: &crate::models::Transaction,
+    gas_used: i64,
+    gas_price: i64,
+    fee_token_meta: Option<&crate::models::TokenMetadata>,
+) -> Value {
+    let gas_used_big = BigInt::from(gas_used.max(0));
+    let base_fee = BigInt::parse_bytes(tx.base_fee.trim_start_matches("0x").as_bytes(), 16)
+        .or_else(|| BigInt::parse_bytes(tx.base_fee.as_bytes(), 10))
+        .unwrap_or_else(|| BigInt::from(0));
+    let total = BigInt::from(gas_price.max(0)) * &gas_used_big;
+    let burnt = &base_fee * &gas_used_big;
+    // A gas price below the base fee cannot happen on chain, but a receipt
+    // that reports one must not produce a negative tip.
+    let tip = if total > burnt {
+        &total - &burnt
+    } else {
+        BigInt::from(0)
+    };
+
+    let charged = fee_token_meta
+        .map(|meta| format_token_amount_with_symbol(&tx.fee_amount, meta.decimals, &meta.symbol));
+    json!({
+        "gas_used": gas_used,
+        "gas_price": gas_price,
+        "base_fee": base_fee.to_string(),
+        "total_wei": total.to_string(),
+        "burnt_wei": burnt.to_string(),
+        "tip_wei": tip.to_string(),
+        "charged": charged,
+        "has_charge": tx.fee_amount != "0" && tx.fee_token.is_some(),
+    })
 }
 
 /// Burnt fees for a block: base fee × gas used, as a wei decimal string.
@@ -722,16 +834,13 @@ pub async fn tx_page(
         }));
     }
 
-    let mut events = Vec::new();
-    if let Some(receipt) = &receipt {
-        if let Some(logs) = receipt.get("logs").and_then(Value::as_array) {
-            for log in logs {
-                if let Some(decoded) = decode_event(log) {
-                    events.push(serde_json::to_value(decoded).unwrap_or(Value::Null));
-                }
-            }
-        }
-    }
+    let decoded_events: Vec<DecodedEvent> = receipt
+        .as_ref()
+        .and_then(|r| r.get("logs"))
+        .and_then(Value::as_array)
+        .map(|logs| logs.iter().filter_map(decode_event).collect())
+        .unwrap_or_default();
+
     let mut balance_changes = receipt
         .as_ref()
         .map(|r| extract_balance_changes(r, &tx))
@@ -791,6 +900,16 @@ pub async fn tx_page(
         let depth = call.get("depth").and_then(Value::as_i64).unwrap_or(0);
         call["indent"] = json!(depth * 20);
     }
+
+    // Metadata for every token the page mentions, so amounts read in the
+    // token's own units rather than as raw integers. One batched query.
+    let token_display = token_display_map(
+        &state,
+        decoded_events
+            .iter()
+            .flat_map(tokens_mentioned)
+            .chain(tx.fee_token.clone()),
+    );
 
     // Gas/fee/identity fields are parsed from the canonical RLP encoding at
     // runtime rather than stored per column.
@@ -921,6 +1040,25 @@ pub async fn tx_page(
         .filter(|c| c.get("status").and_then(Value::as_str) == Some("failed"))
         .count() as i64;
 
+    // What the transaction did, in words. Built after the per-call statuses
+    // are known, since a failure summary is named after the call that failed.
+    let known = known_events(&decoded_events, &token_display, Some(&tx.from_addr));
+    let failure = (tx.status == 0).then(|| failure_of(&calls, fail_reason.as_deref()));
+    let summary = build_summary(tx.status == 1, &known, failure.as_ref(), &token_display);
+    // Each log paired with its sentence, so the events tab can lead with the
+    // reading and keep the decoded parameters underneath it.
+    let events: Vec<Value> = decoded_events
+        .iter()
+        .enumerate()
+        .map(|(i, decoded)| {
+            let mut value = serde_json::to_value(decoded).unwrap_or(Value::Null);
+            if let Some(said) = known.iter().find(|k| k.log_index == i) {
+                value["known"] = serde_json::to_value(said).unwrap_or(Value::Null);
+            }
+            value
+        })
+        .collect();
+
     let ctx = page_ctx(
         &state,
         json!({
@@ -930,6 +1068,9 @@ pub async fn tx_page(
             "trace": trace,
             "calls": calls,
             "events": events,
+            "summary": summary,
+            "known_events": known,
+            "fee_breakdown": fee_breakdown(&tx, gas_used, gas_price, fee_token_meta.as_ref()),
             "balance_changes": balance_changes,
             "fee_payer": fee_payer,
             "signature_type": signature_type,
@@ -1395,7 +1536,7 @@ fn not_found_html(state: &AppState, kind: &str, id: &str, message: &str) -> Resp
 // Helpers
 // ---------------------------------------------------------------------------
 
-pub use crate::decoder::is_valid_address;
+pub use crate::decoder::{is_valid_address, truncate_hash};
 
 fn parse_hex_i64(s: &str) -> i64 {
     if let Some(h) = s.strip_prefix("0x") {
@@ -1575,17 +1716,6 @@ pub fn build_tera(db: Db) -> Result<Arc<Tera>> {
     );
 
     Ok(Arc::new(tera))
-}
-
-pub fn truncate_hash(h: &str, prefix: usize, suffix: usize) -> String {
-    if h.is_empty() {
-        return String::new();
-    }
-    if h.len() > prefix + suffix + 3 {
-        format!("{}…{}", &h[..prefix + 2], &h[h.len() - suffix..])
-    } else {
-        h.to_string()
-    }
 }
 
 pub fn format_time_ago(ts: i64) -> String {

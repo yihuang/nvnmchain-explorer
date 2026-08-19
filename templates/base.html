@@ -150,6 +150,25 @@
         }
         .tab:hover { color: var(--text); }
         .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+        /* The verdict card at the top of a transaction. */
+        .summary-headline { font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+        .summary-mark {
+            width: 24px; height: 24px; border-radius: 8px; flex-shrink: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+            font-weight: 800; font-size: 13px;
+        }
+        .summary-success .summary-mark { background: rgba(52,211,153,0.14); color: var(--green); }
+        .summary-success { border-color: rgba(52,211,153,0.28); }
+        .summary-failure .summary-mark { background: rgba(248,113,113,0.14); color: var(--red); }
+        .summary-failure { border-color: rgba(248,113,113,0.3); }
+        .summary-neutral .summary-mark { background: rgba(110,168,255,0.14); color: var(--accent); }
+        .memo {
+            background: rgba(167,139,250,0.08);
+            border-left: 2px solid var(--accent-2);
+            border-radius: 0 7px 7px 0;
+            padding: 6px 10px;
+            color: #cdc0f5;
+        }
         .pre-wrap { white-space: pre-wrap; word-break: break-all; }
         .divider { border-color: var(--border); }
         .pulse-dot {
