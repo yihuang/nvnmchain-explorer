@@ -227,7 +227,7 @@ src/
   ws.rs         WebSocket newHeads feed + polling fallback
   parse.rs      raw RPC → storage models
   db.rs         SQLite layer
-  decoder.rs    ABI decoder, events, traces
+  decoder.rs    ABI registry (from tempo-contracts) + decoder
   contracts.rs  precompile / token labels
   tokens.rs     token metadata + formatting
   indexer.rs    background indexing

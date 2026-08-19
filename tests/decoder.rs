@@ -840,7 +840,7 @@ fn authorize_key_restrictions_decode() {
     // The old bare-`tuple` spelling decoded this parameter to nothing at all.
     let call = decode_function_call(AUTHORIZE_KEY_CALLDATA).expect("authorizeKey");
     let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert_eq!(names, ["keyId", "signatureType", "config"]);
     assert_eq!(call.params[0].value, addr("11"));
     assert_eq!(call.params[1].value, "2");
     // expiry, enforceLimits, one TokenLimit, allowAnyCalls, no CallScopes.
@@ -970,7 +970,7 @@ fn witness_overload_decodes_the_argument_after_the_tuple() {
     let call = decode_function_call(WITNESS_CALLDATA).expect("authorizeKey with witness");
     assert_eq!(call.name.as_deref(), Some("authorizeKey"));
     let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["keyId", "signatureType", "restrictions", "witness"]);
+    assert_eq!(names, ["keyId", "signatureType", "config", "witness"]);
     assert_eq!(
         call.params[2].value,
         format!(
@@ -1008,7 +1008,7 @@ fn array_length_is_bounded_by_the_calldata() {
     assert_eq!(call.name.as_deref(), Some("authorizeKey"));
     // All-or-nothing: the refused list keeps its names and types, values empty.
     let names: Vec<&str> = call.params.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, ["keyId", "signatureType", "restrictions"]);
+    assert_eq!(names, ["keyId", "signatureType", "config"]);
     assert!(call.params.iter().all(|p| p.value.is_empty()));
 }
 
