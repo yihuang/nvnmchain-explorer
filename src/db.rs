@@ -1,5 +1,6 @@
 //! SQLite storage layer, mirroring `app/database.py` + `app/models.py`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -310,6 +311,16 @@ pub fn init_db(path: &str) -> Result<Connection> {
             PRIMARY KEY (token_addr, holder_addr)
         );
         CREATE INDEX IF NOT EXISTS idx_tb_holder ON token_balances(holder_addr);
+
+        -- Function signatures for selectors no built-in ABI declares, as
+        -- answered by the configured directory. An empty `signature` is a
+        -- remembered miss: the directory did not know it either, and asking
+        -- again on every page view would be a request per view forever.
+        CREATE TABLE IF NOT EXISTS selector_names (
+            selector TEXT PRIMARY KEY,
+            signature TEXT NOT NULL DEFAULT '',
+            fetched_at INTEGER NOT NULL DEFAULT 0
+        );
         "#,
     )?;
     // The holdings of one token, in listing order — holder counts become
@@ -1486,15 +1497,68 @@ pub fn count_anchored(db: &Db) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// Selector name cache
+// ---------------------------------------------------------------------------
+
+/// Cached signatures by selector. A remembered miss comes back as an empty
+/// string, which is what tells the caller not to ask again.
+pub fn get_selector_names(
+    db: &Db,
+    selectors: &[String],
+    fresh_after: i64,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if selectors.is_empty() {
+        return out;
+    }
+    let conn = lock(db);
+    for chunk in selectors.chunks(100) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT selector, signature FROM selector_names
+             WHERE selector IN ({placeholders}) AND fetched_at >= ?"
+        );
+        let params = rusqlite::params_from_iter(
+            chunk
+                .iter()
+                .map(|s| rusqlite::types::Value::Text(s.to_lowercase()))
+                .chain(std::iter::once(rusqlite::types::Value::Integer(
+                    fresh_after,
+                ))),
+        );
+        for (selector, signature) in query_rows(&conn, "get_selector_names", &sql, params, |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            out.insert(selector, signature);
+        }
+    }
+    out
+}
+
+/// Remember what a directory said about each selector, misses included.
+pub fn save_selector_names(db: &Db, answers: &[(String, String)]) -> Result<()> {
+    let mut conn = lock(db);
+    let txn = conn.transaction()?;
+    for (selector, signature) in answers {
+        exec_cached(
+            &txn,
+            "INSERT INTO selector_names (selector, signature, fetched_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(selector) DO UPDATE SET
+                 signature=excluded.signature, fetched_at=excluded.fetched_at",
+            params![selector.to_lowercase(), signature, now_ts()],
+        )?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Holdings
 // ---------------------------------------------------------------------------
 
 /// Batch token metadata lookup; one query per ~100 addresses.
-pub fn get_tokens_metadata(
-    db: &Db,
-    addresses: &[String],
-) -> std::collections::HashMap<String, TokenMetadata> {
-    let mut out = std::collections::HashMap::new();
+pub fn get_tokens_metadata(db: &Db, addresses: &[String]) -> HashMap<String, TokenMetadata> {
+    let mut out = HashMap::new();
     if addresses.is_empty() {
         return out;
     }

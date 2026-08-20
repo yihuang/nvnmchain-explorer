@@ -29,10 +29,11 @@ use crate::contracts::{
 };
 use crate::db::{self, Db};
 use crate::decoder::{
-    checksum_address, decode_event, decode_function_call, extract_balance_changes, extract_calls,
-    flatten_trace, revert_data_in, DecodedEvent,
+    checksum_address, decode_event, decode_function_call, decode_revert, decode_with_signature,
+    extract_balance_changes, extract_calls, flatten_trace, revert_data_in, DecodedEvent,
 };
 use crate::rpc::ChainRpc;
+use crate::signatures;
 use crate::summary::{build_summary, known_events, Failure, TokenDisplay, Tokens};
 use crate::tempo_address::parse_virtual;
 use crate::tokens::{
@@ -298,6 +299,86 @@ fn token_display_map(state: &AppState, addresses: impl Iterator<Item = String>) 
         .collect()
 }
 
+/// Name the calls whose selector no built-in ABI declares, from the signature
+/// directory. A directory that is off, unreachable or ignorant leaves the bare
+/// selector; one that answers also decodes the arguments, since the name alone
+/// is half an answer.
+async fn name_unknown_calls(state: &AppState, calls: &mut [Value]) {
+    let unnamed: Vec<String> = calls
+        .iter()
+        .filter_map(|call| {
+            let decoded = call.get("decoded")?;
+            match decoded.get("name") {
+                Some(Value::Null) => decoded
+                    .get("selector")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                _ => None,
+            }
+        })
+        .collect();
+    if unnamed.is_empty() {
+        return;
+    }
+
+    let names = signatures::resolve(&state.db, &state.cfg, state.rpc.http_client(), &unnamed).await;
+    if names.is_empty() {
+        return;
+    }
+    for call in calls.iter_mut() {
+        let Some(selector) = call
+            .pointer("/decoded/selector")
+            .and_then(Value::as_str)
+            .map(|s| s.to_lowercase())
+        else {
+            continue;
+        };
+        let Some(signature) = names.get(&selector) else {
+            continue;
+        };
+        let data = call.get("data").and_then(Value::as_str).unwrap_or("0x");
+        if let Some(decoded) = decode_with_signature(data, signature) {
+            call["decoded"] = decoded.to_json();
+            // Say where the name came from: it is a stranger's, not the
+            // chain's, and a reader should be able to tell the difference.
+            call["decoded"]["source"] = json!("signature directory");
+        }
+    }
+}
+
+/// Say what each failed call reverted with, rather than showing the ABI blob
+/// the node handed back.
+fn decode_call_reverts(calls: &mut [Value]) {
+    for call in calls.iter_mut() {
+        if call.get("status").and_then(Value::as_str) != Some("failed") {
+            continue;
+        }
+        let Some(revert) = call_revert_data(call).as_deref().and_then(decode_revert) else {
+            continue;
+        };
+        call["revert"] = json!({
+            "name": revert.name,
+            "signature": revert.signature,
+            "text": revert.reason().unwrap_or(&revert.call_form()).to_string(),
+            "params": revert.params,
+        });
+    }
+}
+
+/// The revert data a failed call carries: its output, or hex embedded in its
+/// error message.
+fn call_revert_data(call: &Value) -> Option<String> {
+    call.get("output")
+        .and_then(Value::as_str)
+        .filter(|s| s.len() > 2 && s.starts_with("0x"))
+        .map(String::from)
+        .or_else(|| {
+            call.get("error")
+                .and_then(Value::as_str)
+                .and_then(revert_data_in)
+        })
+}
+
 /// What the call that reverted says about why. The deepest failed call is the
 /// one that objected — the ones above it only passed the failure up.
 fn failure_of(calls: &[Value], reason: Option<&str>) -> Failure {
@@ -313,15 +394,10 @@ fn failure_of(calls: &[Value], reason: Option<&str>) -> Failure {
         return failure;
     };
 
-    let error = call.get("error").and_then(Value::as_str);
-    // Revert data arrives as the call's output, or inside the error message.
-    failure.revert_data = call
-        .get("output")
-        .and_then(Value::as_str)
-        .filter(|s| s.len() > 2 && s.starts_with("0x"))
-        .map(String::from)
-        .or_else(|| error.and_then(revert_data_in));
-    failure.reason = failure.reason.or_else(|| error.map(String::from));
+    failure.revert_data = call_revert_data(call);
+    failure.reason = failure
+        .reason
+        .or_else(|| call.get("error").and_then(Value::as_str).map(String::from));
     failure.function = call
         .pointer("/decoded/name")
         .and_then(Value::as_str)
@@ -969,6 +1045,9 @@ pub async fn tx_page(
             .or_insert(default_formatted);
     }
 
+    // Name the calls no built-in ABI explains, from the signature directory.
+    name_unknown_calls(&state, &mut calls).await;
+
     // Indent each call by depth for the tree view.
     for call in calls.iter_mut() {
         let depth = call.get("depth").and_then(Value::as_i64).unwrap_or(0);
@@ -1109,6 +1188,8 @@ pub async fn tx_page(
             }
         }
     }
+    decode_call_reverts(&mut calls);
+
     let failed_calls = calls
         .iter()
         .filter(|c| c.get("status").and_then(Value::as_str) == Some("failed"))

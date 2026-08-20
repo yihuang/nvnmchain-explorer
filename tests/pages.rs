@@ -5,11 +5,14 @@
 //! the network: fixtures carry their own traces and failure reasons, the RPC
 //! points at a closed port, and the signature directory is stubbed.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{checksum_address, keccak256, keccak_hex, TRANSFER_TOPIC};
 use nvnmchain_explorer::models::{Block, BlockBundle, Transaction, TransferEvent};
+use nvnmchain_explorer::signatures;
 use nvnmchain_explorer::tokens::TokenMeta;
 use serde_json::{json, Value};
 
@@ -213,7 +216,10 @@ async fn serve() -> (tempfile::TempDir, String) {
     // something to be wrong about.
     db::save_block_bundle(&db, &transfer_bundle()).expect("transfers");
 
-    let cfg = nvnmchain_explorer::config::Settings::from_env();
+    let mut cfg = Settings::from_env();
+    // These tests must not reach a third party; the directory is exercised
+    // against a stub of its own in `an_unknown_selector_is_named_by_the_directory`.
+    cfg.signature_lookup_url = None;
     let tera = web::build_tera(db.clone()).expect("templates");
     let state = AppState {
         db,
@@ -543,4 +549,121 @@ async fn search_terms_are_never_patterns() {
     assert!(suggest(&base, "' OR 1=1 --").await.is_empty());
     // And one character matches too much to rank at all.
     assert!(suggest(&base, "p").await.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Signature directory
+// ---------------------------------------------------------------------------
+
+/// A stub signature directory, and how many times it was asked.
+async fn stub_directory(answer: Value) -> (String, Arc<AtomicUsize>) {
+    use axum::{routing::get, Json, Router};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let handler = {
+        let hits = hits.clone();
+        move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+            async move { Json(answer) }
+        }
+    };
+    let app = Router::new().route("/lookup", get(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/lookup"), hits)
+}
+
+/// A call to a contract nothing built-in describes gets its name from the
+/// directory — once, and only if the answer is really that selector's.
+#[tokio::test]
+async fn an_unknown_selector_is_named_by_the_directory() {
+    // `redeem(address,uint256)` — a selector no Tempo interface declares.
+    let signature = "redeem(address,uint256)";
+    let selector = format!("0x{}", hex::encode(&keccak256(signature.as_bytes())[..4]));
+    let (url, hits) = stub_directory(json!({
+        "ok": true,
+        "result": { "function": { selector.clone(): [{ "name": signature }] } },
+    }))
+    .await;
+
+    let (_dir, db) = temp_db("signatures.db");
+    let mut cfg = Settings::from_env();
+    cfg.signature_lookup_url = Some(url);
+    let client = reqwest::Client::new();
+
+    let names = signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    assert_eq!(names.get(&selector).map(String::as_str), Some(signature));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // The answer is cached, so a second page view asks nobody.
+    let again = signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    assert_eq!(again, names);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // And the name is enough to decode the call's arguments.
+    let call = nvnmchain_explorer::decoder::decode_with_signature(
+        &format!(
+            "{selector}{}{:064x}",
+            topic(RECIPIENT).trim_start_matches("0x"),
+            42
+        ),
+        signature,
+    )
+    .expect("decoded with the learned signature");
+    assert_eq!(call.name.as_deref(), Some("redeem"));
+    assert_eq!(call.params[0].value, checksum_address(RECIPIENT));
+    assert_eq!(call.params[1].value, "42");
+}
+
+/// A directory that answers with the wrong function is not believed, and a
+/// selector it does not know is not asked about twice.
+#[tokio::test]
+async fn a_wrong_or_missing_answer_is_remembered_as_a_miss() {
+    let selector = "0xdeadbeef".to_string();
+    let (url, hits) = stub_directory(json!({
+        "ok": true,
+        // The right shape for a different function — a name that does not
+        // hash to the selector it is offered for.
+        "result": { "function": { selector.clone(): [{ "name": "transfer(address,uint256)" }] } },
+    }))
+    .await;
+
+    let (_dir, db) = temp_db("bad-signatures.db");
+    let mut cfg = Settings::from_env();
+    cfg.signature_lookup_url = Some(url);
+    let client = reqwest::Client::new();
+
+    assert!(
+        signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector))
+            .await
+            .is_empty(),
+        "a signature that does not hash to the selector must be refused"
+    );
+    signatures::resolve(&db, &cfg, &client, std::slice::from_ref(&selector)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a miss is remembered, not re-asked"
+    );
+}
+
+/// With no directory configured, nothing is asked and nothing breaks.
+#[tokio::test]
+async fn the_directory_can_be_turned_off() {
+    let (_dir, db) = temp_db("no-directory.db");
+    let mut cfg = Settings::from_env();
+    cfg.signature_lookup_url = None;
+    let names = signatures::resolve(
+        &db,
+        &cfg,
+        &reqwest::Client::new(),
+        &["0xdeadbeef".to_string()],
+    )
+    .await;
+    assert!(names.is_empty());
 }

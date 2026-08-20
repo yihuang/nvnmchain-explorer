@@ -141,6 +141,7 @@ The indexer is built for a sub-second chain:
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
 | `ANCHORING_URL` | unset | Base URL of the app that decodes anchored payloads ([Anchoring](#anchoring)) |
 | `REGISTRY_FACTORY` | unset | `RegistryFactory` whose deployments label namespaces ([Anchoring](#anchoring)) |
+| `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -152,12 +153,13 @@ The indexer is built for a sub-second chain:
 | `/blocks` | Block list |
 | `/tx/{hash}` | Transaction detail (tabs: Overview/Balances/Calls/Events/Raw) |
 | `/address/{addr}` | Address info (transactions, transfers, holdings) |
-| `/token/{addr}` | Token metadata + transfers |
+| `/token/{addr}` | Token metadata, transfers, and holders |
 | `/tokens` | Token list |
 | `/anchoring` | Namespaces that have anchored, plus the latest commitments |
 | `/anchoring/{namespace}` | A namespace's keys, each at its head commitment |
 | `/anchoring/{namespace}/{key}` | Every revision of one key, newest first |
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
+| `/api/search?q=...` | Suggestions for the search box, answered from the index |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
 
 All data endpoints accept `?format=json` or `Accept: application/json`.
@@ -167,6 +169,27 @@ latest-blocks panel, the latest-block stat, and the block-time stat in real
 time as blocks land — no client polling. The feed is in-process: run a single
 instance (as the deploy configs do) so the indexer and the web server share
 the same broadcast channel.
+
+### Decoding
+
+Calls, logs and reverts decode against the chain's own definitions: the
+[tempo-contracts](https://github.com/NVNM-Chain/nvnmchain-tempo) bindings,
+where `#[sol(abi)]` turns each `interface` into a JSON ABI at compile time —
+an upstream change arrives with `cargo update`, and a rename fails to compile
+rather than silently failing to decode. The few declarations with no binding
+are Solidity signatures at the top of `src/decoder.rs`: a typo there does not
+parse, and tests pin the selectors they hash to.
+
+Each decoded log is also said in words, from the phrasing table in
+`src/summary.rs`, and the transaction page leads with that sentence. Two tests
+hold the table and the registry to each other, so a new event cannot land
+unexplained.
+
+A selector nothing declares is looked up once in a public signature directory
+(OpenChain by default) and cached, misses included. An answer is believed only
+when it hashes to the selector it was offered for, and is badged as the
+stranger's name it is. Set `SIGNATURE_LOOKUP_URL=` (empty) and the explorer
+talks to no third party.
 
 ### Anchoring
 
@@ -206,15 +229,20 @@ holder counts and address holdings stay exact without rescanning history.
 ## Tests
 
 ```bash
-# Unit tests (no network)
-cargo test --test decoder
+# Unit and integration tests (no network)
+cargo test --lib --test decoder --test anchoring --test pages
 
 # Integration tests against the live chain RPC
 cargo test --test live_rpc
 ```
 
-The integration tests hit the RPC: they assert the chain id, fetch and index
-recent blocks into a temp SQLite DB, and boot the HTTP API to verify the JSON
+`tests/pages.rs` boots the HTTP API over a temp SQLite database and renders the
+real templates, so a context key a handler stops sending fails a test rather
+than a page view. Nothing in it reaches the network: the RPC points at a closed
+port and the signature directory is stubbed.
+
+The live tests hit the RPC: they assert the chain id, fetch and index recent
+blocks into a temp SQLite DB, and boot the HTTP API to verify the JSON
 endpoints end to end.
 
 ## Layout
@@ -228,12 +256,16 @@ src/
   parse.rs      raw RPC → storage models
   db.rs         SQLite layer
   decoder.rs    ABI registry (from tempo-contracts) + decoder
+  summary.rs    what a transaction did, in a sentence
+  memo.rs       TIP-20 transfer memos
+  signatures.rs names for selectors no built-in ABI declares
+  tempo_address.rs  TIP-1022 virtual addresses
   contracts.rs  precompile / token labels
   tokens.rs     token metadata + formatting
   indexer.rs    background indexing
   web.rs        axum routes + template helpers
 templates/      Tera templates
-tests/          decoder unit tests + live RPC integration tests
+tests/          unit + page tests, and live RPC integration tests
 ```
 
 ## License

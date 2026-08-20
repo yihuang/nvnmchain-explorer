@@ -554,6 +554,24 @@ pub fn decode_function_call(data: &str) -> Option<DecodedCall> {
     })
 }
 
+/// Decode calldata against a signature learned at runtime — what the 4-byte
+/// directory answers with. The signature is checked against the selector
+/// first, so a directory that answers with the wrong function names nothing.
+pub fn decode_with_signature(data: &str, signature: &str) -> Option<DecodedCall> {
+    let (selector, args) = split_calldata(data)?;
+    if !crate::signatures::hashes_to(signature, &hex::encode(selector)) {
+        return None;
+    }
+    let function = HumanReadableParser::parse_function(signature).ok()?;
+    Some(DecodedCall {
+        name: Some(function.name.clone()),
+        signature: Some(function_signature(&function)),
+        params: decoded_params(&function.inputs, &args),
+        selector: format!("0x{}", hex::encode(selector)),
+        raw_args: format!("0x{}", hex::encode(&args)),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Reverts
 // ---------------------------------------------------------------------------
@@ -823,7 +841,12 @@ fn hex_to_dec(value: &Value, default: &str) -> String {
 
 fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
     let input = node.get("input").and_then(Value::as_str).unwrap_or("0x");
-    let decoded = decode_function_call(input).map(|d| d.to_json());
+    let kind = node.get("type").and_then(Value::as_str).unwrap_or("CALL");
+    // A CREATE's input is the contract's init code, not calldata: its first
+    // four bytes are constructor prologue, not a selector to decode or name.
+    let decoded = (!kind.starts_with("CREATE"))
+        .then(|| decode_function_call(input).map(|d| d.to_json()))
+        .flatten();
     let error = node
         .get("error")
         .or_else(|| node.get("revertReason"))
@@ -831,7 +854,7 @@ fn walk_trace(node: &Value, depth: usize, result: &mut Vec<Value>) {
         .filter(|s| !s.is_empty());
     let mut flat = json!({
         "depth": depth,
-        "type": node.get("type").and_then(Value::as_str).unwrap_or("CALL"),
+        "type": kind,
         "from": node.get("from").and_then(Value::as_str).unwrap_or(""),
         "to": node.get("to").and_then(Value::as_str).unwrap_or(""),
         "data": input,

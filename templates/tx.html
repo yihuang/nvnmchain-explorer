@@ -271,7 +271,12 @@
             </div>
             {% if call.decoded %}
             <div class="text-sm ml-4 mb-1">
-                <span class="text-violet-300">{{ call.decoded.signature | fallback(value=call.decoded.name) | fallback(value='Unknown') }}</span>
+                {# The selector as last resort: it names nothing, but it is searchable. #}
+                <span class="text-violet-300">{{ call.decoded.signature | fallback(value=call.decoded.name) | fallback(value=call.decoded.selector) | fallback(value='Unknown') }}</span>
+                {# A name from a public directory is a stranger's, not the chain's. #}
+                {% if call.decoded.source %}
+                <span class="badge badge-warn ml-1" title="Name from the {{ call.decoded.source }}, not from a built-in ABI">4byte</span>
+                {% endif %}
             </div>
             {% if call.decoded.params %}
             <div class="space-y-1 text-xs ml-6">
@@ -289,7 +294,22 @@
             {% if call.output and call.output != '0x' %}
             <div class="text-xs text-faint ml-4 mono">→ output: {{ call.output | truncate(length=80) }}</div>
             {% endif %}
-            {% if call.error %}
+            {% if call.revert %}
+            <div class="text-xs ml-4 mt-1">
+                <span class="badge badge-error">{{ call.revert.name }}</span>
+                <span class="value-negative ml-1">{{ call.revert.text }}</span>
+            </div>
+            {% if call.revert.params %}
+            <div class="space-y-1 text-xs ml-6 mt-1">
+                {% for param in call.revert.params %}
+                <div>
+                    <span class="text-faint">{{ param.type }} {{ param.name }}:</span>
+                    <span class="mono ml-1 break-all">{{ param.value }}</span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% elif call.error %}
             <div class="text-xs text-red-400 ml-4 mono break-all">revert: {{ call.error }}</div>
             {% endif %}
         </div>

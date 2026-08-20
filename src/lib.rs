@@ -10,6 +10,7 @@ pub mod memo;
 pub mod models;
 pub mod parse;
 pub mod rpc;
+pub mod signatures;
 pub mod summary;
 pub mod tempo;
 pub mod tempo_address;

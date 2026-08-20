@@ -38,7 +38,19 @@ pub struct Settings {
     pub native_symbol: String,
     /// Seconds between background recomputes of the home-page stats blob.
     pub stats_interval_seconds: f64,
+    /// Signature directory consulted for selectors no built-in ABI declares.
+    /// Answers are cached in the database, misses included. `None` disables it
+    /// — the explorer then never talks to a third party.
+    pub signature_lookup_url: Option<String>,
 }
+
+/// OpenChain's signature directory, queried at most once per selector per
+/// [`SIGNATURE_TTL_SECONDS`].
+pub const DEFAULT_SIGNATURE_LOOKUP_URL: &str =
+    "https://api.openchain.xyz/signature-database/v1/lookup";
+
+/// How long a cached answer — a miss included — stands before asking again.
+pub const SIGNATURE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
@@ -112,7 +124,18 @@ impl Settings {
             registry_factory: registry_factory(),
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0),
+            signature_lookup_url: signature_lookup_url(),
         }
+    }
+}
+
+/// The signature directory to consult, or `None` when the operator has turned
+/// the lookup off with an empty `SIGNATURE_LOOKUP_URL`.
+fn signature_lookup_url() -> Option<String> {
+    match env::var("SIGNATURE_LOOKUP_URL") {
+        Ok(url) if url.trim().is_empty() => None,
+        Ok(url) => Some(url.trim().to_string()),
+        Err(_) => Some(DEFAULT_SIGNATURE_LOOKUP_URL.to_string()),
     }
 }
 
