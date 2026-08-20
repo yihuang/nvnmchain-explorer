@@ -109,10 +109,16 @@ fn tempo_contracts() -> Vec<(&'static str, JsonAbi)> {
     ]
 }
 
+/// One parsed ABI and the name it was registered under.
+struct NamedContract {
+    name: &'static str,
+    contract: Contract,
+}
+
 /// Everything the registry answers, built once.
 pub(crate) struct Registry {
     /// Registration order, so a lookup can say which ABI a match came from.
-    contracts: Vec<&'static str>,
+    contracts: Vec<NamedContract>,
     /// Selector -> (contract index, function).
     functions: HashMap<[u8; 4], (usize, Function)>,
     /// `topic0` -> (contract index, event).
@@ -127,7 +133,7 @@ fn signature_of(name: &str, inputs: impl Iterator<Item = ParamType>) -> String {
     format!("{name}({})", types.join(","))
 }
 
-fn function_signature(f: &Function) -> String {
+pub(crate) fn function_signature(f: &Function) -> String {
     signature_of(&f.name, f.inputs.iter().map(|p| p.kind.clone()))
 }
 
@@ -200,7 +206,7 @@ impl Registry {
                     .entry(selector(&error_signature(error)))
                     .or_insert_with(|| (index, error.clone()));
             }
-            registry.contracts.push(name);
+            registry.contracts.push(NamedContract { name, contract });
         }
         registry
     }
@@ -212,8 +218,17 @@ impl Registry {
         self.events.values().map(|(_, event)| event)
     }
 
+    /// The whole ABI registered under `name`, for the pages that list what a
+    /// contract exposes.
+    pub(crate) fn contract(&self, name: &str) -> Option<&Contract> {
+        self.contracts
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| &c.contract)
+    }
+
     fn contract_name(&self, index: usize) -> &'static str {
-        self.contracts.get(index).copied().unwrap_or("")
+        self.contracts.get(index).map(|c| c.name).unwrap_or("")
     }
 
     fn function(&self, selector: &[u8; 4]) -> Option<(&'static str, &Function)> {
