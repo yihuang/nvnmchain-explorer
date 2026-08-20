@@ -188,3 +188,35 @@ pub fn identify_address(addr: &str) -> AddressInfo {
 pub fn get_known_token(address: &str) -> Option<TokenInfo> {
     known_tokens().get(&checksum_address(address)).cloned()
 }
+
+/// Precompiles whose name contains `query`, as `(address, name)` pairs.
+/// Sorted by match quality then alphabetically, so the same query always
+/// produces the same list — a hash map's order is not one.
+pub fn search_precompiles(query: &str, limit: usize) -> Vec<(String, String)> {
+    let query = query.trim().to_lowercase();
+    if query.len() < 2 {
+        return Vec::new();
+    }
+    let mut matches: Vec<(u8, String, String)> = precompile_labels()
+        .iter()
+        .filter_map(|(address, name)| {
+            let lowered = name.to_lowercase();
+            let rank = if lowered == query {
+                0
+            } else if lowered.starts_with(&query) {
+                1
+            } else if lowered.contains(&query) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, name.clone(), address.clone()))
+        })
+        .collect();
+    matches.sort();
+    matches.truncate(limit);
+    matches
+        .into_iter()
+        .map(|(_, name, address)| (address, name))
+        .collect()
+}
