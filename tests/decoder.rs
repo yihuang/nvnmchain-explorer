@@ -182,6 +182,24 @@ fn flatten_trace_nested() {
     assert_eq!(flat[2]["value"], "1");
 }
 
+/// A CREATE's input is init code, whose first four bytes are constructor
+/// prologue — not a selector to decode, name, or ask a directory about.
+#[test]
+fn a_create_call_decodes_no_selector() {
+    let trace = json!({
+        "type": "CREATE",
+        "from": format!("0x{}", "aa".repeat(20)),
+        "to": format!("0x{}", "bb".repeat(20)),
+        // Solidity's usual prologue: PUSH1 0xA0; CALLVALUE; PUSH2 …
+        "input": format!("0x60a03461{}", "00".repeat(60)),
+        "gas": "0x186a0",
+        "gasUsed": "0xcccc",
+    });
+    let flat = flatten_trace(&trace);
+    assert_eq!(flat[0]["type"], "CREATE");
+    assert_eq!(flat[0]["decoded"], Value::Null);
+}
+
 /// ABI-encode a `string` return value the standard dynamic way:
 /// word 0 = offset (0x20), word 1 = length, word 2 = UTF-8 payload padded.
 fn abi_string(s: &str) -> String {

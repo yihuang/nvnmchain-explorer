@@ -59,6 +59,13 @@ impl ChainRpc {
         Self::new(&settings.rpc_url)
     }
 
+    /// The shared HTTP client, for the few requests that are not JSON-RPC —
+    /// the signature directory. Borrowing it keeps one connection pool per
+    /// process rather than one per subsystem.
+    pub fn http_client(&self) -> &Client {
+        &self.client
+    }
+
     fn next_id(&self) -> u64 {
         self.req_id.fetch_add(1, Ordering::Relaxed)
     }
