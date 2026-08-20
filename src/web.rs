@@ -14,6 +14,7 @@ use axum::routing::get;
 use axum::Json;
 use axum::Router;
 use chrono::{Local, TimeZone};
+use ethers_core::abi::StateMutability;
 use futures_util::stream::unfold;
 use num_bigint::BigInt;
 use serde_json::{json, Value};
@@ -24,13 +25,14 @@ use tower_http::cors::CorsLayer;
 use crate::anchoring::is_self_verifying;
 use crate::config::Settings;
 use crate::contracts::{
-    get_contract_name, get_known_token, get_precompile_name, identify_address, is_contract,
-    is_tip20_token, search_precompiles,
+    abis_for_address, get_contract_name, get_known_token, get_precompile_name, identify_address,
+    is_contract, is_tip20_token, search_precompiles,
 };
 use crate::db::{self, Db};
 use crate::decoder::{
     checksum_address, decode_event, decode_function_call, decode_revert, decode_with_signature,
-    extract_balance_changes, extract_calls, flatten_trace, revert_data_in, DecodedEvent,
+    event_signature, extract_balance_changes, extract_calls, flatten_trace, function_signature,
+    keccak_hex, revert_data_in, DecodedEvent, REGISTRY,
 };
 use crate::rpc::ChainRpc;
 use crate::signatures;
@@ -297,6 +299,105 @@ fn token_display_map(state: &AppState, addresses: impl Iterator<Item = String>) 
             )
         })
         .collect()
+}
+
+/// A page view must not wait on the RPC's full budget for the bytecode.
+const CODE_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The deployed bytecode at `address`, or `Null` when there is none.
+///
+/// Best-effort: a node that will not answer costs the page a panel, not the
+/// load. Tempo's precompiles report a one-byte marker rather than bytecode,
+/// which is worth saying instead of rendering as an empty box.
+async fn contract_code(state: &AppState, address: &str) -> Value {
+    let fetched = tokio::time::timeout(
+        CODE_FETCH_TIMEOUT,
+        state.rpc.eth_get_code(address, "latest"),
+    )
+    .await;
+    let code = match fetched {
+        Ok(Ok(code)) => code,
+        Ok(Err(e)) => {
+            tracing::warn!("eth_getCode for {address} failed: {e:#}");
+            return Value::Null;
+        }
+        Err(_) => {
+            tracing::warn!("eth_getCode for {address} timed out");
+            return Value::Null;
+        }
+    };
+    let hex = code.strip_prefix("0x").unwrap_or(&code);
+    if hex.is_empty() {
+        return Value::Null;
+    }
+    json!({
+        "hex": code,
+        "bytes": hex.len() / 2,
+        // The marker a Tempo precompile reports in place of real bytecode.
+        "is_precompile_marker": hex.len() <= 2,
+    })
+}
+
+/// What an address exposes: the ABIs the explorer knows for it, split into
+/// reads and writes, plus its events. Empty for an unknown address.
+fn contract_interface(address: &str) -> Value {
+    let names = abis_for_address(address);
+    let (mut reads, mut writes, mut events) = (Vec::new(), Vec::new(), Vec::new());
+    for name in names {
+        let Some(contract) = REGISTRY.contract(name) else {
+            continue;
+        };
+        for function in contract.functions() {
+            // The signature carries the parameter types, so only the name and
+            // the selector need spelling out beside it.
+            let entry = json!({
+                "name": function.name,
+                "signature": function_signature(function),
+                "selector": format!("0x{}", hex::encode(function.short_signature())),
+            });
+            // A view or pure function answers a question; anything else
+            // changes something. That is the split a reader cares about.
+            match function.state_mutability {
+                StateMutability::View | StateMutability::Pure => reads.push(entry),
+                _ => writes.push(entry),
+            }
+        }
+        for event in contract.events() {
+            let signature = event_signature(event);
+            events.push(json!({
+                "name": event.name,
+                "topic0": keccak_hex(signature.as_bytes()),
+                "signature": signature,
+                // Indexedness is the one thing the signature does not say.
+                "inputs": event
+                    .inputs
+                    .iter()
+                    .map(|i| json!({
+                        "type": i.kind.to_string(),
+                        "name": i.name,
+                        "indexed": i.indexed,
+                    }))
+                    .collect::<Vec<_>>(),
+            }));
+        }
+    }
+    // `Contract::functions()`/`events()` walk a map; sort so the page does not
+    // reshuffle itself between views.
+    let by_name = |a: &Value, b: &Value| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    };
+    reads.sort_by(by_name);
+    writes.sort_by(by_name);
+    events.sort_by(by_name);
+    json!({
+        "abis": names,
+        "reads": reads,
+        "writes": writes,
+        "events": events,
+    })
 }
 
 /// Name the calls whose selector no built-in ABI declares, from the signature
@@ -1329,6 +1430,20 @@ pub async fn address_page(
             None
         }
     });
+
+    // The Contract tab: the interface the explorer knows, the TIP-20 metadata
+    // when there is any, and the deployed bytecode. Only the code costs an RPC
+    // round trip, and only when that tab is open.
+    let interface = contract_interface(&checksummed);
+    let has_interface = interface["abis"].as_array().is_some_and(|a| !a.is_empty());
+    let token_meta = db::get_token_metadata(&state.db, &checksummed);
+    let code = if tab == "contract" {
+        contract_code(&state, &checksummed).await
+    } else {
+        Value::Null
+    };
+    let virtual_address = parse_virtual(&checksummed);
+
     let ctx = page_ctx(
         &state,
         json!({
@@ -1336,6 +1451,11 @@ pub async fn address_page(
             "addr_info": addr_info,
             "type": kind,
             "label": label,
+            "interface": interface,
+            "has_interface": has_interface,
+            "token_meta": token_meta,
+            "code": code,
+            "virtual_address": virtual_address,
             "transactions": transactions,
             "html_transactions": html_transactions,
             "holdings": db::get_address_holdings(&state.db, &checksummed),

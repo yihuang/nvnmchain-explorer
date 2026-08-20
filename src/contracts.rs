@@ -33,6 +33,10 @@ fn precompile_labels() -> &'static HashMap<String, String> {
             ),
             (
                 "0xCccCcCCC00000000000000000000000000000000",
+                "Validator Config V1 (legacy)",
+            ),
+            (
+                "0xCccCcCCC00000000000000000000000000000001",
                 "Validator Config",
             ),
             (
@@ -189,6 +193,78 @@ pub fn get_known_token(address: &str) -> Option<TokenInfo> {
     known_tokens().get(&checksum_address(address)).cloned()
 }
 
+/// Which built-in ABIs describe the contract at `addr`, by the names the
+/// decoder's registry loads them under. Some addresses need more than one:
+/// the fee manager's interface says nothing about the AMM it runs.
+pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
+    /// Addresses spelled lowercase, so the table cannot disagree with EIP-55
+    /// over a character. Lookups normalize the same way.
+    const BY_ADDRESS: &[(&str, &[&str])] = &[
+        (
+            "0xfeec000000000000000000000000000000000000",
+            &["fee_manager", "fee_amm"],
+        ),
+        (
+            "0x403c000000000000000000000000000000000000",
+            &["tip403_registry"],
+        ),
+        (
+            "0x20fc000000000000000000000000000000000000",
+            &["tip20_factory"],
+        ),
+        (
+            "0x4d50500000000000000000000000000000000000",
+            &["tip20_channel_reserve"],
+        ),
+        (
+            "0xdec0000000000000000000000000000000000000",
+            &["stablecoin_dex"],
+        ),
+        ("0x4e4f4e4345000000000000000000000000000000", &["nonce"]),
+        (
+            "0xcccccccc00000000000000000000000000000000",
+            &["validator_config"],
+        ),
+        (
+            "0xcccccccc00000000000000000000000000000001",
+            &["validator_config_v2"],
+        ),
+        (
+            "0xaaaaaaaa00000000000000000000000000000000",
+            &["account_keychain"],
+        ),
+        (
+            "0xfdc0000000000000000000000000000000000000",
+            &["address_registry"],
+        ),
+        (
+            "0x5165300000000000000000000000000000000000",
+            &["signature_verifier"],
+        ),
+        (
+            "0xb10c000000000000000000000000000000000000",
+            &["receive_policy_guard"],
+        ),
+        (
+            "0x1060000000000000000000000000000000000000",
+            &["storage_credits"],
+        ),
+    ];
+
+    let lowered = addr.trim().to_lowercase();
+    if let Some((_, abis)) = BY_ADDRESS.iter().find(|(a, _)| *a == lowered) {
+        return abis;
+    }
+    if lowered == crate::anchoring::ANCHORING_ADDRESS.to_lowercase() {
+        return &["local"];
+    }
+    // Every TIP-20 is the same interface at a different address.
+    if is_tip20_token(&lowered) {
+        return &["tip20", "tip20_roles_auth"];
+    }
+    &[]
+}
+
 /// Precompiles whose name contains `query`, as `(address, name)` pairs.
 /// Sorted by match quality then alphabetically, so the same query always
 /// produces the same list — a hash map's order is not one.
@@ -219,4 +295,53 @@ pub fn search_precompiles(query: &str, limit: usize) -> Vec<(String, String)> {
         .into_iter()
         .map(|(_, name, address)| (address, name))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every address the ABI table names must also be a labelled precompile,
+    /// and every ABI it names must be one the registry actually loads.
+    #[test]
+    fn the_abi_table_agrees_with_the_label_table() {
+        for label in precompile_labels().keys() {
+            let abis = abis_for_address(label);
+            assert!(
+                !abis.is_empty(),
+                "{label} is labelled but has no ABI to show"
+            );
+            for name in abis {
+                assert!(
+                    crate::decoder::REGISTRY.contract(name).is_some(),
+                    "{label} names `{name}`, which the registry does not load"
+                );
+            }
+        }
+    }
+
+    /// The lookup must not care how an address is spelled.
+    #[test]
+    fn abis_are_found_however_the_address_is_spelled() {
+        let fee_manager = "0xfeEC000000000000000000000000000000000000";
+        assert_eq!(abis_for_address(fee_manager), ["fee_manager", "fee_amm"]);
+        assert_eq!(
+            abis_for_address(&fee_manager.to_lowercase()),
+            ["fee_manager", "fee_amm"]
+        );
+        assert_eq!(
+            abis_for_address(&fee_manager.to_uppercase().replace("0X", "0x")),
+            ["fee_manager", "fee_amm"]
+        );
+    }
+
+    /// A TIP-20 is recognised by its prefix, not by an entry per token.
+    #[test]
+    fn every_tip20_gets_the_token_interface() {
+        assert_eq!(
+            abis_for_address("0x20c0000000000000000000000000000000000042"),
+            ["tip20", "tip20_roles_auth"]
+        );
+        assert!(abis_for_address("0x1111111111111111111111111111111111111111").is_empty());
+    }
 }
