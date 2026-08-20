@@ -48,12 +48,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image name and cache scope
+      - name: Compute image name and cache tag
         id: meta
         shell: bash
         run: |
           echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-          # One cache scope per arch: the two builds export concurrently.
+          # One cache tag per arch: the two builds export concurrently.
           echo "arch=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push by digest
@@ -64,8 +64,12 @@ jobs:
           file: Dockerfile
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ steps.meta.outputs.arch }}
-          cache-to: type=gha,mode=max,scope=${{ steps.meta.outputs.arch }}
+          # GHCR rather than the Actions cache: mode=max stores the builder's
+          # `target` dir, and two of those exceed the 10GB repo quota, past
+          # which eviction makes builds cold at random. A registry tag has no
+          # quota and is rewritten in place.
+          cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache-${{ steps.meta.outputs.arch }}
+          cache-to: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache-${{ steps.meta.outputs.arch }},mode=max
 
       - name: Export digest
         shell: bash
