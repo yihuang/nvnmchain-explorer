@@ -152,7 +152,7 @@ The indexer is built for a sub-second chain:
 | `/block/{num\|hash}` | Block detail |
 | `/blocks` | Block list |
 | `/tx/{hash}` | Transaction detail (tabs: Overview/Balances/Calls/Events/Raw) |
-| `/address/{addr}` | Address info (transactions, transfers, holdings) |
+| `/address/{addr}` | Address info (transactions, transfers, holdings, contract) |
 | `/token/{addr}` | Token metadata, transfers, and holders |
 | `/tokens` | Token list |
 | `/anchoring` | Namespaces that have anchored, plus the latest commitments |

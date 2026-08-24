@@ -217,9 +217,12 @@ async fn serve() -> (tempfile::TempDir, String) {
     db::save_block_bundle(&db, &transfer_bundle()).expect("transfers");
 
     let mut cfg = Settings::from_env();
-    // These tests must not reach a third party; the directory is exercised
-    // against a stub of its own in `an_unknown_selector_is_named_by_the_directory`.
+    // Nothing here may reach the network. The signature directory is exercised
+    // against a stub of its own; the RPC points at a closed local port, so any
+    // handler that falls back to it fails at once instead of calling the live
+    // chain — which would make these tests both slow and non-deterministic.
     cfg.signature_lookup_url = None;
+    cfg.rpc_url = "http://127.0.0.1:1".into();
     let tera = web::build_tera(db.clone()).expect("templates");
     let state = AppState {
         db,
@@ -666,4 +669,82 @@ async fn the_directory_can_be_turned_off() {
     )
     .await;
     assert!(names.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Contract details
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_token_address_shows_the_interface_it_exposes() {
+    let (_dir, base) = serve().await;
+    let token = checksum_address(TOKEN);
+    let page = get_json(&base, &format!("/address/{token}?tab=contract")).await;
+
+    assert_eq!(page["has_interface"], json!(true));
+    assert_eq!(
+        page["interface"]["abis"],
+        json!(["tip20", "tip20_roles_auth"])
+    );
+
+    // Reads and writes are split by what the function actually does.
+    let reads = page["interface"]["reads"].as_array().expect("reads");
+    let writes = page["interface"]["writes"].as_array().expect("writes");
+    assert!(reads.iter().any(|f| f["name"] == json!("balanceOf")));
+    assert!(writes
+        .iter()
+        .any(|f| f["signature"] == json!("transfer(address,uint256)")));
+    assert!(
+        !reads.iter().any(|f| f["name"] == json!("transfer")),
+        "a state-changing function is not a read"
+    );
+    // And each entry carries the selector the chain identifies it by.
+    let transfer = writes
+        .iter()
+        .find(|f| f["signature"] == json!("transfer(address,uint256)"))
+        .expect("transfer");
+    assert_eq!(transfer["selector"], json!("0xa9059cbb"));
+
+    // Events come with the topic a log would carry.
+    let events = page["interface"]["events"].as_array().expect("events");
+    let transfer_event = events
+        .iter()
+        .find(|e| e["signature"] == json!("Transfer(address,address,uint256)"))
+        .expect("Transfer");
+    assert_eq!(transfer_event["topic0"], json!(TRANSFER_TOPIC.as_str()));
+    assert_eq!(transfer_event["inputs"][0]["indexed"], json!(true));
+
+    // The TIP-20 details come from the indexed metadata, not another RPC call.
+    assert_eq!(page["token_meta"]["symbol"], json!("pathUSD"));
+    assert_eq!(page["token_meta"]["decimals"], json!(6));
+}
+
+/// An ordinary account has no interface to show, and the tab does not claim
+/// otherwise.
+#[tokio::test]
+async fn a_plain_account_has_no_interface() {
+    let (_dir, base) = serve().await;
+    let page = get_json(
+        &base,
+        &format!("/address/{}?tab=contract", checksum_address(SENDER)),
+    )
+    .await;
+    assert_eq!(page["has_interface"], json!(false));
+    assert_eq!(page["interface"]["abis"], json!([]));
+    assert!(page["token_meta"].is_null());
+}
+
+/// The address page renders on every tab, including the ones added last.
+#[tokio::test]
+async fn every_address_tab_renders() {
+    let (_dir, base) = serve().await;
+    for address in [checksum_address(SENDER), checksum_address(TOKEN)] {
+        for tab in ["transactions", "transfers", "holdings", "contract"] {
+            let path = format!("/address/{address}?tab={tab}");
+            let response = reqwest::get(format!("{base}{path}"))
+                .await
+                .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+            assert_eq!(response.status(), 200, "GET {path}");
+        }
+    }
 }
