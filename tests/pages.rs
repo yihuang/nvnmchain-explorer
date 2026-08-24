@@ -748,3 +748,34 @@ async fn every_address_tab_renders() {
         }
     }
 }
+
+/// Multicall3, Permit2 and CreateX are not Tempo's, but they are deployed at
+/// canonical addresses and called constantly. Every path that names a contract
+/// must know them.
+#[tokio::test]
+async fn canonical_contracts_are_named_and_searchable() {
+    let (_dir, base) = serve().await;
+    let multicall = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+    let (dir, db) = temp_db("canonical.db");
+    assert_eq!(
+        nvnmchain_explorer::web::address_label(&db, multicall).as_deref(),
+        Some("Multicall3")
+    );
+    drop(dir);
+
+    let hits = suggest(&base, "permit").await;
+    assert!(
+        hits.iter().any(|r| r["label"] == json!("Permit2")),
+        "got {hits:#?}"
+    );
+
+    // And the interface is there to show, rather than a bare address page.
+    let page = get_json(&base, &format!("/address/{multicall}?tab=contract")).await;
+    assert_eq!(page["interface"]["abis"], json!(["multicall3"]));
+    assert!(page["interface"]["writes"]
+        .as_array()
+        .expect("writes")
+        .iter()
+        .any(|f| f["name"] == json!("aggregate3")));
+}

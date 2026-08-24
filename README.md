@@ -180,6 +180,10 @@ rather than silently failing to decode. The few declarations with no binding
 are Solidity signatures at the top of `src/decoder.rs`: a typo there does not
 parse, and tests pin the selectors they hash to.
 
+Multicall3, Permit2 and CreateX are not Tempo's, so no binding carries them,
+but they sit at canonical addresses and are called constantly. Their ABIs
+are the JSON under `abi/`, compiled in.
+
 Each decoded log is also said in words, from the phrasing table in
 `src/summary.rs`, and the transaction page leads with that sentence. Two tests
 hold the table and the registry to each other, so a new event cannot land
@@ -264,6 +268,7 @@ src/
   tokens.rs     token metadata + formatting
   indexer.rs    background indexing
   web.rs        axum routes + template helpers
+abi/            ABIs for contracts that are not Tempo's
 templates/      Tera templates
 tests/          unit + page tests, and live RPC integration tests
 ```

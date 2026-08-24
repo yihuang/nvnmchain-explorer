@@ -109,6 +109,15 @@ fn tempo_contracts() -> Vec<(&'static str, JsonAbi)> {
     ]
 }
 
+/// Contracts that are not Tempo's, so no binding carries them — deployed at
+/// canonical addresses and called constantly, and without these their calls
+/// decode to a bare selector. JSON under `abi/`.
+const VENDORED: &[(&str, &str)] = &[
+    ("multicall3", include_str!("../abi/multicall3.json")),
+    ("permit2", include_str!("../abi/permit2.json")),
+    ("createx", include_str!("../abi/createx.json")),
+];
+
 /// One parsed ABI and the name it was registered under.
 struct NamedContract {
     name: &'static str,
@@ -175,14 +184,24 @@ impl Registry {
             errors: HashMap::new(),
         };
         // Chain-local first: nothing upstream should shadow these.
-        let parsed = std::iter::once(("local", local_contract())).chain(
-            tempo_contracts().into_iter().filter_map(|(name, abi)| {
+        let parsed = std::iter::once(("local", local_contract()))
+            .chain(tempo_contracts().into_iter().filter_map(|(name, abi)| {
                 from_json_abi(&abi)
                     .map_err(|e| tracing::error!("binding `{name}` did not convert: {e}"))
                     .ok()
                     .map(|contract| (name, contract))
-            }),
-        );
+            }))
+            .chain(VENDORED.iter().filter_map(|(name, json)| {
+                // A malformed asset is a build-time mistake: skip it loudly
+                // rather than taking the process down on a page view.
+                match serde_json::from_str(json) {
+                    Ok(contract) => Some((*name, contract)),
+                    Err(e) => {
+                        tracing::error!("vendored ABI `{name}` failed to parse: {e}");
+                        None
+                    }
+                }
+            }));
         for (name, contract) in parsed {
             let index = registry.contracts.len();
             for function in contract.functions() {
@@ -1034,10 +1053,10 @@ pub fn parse_decimal_or_hex(s: &str) -> i128 {
 mod tests {
     use super::*;
 
-    /// A binding that fails to convert would show up only as calls and logs
-    /// quietly falling back to "unknown".
+    /// A binding that fails to convert, or a vendored asset with a typo, would
+    /// show up only as calls and logs quietly falling back to "unknown".
     #[test]
-    fn every_binding_loads() {
+    fn every_source_loads() {
         for (name, abi) in tempo_contracts() {
             let converted = from_json_abi(&abi);
             assert!(converted.is_ok(), "binding `{name}`: {converted:?}");
@@ -1058,9 +1077,13 @@ mod tests {
                 "`{name}` lost errors"
             );
         }
+        for (name, json) in VENDORED {
+            let parsed: Result<Contract, _> = serde_json::from_str(json);
+            assert!(parsed.is_ok(), "`{name}` failed to parse: {parsed:?}");
+        }
         assert_eq!(
             REGISTRY.contracts.len(),
-            tempo_contracts().len() + 1,
+            tempo_contracts().len() + VENDORED.len() + 1,
             "plus `local`"
         );
     }
@@ -1073,9 +1096,9 @@ mod tests {
             REGISTRY.events.len(),
             REGISTRY.errors.len(),
         );
-        assert!(functions > 180, "only {functions} functions registered");
-        assert!(events > 60, "only {events} events registered");
-        assert!(errors > 100, "only {errors} errors registered");
+        assert!(functions > 240, "only {functions} functions registered");
+        assert!(events > 70, "only {events} events registered");
+        assert!(errors > 120, "only {errors} errors registered");
     }
 
     /// The selector hashes the canonical signature, not ethabi's

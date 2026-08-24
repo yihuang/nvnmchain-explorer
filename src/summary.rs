@@ -726,6 +726,80 @@ static PHRASES: &[Phrase] = &[
         "Initialize",
         &[Slot::Word("at height"), Slot::Value("height")],
     ),
+    // ---- CreateX / Permit2 -------------------------------------------------
+    phrase(
+        "ContractCreation(address)",
+        "contract created",
+        "Deploy Contract",
+        &[Slot::Account("newContract")],
+    ),
+    phrase(
+        "ContractCreation(address,bytes32)",
+        "contract created",
+        "Deploy Contract",
+        &[Slot::Account("newContract")],
+    )
+    .notes(&[("Salt", Slot::Hex("salt"))]),
+    phrase(
+        "Create3ProxyContractCreation(address,bytes32)",
+        "proxy created",
+        "Deploy CREATE3 Proxy",
+        &[Slot::Account("newContract")],
+    )
+    .notes(&[("Salt", Slot::Hex("salt"))]),
+    phrase(
+        "Approval(address,address,address,uint160,uint48)",
+        "approval",
+        "Approve",
+        &[
+            Slot::AmountOf {
+                value: "amount",
+                token: "token",
+            },
+            Slot::Word("for spender"),
+            Slot::Account("spender"),
+        ],
+    )
+    .notes(&[("Expires", Slot::Value("expiration"))]),
+    phrase(
+        "Permit(address,address,address,uint160,uint48,uint48)",
+        "permit",
+        "Permit",
+        &[
+            Slot::Account("spender"),
+            Slot::Word("to spend"),
+            Slot::AmountOf {
+                value: "amount",
+                token: "token",
+            },
+        ],
+    )
+    .notes(&[("Expires", Slot::Value("expiration"))]),
+    phrase(
+        "Lockdown(address,address,address)",
+        "lockdown",
+        "Revoke Approval",
+        &[
+            Slot::Word("for"),
+            Slot::Account("spender"),
+            Slot::Word("on"),
+            Slot::Token("token"),
+        ],
+    ),
+    phrase(
+        "NonceInvalidation(address,address,address,uint48,uint48)",
+        "nonce invalidated",
+        "Invalidate Nonce",
+        &[Slot::Word("to"), Slot::Value("newNonce")],
+    )
+    .notes(&[("Spender", Slot::Account("spender"))]),
+    phrase(
+        "UnorderedNonceInvalidation(address,uint256,uint256)",
+        "nonce invalidated",
+        "Invalidate Nonces",
+        &[Slot::Word("in word"), Slot::Value("word")],
+    )
+    .notes(&[("Owner", Slot::Account("owner"))]),
     // ---- Chain-local ------------------------------------------------------
     phrase(
         "Anchored(address,bytes32,bytes32,bytes)",

@@ -59,12 +59,34 @@ fn precompile_labels() -> &'static HashMap<String, String> {
                 "0x1060000000000000000000000000000000000000",
                 "Storage Credits",
             ),
+            (
+                "0xC077e00000000000000000000000000000000000",
+                "Current Committee",
+            ),
             (crate::anchoring::ANCHORING_ADDRESS, "Anchoring"),
         ];
         pairs
             .iter()
             .map(|(a, label)| (checksum_address(a), label.to_string()))
             .collect()
+    })
+}
+
+/// Contracts that are not Tempo's own but are deployed at canonical addresses
+/// everywhere, including here. Kept apart from the precompiles: they are
+/// ordinary contracts, and calling them precompiles would misreport what they
+/// are on their own page.
+fn deployed_contracts() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        [
+            ("0xcA11bde05977b3631167028862bE2a173976CA11", "Multicall3"),
+            ("0x000000000022D473030F116dDEE9F6B43aC78BA3", "Permit2"),
+            ("0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed", "CreateX"),
+        ]
+        .iter()
+        .map(|(a, label)| (checksum_address(a), label.to_string()))
+        .collect()
     })
 }
 
@@ -132,18 +154,18 @@ pub fn is_tip20_token(addr: &str) -> bool {
 
 pub fn is_contract(addr: &str) -> bool {
     let checksummed = checksum_address(addr);
-    precompile_labels().contains_key(&checksummed) || is_tip20_token(addr)
+    precompile_labels().contains_key(&checksummed)
+        || deployed_contracts().contains_key(&checksummed)
+        || is_tip20_token(addr)
 }
 
 pub fn get_contract_name(addr: &str) -> Option<String> {
     let checksummed = checksum_address(addr);
-    if let Some(label) = precompile_labels().get(&checksummed) {
-        return Some(label.clone());
-    }
-    if let Some(info) = known_tokens().get(&checksummed) {
-        return Some(info.name.clone());
-    }
-    None
+    precompile_labels()
+        .get(&checksummed)
+        .or_else(|| deployed_contracts().get(&checksummed))
+        .cloned()
+        .or_else(|| known_tokens().get(&checksummed).map(|i| i.name.clone()))
 }
 
 pub fn is_eoa(addr: &str) -> bool {
@@ -175,6 +197,13 @@ pub fn identify_address(addr: &str) -> AddressInfo {
             symbol: Some(info.symbol.clone()),
         };
     }
+    if let Some(label) = deployed_contracts().get(&checksummed) {
+        return AddressInfo {
+            kind: "contract".into(),
+            label: Some(label.clone()),
+            symbol: None,
+        };
+    }
     if is_tip20_token(&checksummed) {
         return AddressInfo {
             kind: "token".into(),
@@ -187,6 +216,11 @@ pub fn identify_address(addr: &str) -> AddressInfo {
         label: None,
         symbol: None,
     }
+}
+
+/// The name of a canonical deployed contract (Multicall3, Permit2, CreateX).
+pub fn deployed_contract_name(addr: &str) -> Option<String> {
+    deployed_contracts().get(&checksum_address(addr)).cloned()
 }
 
 pub fn get_known_token(address: &str) -> Option<TokenInfo> {
@@ -249,6 +283,16 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
             "0x1060000000000000000000000000000000000000",
             &["storage_credits"],
         ),
+        (
+            "0xc077e00000000000000000000000000000000000",
+            &["current_committee"],
+        ),
+        (
+            "0xca11bde05977b3631167028862be2a173976ca11",
+            &["multicall3"],
+        ),
+        ("0x000000000022d473030f116ddee9f6b43ac78ba3", &["permit2"]),
+        ("0xba5ed099633d3b313e4d5f7bdc1305d3c28ba5ed", &["createx"]),
     ];
 
     let lowered = addr.trim().to_lowercase();
@@ -265,16 +309,17 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
     &[]
 }
 
-/// Precompiles whose name contains `query`, as `(address, name)` pairs.
+/// Named contracts whose name contains `query`, as `(address, name)` pairs.
 /// Sorted by match quality then alphabetically, so the same query always
 /// produces the same list — a hash map's order is not one.
-pub fn search_precompiles(query: &str, limit: usize) -> Vec<(String, String)> {
+pub fn search_named(query: &str, limit: usize) -> Vec<(String, String)> {
     let query = query.trim().to_lowercase();
     if query.len() < 2 {
         return Vec::new();
     }
     let mut matches: Vec<(u8, String, String)> = precompile_labels()
         .iter()
+        .chain(deployed_contracts())
         .filter_map(|(address, name)| {
             let lowered = name.to_lowercase();
             let rank = if lowered == query {
@@ -301,11 +346,14 @@ pub fn search_precompiles(query: &str, limit: usize) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
-    /// Every address the ABI table names must also be a labelled precompile,
-    /// and every ABI it names must be one the registry actually loads.
+    /// Every labelled address must have an ABI to show, and every ABI it
+    /// names must be one the registry actually loads.
     #[test]
     fn the_abi_table_agrees_with_the_label_table() {
-        for label in precompile_labels().keys() {
+        for label in precompile_labels()
+            .keys()
+            .chain(deployed_contracts().keys())
+        {
             let abis = abis_for_address(label);
             assert!(
                 !abis.is_empty(),
