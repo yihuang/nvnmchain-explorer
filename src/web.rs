@@ -26,7 +26,7 @@ use crate::anchoring::is_self_verifying;
 use crate::config::Settings;
 use crate::contracts::{
     abis_for_address, get_contract_name, get_known_token, get_precompile_name, identify_address,
-    is_contract, is_tip20_token, search_precompiles,
+    is_contract, is_tip20_token, search_named,
 };
 use crate::db::{self, Db};
 use crate::decoder::{
@@ -557,6 +557,9 @@ pub fn address_label(db: &Db, address: &str) -> Option<String> {
         return None;
     }
     if let Some(name) = get_precompile_name(&checksummed) {
+        return Some(name);
+    }
+    if let Some(name) = crate::contracts::deployed_contract_name(&checksummed) {
         return Some(name);
     }
     if let Some(meta) = db::get_token_metadata(db, &checksummed) {
@@ -1883,7 +1886,7 @@ pub async fn search_suggest(
                 format!("{} · {}", meta.symbol, truncate_hash(&meta.address, 8, 6)),
             ));
         }
-        for (address, name) in search_precompiles(q, SUGGESTION_LIMIT) {
+        for (address, name) in search_named(q, SUGGESTION_LIMIT) {
             results.push(suggestion(
                 "precompile",
                 format!("/address/{address}"),
