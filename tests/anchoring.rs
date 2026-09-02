@@ -11,7 +11,9 @@ use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{decode_event, decode_function_call, keccak_hex, ANCHORED_TOPIC};
 use nvnmchain_explorer::indexer::anchored_event;
-use nvnmchain_explorer::models::{AnchoredEvent, Block, BlockBundle, Transaction};
+use nvnmchain_explorer::models::{
+    AnchoredEvent, Block, BlockBundle, RegistryDeployed, Transaction,
+};
 use serde_json::{json, Value};
 
 /// The registry contract that emitted the fixtures — its address is the namespace,
@@ -86,6 +88,12 @@ fn event_from_log(log: &Value, tx: &Transaction, log_index: i64) -> AnchoredEven
     let decoded = decode_event(log).expect("decoded log");
     assert_eq!(decoded.name.as_deref(), Some("Anchored"));
     anchored_event(&decoded, tx, log_index).expect("anchored row")
+}
+
+fn deployment_from_log(log: &Value, tx: &Transaction) -> RegistryDeployed {
+    let decoded = decode_event(log).expect("decoded log");
+    assert_eq!(decoded.name.as_deref(), Some("RegistryDeployed"));
+    nvnmchain_explorer::indexer::registry_deployed(&decoded, tx).expect("deployment row")
 }
 
 fn test_block(number: i64) -> Block {
@@ -370,11 +378,7 @@ fn a_deployment_labels_its_namespace_for_the_configured_factory_only() {
         0,
     );
     // ...and its factory announced it.
-    let log = registry_deployed_log(FACTORY, REGISTRY, "docs");
-    let decoded = decode_event(&log).expect("decoded log");
-    assert_eq!(decoded.name.as_deref(), Some("RegistryDeployed"));
-    let deployed =
-        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx).expect("deployment parses");
+    let deployed = deployment_from_log(&registry_deployed_log(FACTORY, REGISTRY, "docs"), &tx);
     assert_eq!(deployed.registry, REGISTRY);
     assert_eq!(deployed.name, "docs");
     assert_eq!(deployed.description, "docs about docs");
@@ -421,9 +425,7 @@ fn an_impostors_deployment_cannot_unlabel_a_registry() {
     let block = test_block(500);
     let tx = test_tx(&block);
     let deployed = |factory: &str, name: &str| {
-        let log = registry_deployed_log(factory, REGISTRY, name);
-        let decoded = decode_event(&log).expect("decoded log");
-        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx).expect("parses")
+        deployment_from_log(&registry_deployed_log(factory, REGISTRY, name), &tx)
     };
     let impostor = format!("0x{}", "ee".repeat(20));
     let bundle = BlockBundle {
@@ -677,10 +679,7 @@ async fn serve_registry() -> (tempfile::TempDir, String) {
         &tx,
         0,
     );
-    let log = registry_deployed_log(FACTORY, REGISTRY, "docs");
-    let decoded = decode_event(&log).expect("decoded log");
-    let deployed =
-        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx).expect("deployment parses");
+    let deployed = deployment_from_log(&registry_deployed_log(FACTORY, REGISTRY, "docs"), &tx);
     db::save_block_bundle(
         &db,
         &BlockBundle {
@@ -766,13 +765,11 @@ async fn a_registry_address_shows_the_registry_interface() {
     let page = json_at(format!("{base}/address/{REGISTRY}?format=json")).await;
     assert_eq!(page["interface"]["abis"], json!(["registry"]));
     assert_eq!(page["type"], json!("contract"));
-    let writes: Vec<&str> = page["interface"]["writes"]
-        .as_array()
-        .expect("writes")
-        .iter()
-        .filter_map(|f| f["name"].as_str())
-        .collect();
-    assert!(writes.contains(&"addRecord"), "{writes:?}");
+    let writes = page["interface"]["writes"].as_array().expect("writes");
+    assert!(
+        writes.iter().any(|f| f["name"] == "addRecord"),
+        "{writes:?}"
+    );
 
     let factory = json_at(format!("{base}/address/{FACTORY}?format=json")).await;
     assert_eq!(factory["interface"]["abis"], json!(["registry_factory"]));

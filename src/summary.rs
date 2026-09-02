@@ -11,7 +11,6 @@
 //! that is really a fee — are adjusted in `refine` afterwards.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
 
 use serde::Serialize;
 
@@ -913,10 +912,6 @@ fn short_string(word: &str) -> Option<String> {
     .then(|| String::from_utf8_lossy(text).into_owned())
 }
 
-/// A registry announces a registry-scoped role under `keccak256("")` — what an
-/// empty checksum hashes to — so the scope is readable without the contract.
-static REGISTRY_SCOPE: LazyLock<String> = LazyLock::new(|| keccak_hex(b""));
-
 /// The `RecordCategory` ordinals, which reach the log as a bare `uint8`. An
 /// unknown one means the contract gained a variant, and the number stands until
 /// this list catches up.
@@ -1014,7 +1009,8 @@ fn render_slot(slot: &Slot, event: &DecodedEvent, tokens: &Tokens) -> Option<Str
         }
         Slot::Scope(name) => {
             let word = value_of(params, name)?;
-            if word.to_lowercase() == *REGISTRY_SCOPE {
+            // A registry-scoped role is announced under an empty checksum's hash.
+            if word.to_lowercase() == keccak_hex(b"") {
                 "the whole registry".to_string()
             } else {
                 format!("record {}", truncate(&word))
@@ -1026,8 +1022,7 @@ fn render_slot(slot: &Slot, event: &DecodedEvent, tokens: &Tokens) -> Option<Str
                 .parse::<usize>()
                 .ok()
                 .and_then(|i| RECORD_CATEGORIES.get(i))
-                .map(|c| (*c).to_string())
-                .unwrap_or(ordinal)
+                .map_or(ordinal, |category| category.to_string())
         }
     })
 }

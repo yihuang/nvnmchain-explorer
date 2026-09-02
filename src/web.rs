@@ -338,21 +338,26 @@ async fn contract_code(state: &AppState, address: &str) -> Value {
     })
 }
 
+/// The configured factory's registry at `address`, if that is what it is.
+/// With no factory configured, nothing is.
+fn registry_of(state: &AppState, address: &str) -> Option<Value> {
+    let factory = state.cfg.registry_factory.as_deref()?;
+    db::get_registry(&state.db, factory, address)
+}
+
 /// The registry ABIs, when this address is a registry or the factory that
 /// deployed it. A registry is an ordinary deployment, so no table of canonical
 /// addresses can name it: `RegistryDeployed` says which addresses are
 /// registries, and `REGISTRY_FACTORY` whose word to take for it.
 fn registry_abis(state: &AppState, address: &str) -> &'static [&'static str] {
-    let Some(factory) = state.cfg.registry_factory.as_deref() else {
-        return &[];
-    };
-    if address.eq_ignore_ascii_case(factory) {
-        return &["registry_factory"];
+    let factory = state.cfg.registry_factory.as_deref();
+    if factory.is_some_and(|factory| address.eq_ignore_ascii_case(factory)) {
+        &["registry_factory"]
+    } else if registry_of(state, address).is_some() {
+        &["registry"]
+    } else {
+        &[]
     }
-    if db::get_registry(&state.db, factory, address).is_some() {
-        return &["registry"];
-    }
-    &[]
 }
 
 /// What an address exposes: the ABIs the explorer knows for it, split into
@@ -1673,11 +1678,7 @@ pub async fn anchoring_namespace_page(
     let page = page_param(&query);
     let keys = db::get_namespace_keys(&state.db, &namespace, page, PER_PAGE);
     // Labelled when the configured factory deployed this namespace.
-    let registry = state
-        .cfg
-        .registry_factory
-        .as_deref()
-        .and_then(|factory| db::get_registry(&state.db, factory, &namespace));
+    let registry = registry_of(&state, &namespace);
     let ctx = page_ctx(
         &state,
         json!({
@@ -1720,11 +1721,7 @@ pub async fn anchoring_key_page(
     // Anyone may anchor under any key, and the decoder answers per registry —
     // 404 for an address the factory never announced — so an unlabelled
     // namespace gets no link rather than one that leads nowhere.
-    let registry = state
-        .cfg
-        .registry_factory
-        .as_deref()
-        .and_then(|factory| db::get_registry(&state.db, factory, &namespace));
+    let registry = registry_of(&state, &namespace);
     let ctx = page_ctx(
         &state,
         json!({
