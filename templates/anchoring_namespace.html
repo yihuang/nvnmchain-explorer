@@ -14,6 +14,17 @@
     </p>
 </div>
 
+{% if anchoring_url and registry %}
+{# Roles appear nowhere in the keys below: a registry keeps membership in its
+   own state and its history in RoleGranted/RoleRevoked, never anchored. #}
+<p class="text-xs text-dim mb-4">
+    Decoded by the anchoring service —
+    <a href="{{ anchoring_url }}/registries/{{ namespace }}/records" target="_blank" class="text-blue-400 hover:text-blue-300">records</a>
+    and
+    <a href="{{ anchoring_url }}/registries/{{ namespace }}/roles" target="_blank" class="text-blue-400 hover:text-blue-300">roles</a>.
+</p>
+{% endif %}
+
 <div class="card overflow-x-auto">
     <div class="min-w-[720px]">
         <div class="flex table-header">

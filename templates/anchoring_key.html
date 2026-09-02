@@ -38,11 +38,11 @@
     </div>
 </div>
 
-{% if anchoring_url %}
+{% if anchoring_url and registry %}
 <p class="text-xs text-dim mb-4">
     What this payload means is an application question —
     <a href="{{ anchoring_url }}/registries/{{ namespace }}/records" target="_blank" class="text-blue-400 hover:text-blue-300">the anchoring decoder</a>
-    reads this namespace's records, decoded.
+    reads this registry's records, decoded.
 </p>
 {% endif %}
 

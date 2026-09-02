@@ -299,8 +299,9 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
     if let Some((_, abis)) = BY_ADDRESS.iter().find(|(a, _)| *a == lowered) {
         return abis;
     }
+    // Not in the table above because the address is a constant, not a literal.
     if lowered == crate::anchoring::ANCHORING_ADDRESS.to_lowercase() {
-        return &["local"];
+        return &["anchoring"];
     }
     // Every TIP-20 is the same interface at a different address.
     if is_tip20_token(&lowered) {
@@ -381,6 +382,20 @@ mod tests {
             abis_for_address(&fee_manager.to_uppercase().replace("0X", "0x")),
             ["fee_manager", "fee_amm"]
         );
+    }
+
+    /// The precompile's own interface. The test above only asks that the ABI
+    /// named exists, which passed while this address named the group holding
+    /// the registry factory's event.
+    #[test]
+    fn the_anchoring_precompile_shows_its_own_interface() {
+        let abis = abis_for_address(crate::anchoring::ANCHORING_ADDRESS);
+        assert_eq!(abis, ["anchoring"]);
+        let contract = crate::decoder::REGISTRY
+            .contract("anchoring")
+            .expect("anchoring registered");
+        assert!(contract.functions().any(|f| f.name == "anchor"));
+        assert!(contract.events().any(|e| e.name == "Anchored"));
     }
 
     /// A TIP-20 is recognised by its prefix, not by an entry per token.

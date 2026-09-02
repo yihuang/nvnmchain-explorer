@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use nvnmchain_explorer::anchoring::{is_self_verifying, ANCHORING_ADDRESS};
+use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{decode_event, decode_function_call, keccak_hex, ANCHORED_TOPIC};
 use nvnmchain_explorer::indexer::anchored_event;
@@ -464,9 +465,16 @@ async fn serve() -> (tempfile::TempDir, String) {
 
 /// A server over `db`, and its base URL. The caller keeps the TempDir alive.
 async fn serve_db(db: Db) -> String {
+    serve_configured(db, |_| {}).await
+}
+
+/// The same, with the settings an operator would have set. Taken as a closure
+/// rather than through the environment, which these tests share.
+async fn serve_configured(db: Db, configure: impl FnOnce(&mut Settings)) -> String {
     use nvnmchain_explorer::web::{self, AppState};
 
-    let cfg = nvnmchain_explorer::config::Settings::from_env();
+    let mut cfg = nvnmchain_explorer::config::Settings::from_env();
+    configure(&mut cfg);
     let tera = web::build_tera(db.clone()).expect("templates");
     let state = AppState {
         db,
@@ -656,6 +664,118 @@ async fn a_listing_longer_than_a_page_is_paged() {
     assert!(second.contains("Page 2 of 2"));
     assert!(second.contains("?page=1"), "the way back");
     assert!(!second.contains("Next"), "and no page three");
+}
+
+/// A registry that has anchored one key, announced by the configured factory,
+/// with a decoder to link out to.
+async fn serve_registry() -> (tempfile::TempDir, String) {
+    let (dir, db) = temp_db();
+    let block = test_block(700);
+    let tx = test_tx(&block);
+    let anchor = event_from_log(
+        &anchored_log(REGISTRY, REGISTRY_KEY, REGISTRY_COMMITMENT, "0x"),
+        &tx,
+        0,
+    );
+    let log = registry_deployed_log(FACTORY, REGISTRY, "docs");
+    let decoded = decode_event(&log).expect("decoded log");
+    let deployed =
+        nvnmchain_explorer::indexer::registry_deployed(&decoded, &tx).expect("deployment parses");
+    db::save_block_bundle(
+        &db,
+        &BlockBundle {
+            block,
+            txs: vec![tx],
+            transfers: vec![],
+            anchored: vec![anchor],
+            tokens: vec![],
+            registries: vec![deployed],
+        },
+    )
+    .expect("save bundle");
+    let base = serve_configured(db, |cfg| {
+        cfg.anchoring_url = Some("http://decoder.test".into());
+        cfg.registry_factory = Some(FACTORY.into());
+    })
+    .await;
+    (dir, base)
+}
+
+async fn html_at(url: String) -> String {
+    reqwest::get(url)
+        .await
+        .expect("page")
+        .text()
+        .await
+        .expect("body")
+}
+
+async fn json_at(url: String) -> Value {
+    reqwest::get(url)
+        .await
+        .expect("page")
+        .json()
+        .await
+        .expect("json")
+}
+
+/// Anyone may anchor under any key, and the decoder answers per registry, so
+/// only a namespace the factory announced gets the link.
+#[tokio::test]
+async fn only_a_registry_links_out_to_the_decoder() {
+    let (_dir, base) = serve_registry().await;
+
+    // Tera escapes the URL's slashes into the attribute, so the path is what
+    // says which projection a link reaches.
+    let namespace = html_at(format!("{base}/anchoring/{REGISTRY}")).await;
+    for projection in ["records", "roles"] {
+        assert!(
+            namespace.contains(&format!("decoder.test/registries/{REGISTRY}/{projection}")),
+            "the {projection} projection"
+        );
+    }
+    assert!(
+        html_at(format!("{base}/anchoring/{REGISTRY}/{REGISTRY_KEY}"))
+            .await
+            .contains("the anchoring decoder"),
+        "the key page's link"
+    );
+
+    // The same anchor under a factory that never announced it: no link, rather
+    // than one that leads to a 404.
+    let (_dir, db) = temp_db();
+    index_anchor(&db, 800, REGISTRY_KEY, REGISTRY_COMMITMENT, "0x");
+    let base = serve_configured(db, |cfg| {
+        cfg.anchoring_url = Some("http://decoder.test".into());
+        cfg.registry_factory = Some(format!("0x{}", "5e".repeat(20)));
+    })
+    .await;
+    let page = html_at(format!("{base}/anchoring/{REGISTRY}/{REGISTRY_KEY}")).await;
+    assert!(
+        !page.contains("decoder.test"),
+        "no link for a bare namespace"
+    );
+}
+
+/// A registry lands wherever `CREATE` puts it, so its interface — and the fact
+/// that it is a contract at all — come from the factory's log.
+#[tokio::test]
+async fn a_registry_address_shows_the_registry_interface() {
+    let (_dir, base) = serve_registry().await;
+
+    let page = json_at(format!("{base}/address/{REGISTRY}?format=json")).await;
+    assert_eq!(page["interface"]["abis"], json!(["registry"]));
+    assert_eq!(page["type"], json!("contract"));
+    let writes: Vec<&str> = page["interface"]["writes"]
+        .as_array()
+        .expect("writes")
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    assert!(writes.contains(&"addRecord"), "{writes:?}");
+
+    let factory = json_at(format!("{base}/address/{FACTORY}?format=json")).await;
+    assert_eq!(factory["interface"]["abis"], json!(["registry_factory"]));
 }
 
 /// The layout, rendered with whatever `page_ctx` would have put in it.

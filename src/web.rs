@@ -338,12 +338,33 @@ async fn contract_code(state: &AppState, address: &str) -> Value {
     })
 }
 
+/// The registry ABIs, when this address is a registry or the factory that
+/// deployed it. A registry is an ordinary deployment, so no table of canonical
+/// addresses can name it: `RegistryDeployed` says which addresses are
+/// registries, and `REGISTRY_FACTORY` whose word to take for it.
+fn registry_abis(state: &AppState, address: &str) -> &'static [&'static str] {
+    let Some(factory) = state.cfg.registry_factory.as_deref() else {
+        return &[];
+    };
+    if address.eq_ignore_ascii_case(factory) {
+        return &["registry_factory"];
+    }
+    if db::get_registry(&state.db, factory, address).is_some() {
+        return &["registry"];
+    }
+    &[]
+}
+
 /// What an address exposes: the ABIs the explorer knows for it, split into
 /// reads and writes, plus its events. Empty for an unknown address.
-fn contract_interface(address: &str) -> Value {
-    let names = abis_for_address(address);
+fn contract_interface(state: &AppState, address: &str) -> Value {
+    let names: Vec<&'static str> = abis_for_address(address)
+        .iter()
+        .chain(registry_abis(state, address))
+        .copied()
+        .collect();
     let (mut reads, mut writes, mut events) = (Vec::new(), Vec::new(), Vec::new());
-    for name in names {
+    for name in &names {
         let Some(contract) = REGISTRY.contract(name) else {
             continue;
         };
@@ -1418,10 +1439,20 @@ pub async fn address_page(
         _ => total_pages(tx_count, per_page),
     };
 
+    // The Contract tab: the interface the explorer knows, the TIP-20 metadata
+    // when there is any, and the deployed bytecode. Only the code costs an RPC
+    // round trip, and only when that tab is open.
+    let interface = contract_interface(&state, &checksummed);
+    let has_interface = interface["abis"].as_array().is_some_and(|a| !a.is_empty());
+
     let addr_info = identify_address(&checksummed);
     let is_token_addr = db::get_token_metadata(&state.db, &checksummed).is_some()
         || crate::contracts::is_tip20_token(&checksummed);
-    let kind = if addr_info.kind == "eoa" && (is_contract(&checksummed) || is_token_addr) {
+    // Knowing an interface for an address is knowing it is a contract — the
+    // only thing that says so for a registry, which is in no table of addresses.
+    let kind = if addr_info.kind == "eoa"
+        && (is_contract(&checksummed) || is_token_addr || has_interface)
+    {
         "contract"
     } else {
         addr_info.kind.as_str()
@@ -1434,11 +1465,6 @@ pub async fn address_page(
         }
     });
 
-    // The Contract tab: the interface the explorer knows, the TIP-20 metadata
-    // when there is any, and the deployed bytecode. Only the code costs an RPC
-    // round trip, and only when that tab is open.
-    let interface = contract_interface(&checksummed);
-    let has_interface = interface["abis"].as_array().is_some_and(|a| !a.is_empty());
     let token_meta = db::get_token_metadata(&state.db, &checksummed);
     let code = if tab == "contract" {
         contract_code(&state, &checksummed).await
@@ -1691,10 +1717,19 @@ pub async fn anchoring_key_page(
     let Some(head) = head else {
         return not_found(&state, &headers, &query, "Anchored key", &key);
     };
+    // Anyone may anchor under any key, and the decoder answers per registry —
+    // 404 for an address the factory never announced — so an unlabelled
+    // namespace gets no link rather than one that leads nowhere.
+    let registry = state
+        .cfg
+        .registry_factory
+        .as_deref()
+        .and_then(|factory| db::get_registry(&state.db, factory, &namespace));
     let ctx = page_ctx(
         &state,
         json!({
             "namespace": namespace,
+            "registry": registry,
             "key": head.key,
             "self_verifying": is_self_verifying(&head.commitment, &head.metadata),
             "head": head,

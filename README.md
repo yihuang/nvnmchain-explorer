@@ -204,11 +204,21 @@ routes answer either way.
 What a payload *means* belongs to the application that wrote it. Set
 `ANCHORING_URL` to whatever reads those envelopes — for the registry ones,
 [nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) `serve` —
-and each key page links out to `{ANCHORING_URL}/registries/{namespace}/records`.
+and a registry's pages link out to its `records` and `roles` there. Only a
+namespace the factory announced gets the link, since anyone may anchor under any
+key and the decoder 404s for an address it has no registry for.
 
 Set `REGISTRY_FACTORY` to the deployed `RegistryFactory` to label the namespaces
 it deployed with their registry name. Deployments are indexed either way, so
 setting it later needs no re-sync; unset, nothing is trusted as a registry.
+
+One `Registry` is deployed per registry — the precompile partitions by caller,
+so the address *is* the namespace — at an address no table could hold in
+advance. `RegistryDeployed` is what says which addresses are registries, so
+their pages show the `Registry` interface and the factory's shows its own.
+A registry's log decodes here too: records restate what `Anchored` already
+carries, and `RoleGranted`/`RoleRevoked` are the whole record of a role, which
+is never anchored.
 
 ## Indexer
 

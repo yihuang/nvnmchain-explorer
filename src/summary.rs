@@ -11,6 +11,7 @@
 //! that is really a fee — are adjusted in `refine` afterwards.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use serde::Serialize;
 
@@ -66,6 +67,10 @@ enum Slot {
     Hex(&'static str),
     /// A `bytes32` role, by name when it is one of the known ones.
     Role(&'static str),
+    /// A registry role's scope: the whole registry, or one record.
+    Scope(&'static str),
+    /// A `RecordCategory`, which crosses the ABI as its `uint8` ordinal.
+    Category(&'static str),
 }
 
 /// How one event reads. `action` opens the sentence and names a failure
@@ -818,6 +823,53 @@ static PHRASES: &[Phrase] = &[
             ("Registry", Slot::Account("registry")),
             ("Creator", Slot::Account("creator")),
         ]),
+    // A registry's own log. Records read as `Anchored` above too, in the
+    // precompile's terms; roles read nowhere else, since they are not anchored.
+    phrase(
+        "RecordAdded(bytes32,uint256,string,uint8,string,address)",
+        "record added",
+        "Add Record",
+        &[
+            Slot::Word("version"),
+            Slot::Value("index"),
+            Slot::Word("of"),
+            Slot::Hex("checksum"),
+        ],
+    )
+    .notes(&[
+        ("Category", Slot::Category("category")),
+        ("Data pointer", Slot::Value("dataPointer")),
+        ("Author", Slot::Account("author")),
+    ]),
+    phrase(
+        "RecordStatusUpdated(bytes32,uint256,string)",
+        "record status updated",
+        "Update Record Status",
+        &[Slot::Value("status"), Slot::Word("on version"), Slot::Value("index")],
+    )
+    .notes(&[("Record", Slot::Hex("checksumHash"))]),
+    phrase(
+        "RoleGranted(bytes32,address,bytes32)",
+        "role granted",
+        "Grant Role",
+        &[
+            Slot::Role("role"),
+            Slot::Word("to"),
+            Slot::Account("account"),
+        ],
+    )
+    .notes(&[("Scope", Slot::Scope("checksumHash"))]),
+    phrase(
+        "RoleRevoked(bytes32,address,bytes32)",
+        "role revoked",
+        "Revoke Role",
+        &[
+            Slot::Role("role"),
+            Slot::Word("from"),
+            Slot::Account("account"),
+        ],
+    )
+    .notes(&[("Scope", Slot::Scope("checksumHash"))]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -833,13 +885,48 @@ const KNOWN_ROLES: &[&str] = &[
     "BURN_BLOCKED_ROLE",
 ];
 
-fn role_name(hash: &str) -> Option<&'static str> {
-    let hash = hash.to_lowercase();
+/// What a `bytes32` role says it is. TIP-20 hashes its role names, so a word is
+/// matched against the ones this explorer knows; a registry role *is* its name
+/// (`bytes32 constant ROLE_ADMIN = "admin"`), so the word carries it.
+fn role_name(word: &str) -> Option<String> {
+    let hashed = word.to_lowercase();
     KNOWN_ROLES
         .iter()
-        .find(|role| keccak_hex(role.as_bytes()) == hash)
-        .copied()
+        .find(|role| keccak_hex(role.as_bytes()) == hashed)
+        .map(|role| (*role).to_string())
+        .or_else(|| short_string(word))
 }
+
+/// A `bytes32` holding a right-padded ASCII literal, the way Solidity encodes a
+/// `bytes32` constant written as a string. The text has to be the whole non-zero
+/// prefix and printable throughout, or a hash whose tail happens to be zeroes
+/// would read as mojibake.
+fn short_string(word: &str) -> Option<String> {
+    let word = word.trim();
+    let raw = hex::decode(word.strip_prefix("0x").unwrap_or(word))
+        .ok()
+        .filter(|raw| raw.len() == 32)?;
+    let (text, padding) = raw.split_at(raw.iter().position(|b| *b == 0).unwrap_or(raw.len()));
+    (!text.is_empty()
+        && padding.iter().all(|b| *b == 0)
+        && text.iter().all(|b| b.is_ascii_graphic() || *b == b' '))
+    .then(|| String::from_utf8_lossy(text).into_owned())
+}
+
+/// A registry announces a registry-scoped role under `keccak256("")` — what an
+/// empty checksum hashes to — so the scope is readable without the contract.
+static REGISTRY_SCOPE: LazyLock<String> = LazyLock::new(|| keccak_hex(b""));
+
+/// The `RecordCategory` ordinals, which reach the log as a bare `uint8`. An
+/// unknown one means the contract gained a variant, and the number stands until
+/// this list catches up.
+const RECORD_CATEGORIES: &[&str] = &[
+    "Unspecified",
+    "Private markets diligence",
+    "Regulated bank underwriting",
+    "Multi-party clinical trials",
+    "Agentic AI",
+];
 
 // ---------------------------------------------------------------------------
 // Known events
@@ -922,10 +1009,25 @@ fn render_slot(slot: &Slot, event: &DecodedEvent, tokens: &Tokens) -> Option<Str
         Slot::Value(name) => value_of(params, name)?,
         Slot::Hex(name) => truncate(&value_of(params, name)?),
         Slot::Role(name) => {
-            let hash = value_of(params, name)?;
-            role_name(&hash)
-                .map(String::from)
-                .unwrap_or_else(|| truncate(&hash))
+            let word = value_of(params, name)?;
+            role_name(&word).unwrap_or_else(|| truncate(&word))
+        }
+        Slot::Scope(name) => {
+            let word = value_of(params, name)?;
+            if word.to_lowercase() == *REGISTRY_SCOPE {
+                "the whole registry".to_string()
+            } else {
+                format!("record {}", truncate(&word))
+            }
+        }
+        Slot::Category(name) => {
+            let ordinal = value_of(params, name)?;
+            ordinal
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| RECORD_CATEGORIES.get(i))
+                .map(|c| (*c).to_string())
+                .unwrap_or(ordinal)
         }
     })
 }
@@ -1336,6 +1438,7 @@ mod tests {
     use super::*;
     use crate::decoder::decode_event;
     use crate::decoder::{event_signature, REGISTRY};
+    use ethers_core::abi::Token as EthersToken;
     use serde_json::json;
 
     fn token_map() -> Tokens {
@@ -1371,6 +1474,111 @@ mod tests {
     fn say(log: &serde_json::Value, sender: Option<&str>) -> KnownEvent {
         let decoded = decode_event(log).expect("decoded");
         known_event(&decoded, 0, &token_map(), sender).expect("phrased")
+    }
+
+    /// A `bytes32` holding a Solidity string literal, right-padded as the
+    /// compiler lays one out.
+    fn word_of(text: &str) -> Vec<u8> {
+        let mut word = vec![0u8; 32];
+        word[..text.len()].copy_from_slice(text.as_bytes());
+        word
+    }
+
+    /// A registry's log, in the shape a receipt carries it: `signature` names
+    /// the event, `topics` are its indexed arguments, `data` the rest.
+    fn registry_log(signature: &str, topics: &[String], data: &[EthersToken]) -> serde_json::Value {
+        let mut all = vec![keccak_hex(signature.as_bytes())];
+        all.extend(topics.iter().cloned());
+        json!({
+            "address": "0x4444444444444444444444444444444444444444",
+            "topics": all,
+            "data": format!("0x{}", hex::encode(ethers_core::abi::encode(data))),
+            "logIndex": "0x0",
+        })
+    }
+
+    /// One `RoleGranted`/`RoleRevoked`, said in words.
+    fn role_event(signature: &str, scope: &str, role: &str) -> KnownEvent {
+        let account = "0x2222222222222222222222222222222222222222";
+        say(
+            &registry_log(
+                signature,
+                &[keccak_hex(scope.as_bytes()), topic(account)],
+                &[EthersToken::FixedBytes(word_of(role))],
+            ),
+            None,
+        )
+    }
+
+    /// A record version says which version of what, and the classification the
+    /// contract takes as an enum reaches the log as a bare ordinal.
+    #[test]
+    fn a_record_version_names_its_category_and_author() {
+        let checksum = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let author = "0x1111111111111111111111111111111111111111";
+        let event = say(
+            &registry_log(
+                "RecordAdded(bytes32,uint256,string,uint8,string,address)",
+                &[keccak_hex(checksum.as_bytes()), topic(author)],
+                &[
+                    EthersToken::Uint(2.into()),
+                    EthersToken::String(checksum.into()),
+                    EthersToken::Uint(1.into()),
+                    EthersToken::String("ipfs://bafy".into()),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(event.kind, "record added");
+        assert_eq!(event.headline, "Add Record version 2 of e3b0c4…b855");
+        assert_eq!(
+            event.details,
+            vec![
+                ("Category".into(), "Private markets diligence".into()),
+                ("Data pointer".into(), "ipfs://bafy".into()),
+                ("Author".into(), "0x1111…1111".into()),
+            ]
+        );
+    }
+
+    /// A registry role *is* its name, and `keccak256("")` is the scope meaning
+    /// the whole registry rather than one record.
+    #[test]
+    fn a_registry_role_reads_by_name_and_scope() {
+        let granted = role_event("RoleGranted(bytes32,address,bytes32)", "", "admin");
+        assert_eq!(granted.headline, "Grant Role admin to 0x2222…2222");
+        assert_eq!(
+            granted.details,
+            vec![("Scope".into(), "the whole registry".into())]
+        );
+
+        let revoked = role_event(
+            "RoleRevoked(bytes32,address,bytes32)",
+            "sha256:ab",
+            "editor",
+        );
+        assert_eq!(revoked.headline, "Revoke Role editor from 0x2222…2222");
+        let (label, scope) = &revoked.details[0];
+        assert_eq!(label, "Scope");
+        assert!(scope.starts_with("record 0x"), "{scope}");
+    }
+
+    /// Only a whole printable prefix followed by nothing but padding is a
+    /// literal — a hash that happens to end in a zero byte is not.
+    #[test]
+    fn only_a_padded_literal_reads_as_one() {
+        let hexed = |word: &[u8]| format!("0x{}", hex::encode(word));
+        assert_eq!(
+            short_string(&hexed(&word_of("admin"))).as_deref(),
+            Some("admin")
+        );
+        assert_eq!(short_string(&keccak_hex(b"")), None);
+        assert_eq!(short_string(&hexed(&[0u8; 32])), None);
+        // Printable, padded — but the padding is not at the end.
+        let mut word = [0x41u8; 32];
+        word[4] = 0;
+        assert_eq!(short_string(&hexed(&word)), None);
+        assert_eq!(short_string("0xdeadbeef"), None);
     }
 
     /// The headline sentence the whole feature exists for.
