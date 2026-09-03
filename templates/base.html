@@ -66,6 +66,15 @@
             transition: background 120ms ease;
         }
         .t-row:last-child { border-bottom: none; }
+        /* A live panel scrolls rather than growing the page under the reader. */
+        .feed { max-height: 32rem; overflow-y: auto; overscroll-behavior: contain; }
+        /* A step to the next block, or the end of the chain shown rather than hidden. */
+        .step {
+            padding: 3px 9px; border: 1px solid var(--border); border-radius: 6px;
+            color: var(--text-dim); text-decoration: none;
+        }
+        .step:hover { color: #93c5fd; border-color: #3b82f6; }
+        .step-off { opacity: .35; }
         .t-row:hover { background: rgba(255,255,255,0.025); }
         .badge {
             display: inline-flex;

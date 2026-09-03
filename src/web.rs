@@ -728,6 +728,8 @@ pub async fn home(
             "stats": stats,
             "recent_blocks": recent_blocks,
             "recent_txs": recent_txs,
+            "recent_block_count": state.cfg.recent_block_count,
+            "recent_tx_count": state.cfg.recent_tx_count,
             "latest_num": latest_num,
             "chain_head": chain_head,
             "indexed_display": comma_num(indexed_count),
@@ -915,6 +917,12 @@ pub async fn block_page(
         })
         .collect();
     let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
+    // Looked up rather than inferred from the tip: the index has gaps while it
+    // backfills, so a number below the tip is not necessarily there to link to.
+    let neighbour = |n: i64| db::get_block_by_number(&state.db, n).map(|b| b.number);
+    let previous = (block.number > 0)
+        .then(|| neighbour(block.number - 1))
+        .flatten();
     let ctx = page_ctx(
         &state,
         json!({
@@ -923,6 +931,8 @@ pub async fn block_page(
             "gas_pct": gas_pct,
             "base_fee_gwei": format_token_amount(&block.base_fee, 9),
             "burnt_fees": burnt,
+            "previous_block": previous,
+            "next_block": neighbour(block.number + 1),
         }),
     );
     html_or_json(&state, &headers, &query, "block.html", &ctx)

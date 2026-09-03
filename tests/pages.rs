@@ -252,6 +252,27 @@ async fn get_json(base: &str, path: &str) -> Value {
         .unwrap_or_else(|e| panic!("GET {path} json: {e}"))
 }
 
+/// A neighbour is offered only where one is indexed. The fixture holds 100 and
+/// 101 but not 99, which is what a backfilling index looks like, and a link to 99
+/// would 404.
+#[tokio::test]
+async fn a_block_links_only_to_neighbours_that_are_indexed() {
+    let (_dir, base) = serve().await;
+    let page = get_json(&base, "/block/100?").await;
+
+    assert_eq!(page["next_block"], json!(101));
+    assert_eq!(page["previous_block"], Value::Null, "99 is not indexed");
+
+    let html = reqwest::get(format!("{base}/block/100"))
+        .await
+        .expect("GET /block/100")
+        .text()
+        .await
+        .expect("block html");
+    assert!(html.contains("href=\"/block/101\""), "a link forward");
+    assert!(html.contains("step-off"), "and a dead end back");
+}
+
 #[tokio::test]
 async fn a_successful_transaction_says_what_it_did() {
     let (_dir, base) = serve().await;
