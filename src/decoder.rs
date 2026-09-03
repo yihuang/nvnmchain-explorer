@@ -73,6 +73,13 @@ const LOCAL: &[(&str, &[&str])] = &[
             "function recordKey(bytes32 checksumHash) external pure returns (bytes32)",
             "function statusKey(bytes32 checksumHash, uint256 index) external pure returns (bytes32)",
             "function recordRole(bytes32 checksumHash, bytes32 role) external pure returns (bytes32)",
+            // Leaves: records that hold no key each and prove against one root.
+            "event LeavesAppended(uint256 indexed firstLeaf, uint256 appended, bytes32 root)",
+            "function appendLeaf(bytes32 commitment, bytes32[] peaks, uint256 count, bytes metadata) external",
+            "function appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes32[] peaks, uint256 count, bytes metadata) external",
+            "function mmrRoot() external view returns (bytes32)",
+            "function KIND_MMR() external pure returns (bytes32)",
+            "function MMR_KEY() external pure returns (bytes32)",
             "function versionCount(bytes32 checksumHash) external view returns (uint256)",
             "function factory() external view returns (address)",
             "function owner() external view returns (address)",
@@ -84,6 +91,20 @@ const LOCAL: &[(&str, &[&str])] = &[
             "error MissingRole(address account, bytes32 role)",
             "error LastAdmin()",
             "error Unauthorized()",
+            // The last two come from the `MMR` library both contracts link in.
+            "error ChunksMismatch()",
+            "error PeaksDoNotMatch(bytes32 root)",
+            "error ChunkNotAligned(uint256 count, uint256 height)",
+        ],
+    ),
+    (
+        // One address for every registry: verifying is pure, and the root is the
+        // only input that differs.
+        "mmr_verifier",
+        &[
+            "function verify(bytes32 root, bytes32 commitment, uint256 index, bytes32[] siblings, bytes32[] peaks, uint256 count) external pure returns (bool)",
+            "error PeaksDoNotMatch(bytes32 root)",
+            "error ChunkNotAligned(uint256 count, uint256 height)",
         ],
     ),
 ];

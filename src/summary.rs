@@ -847,6 +847,18 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Value("status"), Slot::Word("on version"), Slot::Value("index")],
     )
     .notes(&[("Record", Slot::Hex("checksumHash"))]),
+    // A leaf holds no key, so this log is the only word that any arrived.
+    phrase(
+        "LeavesAppended(uint256,uint256,bytes32)",
+        "leaves appended",
+        "Append Leaves",
+        &[
+            Slot::Value("appended"),
+            Slot::Word("from index"),
+            Slot::Value("firstLeaf"),
+        ],
+    )
+    .notes(&[("MMR root", Slot::Hex("root"))]),
     phrase(
         "RoleGranted(bytes32,address,bytes32)",
         "role granted",
@@ -1533,6 +1545,30 @@ mod tests {
                 ("Data pointer".into(), "ipfs://bafy".into()),
                 ("Author".into(), "0x1111…1111".into()),
             ]
+        );
+    }
+
+    /// Where a batch of leaves starts is indexed and how many is not, so the
+    /// headline is read from both a topic and the data.
+    #[test]
+    fn a_batch_of_leaves_says_how_many_and_where_they_start() {
+        let root = "d81a2e1a3cbe000000000000000000000000000000000000000000000000beef";
+        let event = say(
+            &registry_log(
+                "LeavesAppended(uint256,uint256,bytes32)",
+                &[format!("0x{:064x}", 0)],
+                &[
+                    EthersToken::Uint(1013.into()),
+                    EthersToken::FixedBytes(hex::decode(root).expect("root")),
+                ],
+            ),
+            None,
+        );
+        assert_eq!(event.kind, "leaves appended");
+        assert_eq!(event.headline, "Append Leaves 1013 from index 0");
+        assert_eq!(
+            event.details,
+            vec![("MMR root".into(), "0xd81a…beef".into())]
         );
     }
 

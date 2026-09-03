@@ -773,6 +773,14 @@ async fn a_registry_address_shows_the_registry_interface() {
 
     let factory = json_at(format!("{base}/address/{FACTORY}?format=json")).await;
     assert_eq!(factory["interface"]["abis"], json!(["registry_factory"]));
+
+    // The leaf half of the same interface, which no record list will show.
+    assert!(
+        writes.iter().any(|f| f["name"] == "appendLeaves"),
+        "{writes:?}"
+    );
+    let reads = page["interface"]["reads"].as_array().expect("reads");
+    assert!(reads.iter().any(|f| f["name"] == "mmrRoot"), "{reads:?}");
 }
 
 /// The layout, rendered with whatever `page_ctx` would have put in it.
