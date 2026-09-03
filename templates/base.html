@@ -66,6 +66,8 @@
             transition: background 120ms ease;
         }
         .t-row:last-child { border-bottom: none; }
+        /* A live panel scrolls rather than growing the page under the reader. */
+        .feed { max-height: 32rem; overflow-y: auto; overscroll-behavior: contain; }
         .t-row:hover { background: rgba(255,255,255,0.025); }
         .badge {
             display: inline-flex;

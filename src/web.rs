@@ -728,6 +728,8 @@ pub async fn home(
             "stats": stats,
             "recent_blocks": recent_blocks,
             "recent_txs": recent_txs,
+            "recent_block_count": state.cfg.recent_block_count,
+            "recent_tx_count": state.cfg.recent_tx_count,
             "latest_num": latest_num,
             "chain_head": chain_head,
             "indexed_display": comma_num(indexed_count),
