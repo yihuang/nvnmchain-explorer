@@ -351,7 +351,8 @@ fn apply_receipt(
         // an impostor's payload is never worth decoding.
         let topic0 = log.pointer("/topics/0").and_then(Value::as_str);
         let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
-        if topic0 == Some(crate::decoder::ANCHORED_TOPIC.as_str())
+        if matches!(topic0, Some(t) if t == *crate::decoder::LEAF_APPENDED_TOPIC
+                                    || t == *crate::decoder::LEAVES_APPENDED_TOPIC)
             && !emitter.eq_ignore_ascii_case(ANCHORING_ADDRESS)
         {
             continue;
@@ -371,10 +372,12 @@ fn apply_receipt(
             }
             continue;
         }
-        if decoded.topic0 == *crate::decoder::ANCHORED_TOPIC {
+        if decoded.topic0 == *crate::decoder::LEAF_APPENDED_TOPIC
+            || decoded.topic0 == *crate::decoder::LEAVES_APPENDED_TOPIC
+        {
             match anchored_event(&decoded, tx, log_index) {
                 Some(event) => anchored.push(event),
-                None => warn!("undecodable Anchored log {log_index} in {}", tx.hash),
+                None => warn!("undecodable append log {log_index} in {}", tx.hash),
             }
             continue;
         }
@@ -444,25 +447,47 @@ fn param<'a>(decoded: &'a crate::decoder::DecodedEvent, name: &str) -> Option<&'
 /// One decoded `Anchored` log as a storable row, or `None` when the log does
 /// not carry a whole commitment — the precompile keeps only the head, so a row
 /// here is the only record that this revision ever existed.
+/// One decoded append as a storable row, or `None` when the log does not carry
+/// what the row is keyed on.
+///
+/// Both shapes land here. `LeafAppended` is one leaf at `index`, carrying what
+/// it committed to; `LeavesAppended` is a span from `firstLeaf` to `count`,
+/// whose leaves reach the chain as the roots of subtrees and so have no
+/// commitment of their own.
 pub fn anchored_event(
     decoded: &crate::decoder::DecodedEvent,
     tx: &Transaction,
     log_index: i64,
 ) -> Option<AnchoredEvent> {
     let arg = |name: &str| param(decoded, name);
-    let (key, commitment) = (arg("key")?, arg("commitment")?);
+    let word = |value: &str| (value.len() == 66).then(|| value.to_string());
     // `0x` + 64 hex digits. A truncated log decodes to a short or empty value,
-    // which would store a head the chain never wrote.
-    if key.len() != 66 || commitment.len() != 66 {
-        return None;
-    }
+    // which would store a root the chain never wrote.
+    let root = word(arg("root")?)?;
+    let batch = decoded.topic0 == *crate::decoder::LEAVES_APPENDED_TOPIC;
+    let (index, leaves, commitment) = if batch {
+        // `count` is the tree's size after the append, not the size of the
+        // batch, so what it added is the distance from where it started. A
+        // batch that added nothing, or went backwards, is not one this wrote.
+        let first: i64 = arg("firstLeaf")?.parse().ok()?;
+        let after: i64 = arg("count")?.parse().ok()?;
+        (
+            first,
+            after.checked_sub(first).filter(|n| *n > 0)?,
+            String::new(),
+        )
+    } else {
+        (arg("index")?.parse().ok()?, 1, word(arg("commitment")?)?)
+    };
     Some(AnchoredEvent {
         tx_hash: tx.hash.clone(),
         block_number: tx.block_number,
         log_index,
-        namespace: checksum_address(arg("caller")?),
-        key: key.to_string(),
-        commitment: commitment.to_string(),
+        namespace: checksum_address(arg("namespace")?),
+        index,
+        leaves,
+        commitment,
+        root,
         metadata: arg("metadata").unwrap_or("0x").to_string(),
         timestamp: tx.timestamp,
         created_at: db::now_ts(),
@@ -1050,18 +1075,22 @@ mod tests {
     use super::*;
     use crate::decoder::TRANSFER_TOPIC;
 
-    /// An `Anchored` log as a node reports it, from `emitter`.
+    /// A `LeafAppended` log as a node reports it, from `emitter`.
     fn anchored_log(emitter: &str, caller: &str) -> Value {
-        let commitment = "22".repeat(32);
+        let (commitment, root) = ("22".repeat(32), "33".repeat(32));
         json!({
             "address": emitter,
             "topics": [
-                crate::decoder::ANCHORED_TOPIC.as_str(),
+                crate::decoder::LEAF_APPENDED_TOPIC.as_str(),
                 format!("0x{}{}", "00".repeat(12), caller),
-                format!("0x{}", "11".repeat(32)),
+                format!("0x{:064x}", 0),
             ],
-            // abi.encode(bytes32 commitment, bytes metadata), metadata empty.
-            "data": format!("0x{commitment}{:064x}{:064x}", 0x40, 0),
+            // abi.encode(commitment, root, bytes32[] peaks, bytes metadata),
+            // both tails empty.
+            "data": format!(
+                "0x{commitment}{root}{:064x}{:064x}{:064x}{:064x}",
+                4 * 32, 5 * 32, 0, 0
+            ),
             "logIndex": "0x0",
         })
     }

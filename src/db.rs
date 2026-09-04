@@ -155,6 +155,21 @@ pub fn init_db(path: &str) -> Result<Connection> {
     if address_keyed_alone {
         conn.execute("DROP TABLE registries", [])?;
     }
+    // `anchored_events` was keyed by `(namespace, key)`; a row is an append at a
+    // leaf index now. Every row is re-derivable by indexing, so a database on
+    // the old shape starts over rather than being migrated.
+    let keyed_by_key = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('anchored_events') WHERE name = 'key'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        == 1;
+    if keyed_by_key {
+        conn.execute("DROP TABLE anchored_events", [])?;
+        conn.execute("DROP TABLE IF EXISTS anchored_namespaces", [])?;
+    }
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS blocks (
@@ -254,8 +269,13 @@ pub fn init_db(path: &str) -> Result<Connection> {
             block_number INTEGER NOT NULL,
             log_index INTEGER NOT NULL DEFAULT 0,
             namespace BLOB NOT NULL,
-            key BLOB NOT NULL,
-            commitment BLOB NOT NULL,
+            -- The leaf index this append began at, and how many it added.
+            leaf_index INTEGER NOT NULL DEFAULT 0,
+            leaves INTEGER NOT NULL DEFAULT 1,
+            -- A single leaf's commitment; empty for a batch, whose leaves never
+            -- reach the chain one at a time.
+            commitment BLOB NOT NULL DEFAULT X'',
+            root BLOB NOT NULL DEFAULT X'',
             metadata BLOB NOT NULL DEFAULT X'',
             timestamp INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT 0,
@@ -263,17 +283,18 @@ pub fn init_db(path: &str) -> Result<Connection> {
             UNIQUE (block_number, log_index)
         );
         CREATE INDEX IF NOT EXISTS idx_anchored_tx_hash ON anchored_events(tx_hash);
-        -- The head lookup and the per-key history both walk this.
-        CREATE INDEX IF NOT EXISTS idx_anchored_ns_key
-            ON anchored_events(namespace, key, block_number, log_index);
+        -- A namespace's appends in log order, and the lookup of the one that
+        -- covers a leaf index, both walk this.
+        CREATE INDEX IF NOT EXISTS idx_anchored_ns_leaf
+            ON anchored_events(namespace, leaf_index, block_number, log_index);
 
         -- Per-namespace stats for /anchoring, like token_metadata.holder_count:
-        -- maintained with each inserted anchor and recomputed at startup, so no
-        -- page view aggregates over every anchor ever written.
+        -- maintained with each inserted append and recomputed at startup, so no
+        -- page view aggregates over every append ever written.
         CREATE TABLE IF NOT EXISTS anchored_namespaces (
             namespace BLOB PRIMARY KEY,
             anchor_count INTEGER NOT NULL DEFAULT 0,
-            key_count INTEGER NOT NULL DEFAULT 0,
+            leaf_count INTEGER NOT NULL DEFAULT 0,
             last_block INTEGER NOT NULL DEFAULT 0,
             last_timestamp INTEGER NOT NULL DEFAULT 0
         );
@@ -1194,28 +1215,31 @@ pub fn get_token_holders(
 }
 
 // ---------------------------------------------------------------------------
-// Anchored events
+// Appends
 // ---------------------------------------------------------------------------
 
-const ANCHORED_COLS: &str = "tx_hash, block_number, log_index, namespace, key, commitment, \
-                             metadata, timestamp, created_at";
+const ANCHORED_COLS: &str = "tx_hash, block_number, log_index, namespace, leaf_index, leaves, \
+                             commitment, root, metadata, timestamp, created_at";
 
-/// Insert one `Anchored` log. Returns `true` when the row was newly inserted
-/// and `false` when it duplicated an existing (block_number, log_index) — a
+/// Insert one append. Returns `true` when the row was newly inserted and
+/// `false` when it duplicated an existing (block_number, log_index) — a
 /// re-indexed block, whose events must not move the namespace stats again.
 fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<bool> {
     let inserted = exec_cached(
         conn,
-        "INSERT OR IGNORE INTO anchored_events (tx_hash, block_number, log_index, namespace, key,
-                                                commitment, metadata, timestamp, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR IGNORE INTO anchored_events (tx_hash, block_number, log_index, namespace,
+                                                leaf_index, leaves, commitment, root, metadata,
+                                                timestamp, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             hex_blob(&event.tx_hash),
             event.block_number,
             event.log_index,
             hex_blob(&event.namespace),
-            hex_blob(&event.key),
+            event.index,
+            event.leaves,
             hex_blob(&event.commitment),
+            hex_blob(&event.root),
             hex_blob(&event.metadata),
             event.timestamp,
             event.created_at,
@@ -1224,32 +1248,21 @@ fn insert_anchored(conn: &Connection, event: &AnchoredEvent) -> Result<bool> {
     Ok(inserted != 0)
 }
 
-/// Fold one freshly-inserted anchor into its namespace's summary row. Runs in
+/// Fold one freshly-inserted append into its namespace's summary row. Runs in
 /// the same transaction as the insert, so the stats never drift from the log.
 fn refresh_anchored_namespace(conn: &Connection, event: &AnchoredEvent) -> Result<()> {
-    // The event's own row is already in, so a second row under the pair means
-    // the key existed before this anchor.
-    let key_existed =
-        conn.prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM anchored_events
-                           WHERE namespace=?1 AND key=?2 LIMIT 1 OFFSET 1)",
-        )?
-        .query_row(
-            params![hex_blob(&event.namespace), hex_blob(&event.key)],
-            |r| r.get::<_, i64>(0),
-        )? != 0;
     exec_cached(
         conn,
-        "INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
+        "INSERT INTO anchored_namespaces (namespace, anchor_count, leaf_count, last_block, last_timestamp)
          VALUES (?1, 1, ?2, ?3, ?4)
          ON CONFLICT(namespace) DO UPDATE SET
              anchor_count = anchor_count + 1,
-             key_count = key_count + excluded.key_count,
+             leaf_count = MAX(leaf_count, excluded.leaf_count),
              last_block = MAX(last_block, excluded.last_block),
              last_timestamp = MAX(last_timestamp, excluded.last_timestamp)",
         params![
             hex_blob(&event.namespace),
-            i64::from(!key_existed),
+            event.index + event.leaves,
             event.block_number,
             event.timestamp,
         ],
@@ -1265,8 +1278,8 @@ pub fn sync_anchored_namespaces(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "BEGIN IMMEDIATE;
          DELETE FROM anchored_namespaces;
-         INSERT INTO anchored_namespaces (namespace, anchor_count, key_count, last_block, last_timestamp)
-         SELECT namespace, COUNT(*), COUNT(DISTINCT key), MAX(block_number), MAX(timestamp)
+         INSERT INTO anchored_namespaces (namespace, anchor_count, leaf_count, last_block, last_timestamp)
+         SELECT namespace, COUNT(*), MAX(leaf_index + leaves), MAX(block_number), MAX(timestamp)
          FROM anchored_events GROUP BY namespace;
          COMMIT;",
     )?;
@@ -1292,11 +1305,13 @@ fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
         block_number: row.get(1)?,
         log_index: row.get(2)?,
         namespace: blob_addr(&row.get::<_, Vec<u8>>(3)?),
-        key: blob_hex(&row.get::<_, Vec<u8>>(4)?),
-        commitment: blob_hex(&row.get::<_, Vec<u8>>(5)?),
-        metadata: blob_hex(&row.get::<_, Vec<u8>>(6)?),
-        timestamp: row.get(7)?,
-        created_at: row.get(8)?,
+        index: row.get(4)?,
+        leaves: row.get(5)?,
+        commitment: blob_hex(&row.get::<_, Vec<u8>>(6)?),
+        root: blob_hex(&row.get::<_, Vec<u8>>(7)?),
+        metadata: blob_hex(&row.get::<_, Vec<u8>>(8)?),
+        timestamp: row.get(9)?,
+        created_at: row.get(10)?,
     })
 }
 
@@ -1330,7 +1345,7 @@ pub fn get_anchored_namespaces(
     query_rows(
         &lock(db),
         "get_anchored_namespaces",
-        "SELECT n.namespace, n.anchor_count, n.key_count, n.last_block, n.last_timestamp,
+        "SELECT n.namespace, n.anchor_count, n.leaf_count, n.last_block, n.last_timestamp,
                 r.name
          FROM anchored_namespaces n
          LEFT JOIN registries r ON r.address = n.namespace AND r.factory = ?3
@@ -1347,7 +1362,7 @@ pub fn get_anchored_namespaces(
             Ok(json!({
                 "namespace": blob_addr(&r.get::<_, Vec<u8>>(0)?),
                 "anchor_count": r.get::<_, i64>(1)?,
-                "key_count": r.get::<_, i64>(2)?,
+                "leaf_count": r.get::<_, i64>(2)?,
                 "last_block": r.get::<_, i64>(3)?,
                 "name": r.get::<_, Option<String>>(5)?,
                 "last_timestamp": r.get::<_, i64>(4)?,
@@ -1370,96 +1385,42 @@ pub fn count_anchored_summary(db: &Db) -> (i64, i64) {
     .unwrap_or((0, 0))
 }
 
-/// Keys one namespace has anchored, for paging its listing — the summary row
-/// the insert path maintains, not a count over its anchors.
-pub fn count_namespace_keys(db: &Db, namespace: &str) -> i64 {
-    query_count(
-        &lock(db),
-        "count_namespace_keys",
-        // Wrapped in a subquery so a namespace with nothing anchored answers
-        // zero rather than no row at all.
-        "SELECT COALESCE((SELECT key_count FROM anchored_namespaces WHERE namespace=?1), 0)",
-        params![hex_blob(namespace)],
-    )
-}
-
-/// Keys a namespace has anchored, each at its head row — what `latest` returns.
+/// What a namespace's tree holds: its leaf count, and the root over them.
 ///
-/// Two steps rather than one window function over the namespace: the group-by
-/// is answered from `idx_anchored_ns_key` alone, then only the page's heads are
-/// read as rows, so no page view drags every revision's metadata through a sort.
-pub fn get_namespace_keys(db: &Db, namespace: &str, page: u32, per_page: u32) -> Vec<Value> {
-    query_rows(
-        &lock(db),
-        "get_namespace_keys",
-        // The inner query walks `idx_anchored_ns_key` and never leaves it: the
-        // page's keys and their revision counts come out of the index alone.
-        // Only those rows are then joined to their head, so the payloads of
-        // superseded revisions are never read.
-        "SELECT k.key, k.revisions, h.commitment, h.metadata, h.block_number, h.timestamp, h.tx_hash
-         FROM (SELECT key, COUNT(*) AS revisions, MAX(block_number) AS last_block
-               FROM anchored_events WHERE namespace=?1
-               GROUP BY key
-               ORDER BY last_block DESC, key
-               LIMIT ?2 OFFSET ?3) k
-         JOIN anchored_events h ON h.id = (SELECT id FROM anchored_events
-                                           WHERE namespace=?1 AND key=k.key
-                                           ORDER BY block_number DESC, log_index DESC
-                                           LIMIT 1)
-         ORDER BY k.last_block DESC, k.key",
-        params![
-            hex_blob(namespace),
-            i64::from(per_page),
-            page_offset(page, per_page)
-        ],
-        |r| {
-            Ok(json!({
-                "key": blob_hex(&r.get::<_, Vec<u8>>(0)?),
-                "revisions": r.get::<_, i64>(1)?,
-                "commitment": blob_hex(&r.get::<_, Vec<u8>>(2)?),
-                "metadata": blob_hex(&r.get::<_, Vec<u8>>(3)?),
-                "block_number": r.get::<_, i64>(4)?,
-                "timestamp": r.get::<_, i64>(5)?,
-                "tx_hash": blob_hex(&r.get::<_, Vec<u8>>(6)?),
-            }))
-        },
-    )
-}
-
-/// The head revision of one `(namespace, key)` — what `latest` returns.
-pub fn get_key_head(db: &Db, namespace: &str, key: &str) -> Option<AnchoredEvent> {
+/// Both come from its newest append, which is the one at the highest leaf
+/// index — an index only ever grows, so that holds however out of order a
+/// re-index arrives. One seek down `idx_anchored_ns_leaf`, not a walk.
+pub fn get_namespace_mmr(db: &Db, namespace: &str) -> (i64, String) {
     query_opt(
         &lock(db),
-        "get_key_head",
-        &format!(
-            "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1 AND key=?2
-             ORDER BY block_number DESC, log_index DESC LIMIT 1"
-        ),
-        params![hex_blob(namespace), hex_blob(key)],
-        row_to_anchored,
+        "get_namespace_mmr",
+        "SELECT leaf_index + leaves, root FROM anchored_events
+         WHERE namespace=?1 ORDER BY leaf_index DESC LIMIT 1",
+        params![hex_blob(namespace)],
+        |r| Ok((r.get::<_, i64>(0)?, blob_hex(&r.get::<_, Vec<u8>>(1)?))),
     )
+    .unwrap_or((0, String::new()))
 }
 
-/// One page of a key's revisions, newest first. Paged like every other listing:
-/// nothing bounds how often a key is re-anchored, and each row carries its
-/// whole metadata payload.
-pub fn get_key_history(
+/// One page of a namespace's appends, newest first.
+///
+/// Paged like every other listing: nothing bounds how often a namespace
+/// appends, and every row carries its whole metadata payload.
+pub fn get_namespace_appends(
     db: &Db,
     namespace: &str,
-    key: &str,
     page: u32,
     per_page: u32,
 ) -> Vec<AnchoredEvent> {
     query_rows(
         &lock(db),
-        "get_key_history",
+        "get_namespace_appends",
         &format!(
-            "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1 AND key=?2
-             ORDER BY block_number DESC, log_index DESC LIMIT ?3 OFFSET ?4"
+            "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1
+             ORDER BY block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3"
         ),
         params![
             hex_blob(namespace),
-            hex_blob(key),
             i64::from(per_page),
             page_offset(page, per_page)
         ],
@@ -1467,13 +1428,32 @@ pub fn get_key_history(
     )
 }
 
-/// Revisions on record for one key, for paging the history above.
-pub fn count_key_revisions(db: &Db, namespace: &str, key: &str) -> i64 {
+/// Appends on record for one namespace, for paging the listing above.
+pub fn count_namespace_appends(db: &Db, namespace: &str) -> i64 {
     query_count(
         &lock(db),
-        "count_key_revisions",
-        "SELECT COUNT(*) FROM anchored_events WHERE namespace=?1 AND key=?2",
-        params![hex_blob(namespace), hex_blob(key)],
+        "count_namespace_appends",
+        "SELECT COUNT(*) FROM anchored_events WHERE namespace=?1",
+        params![hex_blob(namespace)],
+    )
+}
+
+/// The append that put leaf `index` into `namespace`'s tree.
+///
+/// A batch covers a span, so this seeks down `idx_anchored_ns_leaf` to the last
+/// append starting at or below the index, and keeps it only if its span reaches
+/// that far. Spans are contiguous, so the first row it meets settles it.
+pub fn get_leaf(db: &Db, namespace: &str, index: i64) -> Option<AnchoredEvent> {
+    query_opt(
+        &lock(db),
+        "get_leaf",
+        &format!(
+            "SELECT {ANCHORED_COLS} FROM anchored_events
+             WHERE namespace=?1 AND leaf_index <= ?2 AND leaf_index + leaves > ?2
+             ORDER BY leaf_index DESC LIMIT 1"
+        ),
+        params![hex_blob(namespace), index],
+        row_to_anchored,
     )
 }
 

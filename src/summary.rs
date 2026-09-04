@@ -806,12 +806,27 @@ static PHRASES: &[Phrase] = &[
     .notes(&[("Owner", Slot::Account("owner"))]),
     // ---- Chain-local ------------------------------------------------------
     phrase(
-        "Anchored(address,bytes32,bytes32,bytes)",
-        "anchored",
-        "Anchor Commitment",
-        &[Slot::Hex("commitment"), Slot::Word("at"), Slot::Hex("key")],
+        "LeafAppended(address,uint256,bytes32,bytes32,bytes32[],bytes)",
+        "leaf appended",
+        "Append Leaf",
+        &[Slot::Hex("commitment"), Slot::Word("as leaf"), Slot::Value("index")],
     )
-    .notes(&[("Namespace", Slot::Account("caller"))]),
+    .notes(&[
+        ("Namespace", Slot::Account("namespace")),
+        ("MMR root", Slot::Hex("root")),
+    ]),
+    // A batch's rows never reach the chain one at a time, so where the leaf
+    // above names what it committed to, this can only say how many arrived.
+    phrase(
+        "LeavesAppended(address,uint256,uint256,bytes32[],uint8[],bytes32,bytes32[],bytes)",
+        "leaves appended",
+        "Append Leaves",
+        &[Slot::Word("to"), Slot::Value("count"), Slot::Word("leaves from"), Slot::Value("firstLeaf")],
+    )
+    .notes(&[
+        ("Namespace", Slot::Account("namespace")),
+        ("MMR root", Slot::Hex("root")),
+    ]),
     phrase(
         "RegistryDeployed(address,address,string,string,string)",
         "registry deployed",
@@ -822,8 +837,8 @@ static PHRASES: &[Phrase] = &[
             ("Registry", Slot::Account("registry")),
             ("Creator", Slot::Account("creator")),
         ]),
-    // A registry's own log. Records read as `Anchored` above too, in the
-    // precompile's terms; roles read nowhere else, since they are not anchored.
+    // A registry's own log. Records read as `LeafAppended` above too, in the
+    // precompile's terms; roles read nowhere else, since they are not leaves.
     phrase(
         "RecordAdded(bytes32,uint256,string,uint8,string,address)",
         "record added",
@@ -847,18 +862,6 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Value("status"), Slot::Word("on version"), Slot::Value("index")],
     )
     .notes(&[("Record", Slot::Hex("checksumHash"))]),
-    // A leaf holds no key, so this log is the only word that any arrived.
-    phrase(
-        "LeavesAppended(uint256,uint256,bytes32)",
-        "leaves appended",
-        "Append Leaves",
-        &[
-            Slot::Value("appended"),
-            Slot::Word("from index"),
-            Slot::Value("firstLeaf"),
-        ],
-    )
-    .notes(&[("MMR root", Slot::Hex("root"))]),
     phrase(
         "RoleGranted(bytes32,address,bytes32)",
         "role granted",
@@ -1504,6 +1507,17 @@ mod tests {
         })
     }
 
+    /// The same, emitted by the anchoring precompile rather than a registry.
+    fn precompile_log(
+        signature: &str,
+        topics: &[String],
+        data: &[EthersToken],
+    ) -> serde_json::Value {
+        let mut log = registry_log(signature, topics, data);
+        log["address"] = json!(crate::anchoring::ANCHORING_ADDRESS);
+        log
+    }
+
     /// One `RoleGranted`/`RoleRevoked`, said in words.
     fn role_event(signature: &str, scope: &str, role: &str) -> KnownEvent {
         let account = "0x2222222222222222222222222222222222222222";
@@ -1552,23 +1566,40 @@ mod tests {
     /// headline is read from both a topic and the data.
     #[test]
     fn a_batch_of_leaves_says_how_many_and_where_they_start() {
+        // The precompile's, not a registry's: a batch's rows never reach the
+        // chain one at a time, so the count and the span are all it can say.
+        let namespace = format!("0x{}", "a1".repeat(20));
         let root = "d81a2e1a3cbe000000000000000000000000000000000000000000000000beef";
         let event = say(
-            &registry_log(
-                "LeavesAppended(uint256,uint256,bytes32)",
-                &[format!("0x{:064x}", 0)],
+            &precompile_log(
+                "LeavesAppended(address,uint256,uint256,bytes32[],uint8[],bytes32,bytes32[],bytes)",
+                &[
+                    format!(
+                        "0x{}{}",
+                        "00".repeat(12),
+                        namespace.trim_start_matches("0x")
+                    ),
+                    format!("0x{:064x}", 0),
+                ],
                 &[
                     EthersToken::Uint(1013.into()),
+                    EthersToken::Array(vec![]),
+                    EthersToken::Array(vec![]),
                     EthersToken::FixedBytes(hex::decode(root).expect("root")),
+                    EthersToken::Array(vec![]),
+                    EthersToken::Bytes(vec![]),
                 ],
             ),
             None,
         );
         assert_eq!(event.kind, "leaves appended");
-        assert_eq!(event.headline, "Append Leaves 1013 from index 0");
+        assert_eq!(event.headline, "Append Leaves to 1013 leaves from 0");
         assert_eq!(
             event.details,
-            vec![("MMR root".into(), "0xd81a…beef".into())]
+            vec![
+                ("Namespace".into(), "0xA1A1…a1a1".into()),
+                ("MMR root".into(), "0xd81a…beef".into()),
+            ]
         );
     }
 

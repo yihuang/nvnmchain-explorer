@@ -5,14 +5,14 @@
 
 <div class="mb-6">
     <h1 class="text-2xl font-extrabold tracking-tight">Anchoring</h1>
-    <p class="text-xs text-dim mt-1">{{ total }} commitments · the caller is the namespace, so writes never collide</p>
+    <p class="text-xs text-dim mt-1">{{ total }} appends · the caller is the namespace, so no two trees collide</p>
 </div>
 
 <div class="card overflow-x-auto mb-6">
     <div class="min-w-[560px]">
         <div class="flex table-header">
             <div class="flex-1 px-3">Namespace</div>
-            <div class="w-24 px-3 text-right">Keys</div>
+            <div class="w-24 px-3 text-right">Leaves</div>
             <div class="w-28 px-3 text-right">Commitments</div>
             <div class="w-28 px-3 text-right">Last block</div>
         </div>
@@ -22,7 +22,7 @@
             <div class="flex-1 px-3 py-3 mono truncate">
                 <a href="/anchoring/{{ ns.namespace }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=ns.namespace, prefix=10, suffix=6) }}</a>{% if ns.name %} <span class="text-xs text-dim" title="deployed by the configured RegistryFactory">{{ ns.name }}</span>{% endif %}
             </div>
-            <div class="w-24 px-3 py-3 text-right text-dim">{{ ns.key_count }}</div>
+            <div class="w-24 px-3 py-3 text-right text-dim">{{ ns.leaf_count }}</div>
             <div class="w-28 px-3 py-3 text-right text-dim">{{ ns.anchor_count }}</div>
             <div class="w-28 px-3 py-3 text-right">
                 <a href="/block/{{ ns.last_block }}" class="text-blue-400 hover:text-blue-300">{{ ns.last_block }}</a>
@@ -36,12 +36,12 @@
 </div>
 
 {% if recent %}
-<h2 class="section-title mb-2">Latest commitments</h2>
+<h2 class="section-title mb-2">Latest appends</h2>
 <div class="card overflow-x-auto">
     <div class="min-w-[720px]">
         <div class="flex table-header">
             <div class="w-44 px-3">Namespace</div>
-            <div class="w-44 px-3">Key</div>
+            <div class="w-36 px-3">Leaves</div>
             <div class="flex-1 px-3">Commitment</div>
             <div class="w-24 px-3 text-right">Block</div>
             <div class="w-24 px-3 text-right">Age</div>
@@ -51,10 +51,12 @@
             <div class="w-44 px-3 py-3 mono truncate">
                 <a href="/anchoring/{{ row.namespace }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=row.namespace) }}</a>
             </div>
-            <div class="w-44 px-3 py-3 mono truncate">
-                <a href="/anchoring/{{ row.namespace }}/{{ row.key }}" class="text-blue-400 hover:text-blue-300">{{ truncate_hash(h=row.key) }}</a>
+            <div class="w-36 px-3 py-3 mono truncate">
+                <a href="/anchoring/{{ row.namespace }}/{{ row.index }}" class="text-blue-400 hover:text-blue-300">{% if row.leaves == 1 %}#{{ row.index }}{% else %}#{{ row.index }}–{{ row.index + row.leaves - 1 }}{% endif %}</a>
             </div>
-            <div class="flex-1 px-3 py-3 truncate text-dim">{{ truncate_hash(h=row.commitment, prefix=10, suffix=6) }}</div>
+            {# A batch has no commitment of its own: its leaves reached the chain
+               as the roots of subtrees. #}
+            <div class="flex-1 px-3 py-3 truncate text-dim">{% if row.commitment %}{{ truncate_hash(h=row.commitment, prefix=10, suffix=6) }}{% else %}{{ row.leaves }} in one batch{% endif %}</div>
             <div class="w-24 px-3 py-3 text-right">
                 <a href="/block/{{ row.block_number }}" class="text-blue-400 hover:text-blue-300">{{ row.block_number }}</a>
             </div>

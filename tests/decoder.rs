@@ -820,10 +820,8 @@ fn huge_page_numbers_do_not_panic() {
     assert!(db::get_all_tokens(&db, u32::MAX, 25).is_empty());
     let ns = format!("0x{}", "cc".repeat(20));
     assert!(db::get_anchored_namespaces(&db, None, u32::MAX, 25).is_empty());
-    assert!(db::get_namespace_keys(&db, &ns, u32::MAX, 25).is_empty());
-    assert!(
-        db::get_key_history(&db, &ns, &format!("0x{}", "dd".repeat(32)), u32::MAX, 25).is_empty()
-    );
+    assert!(db::get_namespace_appends(&db, &ns, u32::MAX, 25).is_empty());
+    assert!(db::get_leaf(&db, &ns, i64::MAX).is_none());
 }
 
 /// `authorizeKey(keyId, WebAuthn, KeyRestrictions{expiry, enforceLimits, one

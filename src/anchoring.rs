@@ -1,6 +1,6 @@
-//! The anchoring precompile: a caller-partitioned commitment log enshrined at
-//! T10, keeping only the head per `(namespace, key)` — so the `Anchored` log is
-//! the only record of history.
+//! The anchoring precompile: one Merkle Mountain Range per caller, enshrined at
+//! T10. It keeps the leaf count and the peaks, so its two append events are the
+//! only record of which leaves arrived and what they carried.
 //!
 //! What a payload *means* is deliberately not here: those shapes track a
 //! contract in another repo, so reading them belongs to the decoder that
@@ -18,8 +18,12 @@ use crate::decoder::{keccak_hex, normalize_hex};
 /// Fixed at genesis (`IAnchoring.sol`).
 pub const ANCHORING_ADDRESS: &str = "0x0000000000000000000000000000000000000A00";
 
-/// Whether the commitment is `keccak256(metadata)`, as `anchorAndHash` writes
-/// it. The precompile's own guarantee, so it holds whatever the payload means.
+/// Whether the commitment is `keccak256(metadata)`, as a registry's record
+/// leaves are: the envelope rides along as the leaf's payload, so the log
+/// carries the preimage of what the leaf committed to.
+///
+/// Only a single leaf can be checked this way. A batch reaches the chain as the
+/// roots of subtrees, and no row of it is logged on its own.
 pub fn is_self_verifying(commitment: &str, metadata: &str) -> bool {
     let Ok(raw) = hex::decode(metadata.strip_prefix("0x").unwrap_or(metadata)) else {
         return false;

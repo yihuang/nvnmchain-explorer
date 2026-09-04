@@ -1663,7 +1663,7 @@ pub async fn anchoring_page(
     html_or_json(&state, &headers, &query, "anchoring.html", &ctx)
 }
 
-/// One namespace's keys, each showing the commitment `latest` would return.
+/// One namespace's appends, newest first, over the tree they built.
 pub async fn anchoring_namespace_page(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
@@ -1676,27 +1676,32 @@ pub async fn anchoring_namespace_page(
     }
     let namespace = checksummed;
     let page = page_param(&query);
-    let keys = db::get_namespace_keys(&state.db, &namespace, page, PER_PAGE);
+    let appends = db::get_namespace_appends(&state.db, &namespace, page, PER_PAGE);
     // Labelled when the configured factory deployed this namespace.
     let registry = registry_of(&state, &namespace);
+    let (leaves, root) = db::get_namespace_mmr(&state.db, &namespace);
     let ctx = page_ctx(
         &state,
         json!({
             "namespace": namespace,
             "registry": registry,
-            "keys": keys,
+            "appends": appends,
+            "leaves": leaves,
+            "root": root,
             "page": page,
-            "total_pages": total_pages(db::count_namespace_keys(&state.db, &namespace), PER_PAGE),
+            "total_pages": total_pages(db::count_namespace_appends(&state.db, &namespace), PER_PAGE),
         }),
     );
     html_or_json(&state, &headers, &query, "anchoring_namespace.html", &ctx)
 }
 
-/// Every revision of one key, newest first — the precompile itself keeps only
-/// the first row.
-pub async fn anchoring_key_page(
+/// One leaf: the append that put it there, and what it committed to.
+///
+/// A leaf never changes, so there is no history to page — one append and one
+/// payload, for good.
+pub async fn anchoring_leaf_page(
     State(state): State<AppState>,
-    Path((namespace, key)): Path<(String, String)>,
+    Path((namespace, index)): Path<(String, String)>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
@@ -1705,38 +1710,30 @@ pub async fn anchoring_key_page(
         return invalid_address(&state, &headers, &query, "Namespace", &namespace);
     }
     let namespace = checksummed;
-    let page = page_param(&query);
-    let revisions = db::count_key_revisions(&state.db, &namespace, &key);
-    let history = db::get_key_history(&state.db, &namespace, &key, page, PER_PAGE);
-    // The head belongs on every page of a history nothing bounds the length of,
-    // but page one already opens on it.
-    let head = if page == 1 {
-        history.first().cloned()
-    } else {
-        db::get_key_head(&state.db, &namespace, &key)
+    let Ok(index) = index.parse::<i64>() else {
+        return not_found(&state, &headers, &query, "Leaf", &index);
     };
-    let Some(head) = head else {
-        return not_found(&state, &headers, &query, "Anchored key", &key);
+    let Some(append) = db::get_leaf(&state.db, &namespace, index) else {
+        return not_found(&state, &headers, &query, "Leaf", &index.to_string());
     };
-    // Anyone may anchor under any key, and the decoder answers per registry —
-    // 404 for an address the factory never announced — so an unlabelled
-    // namespace gets no link rather than one that leads nowhere.
+    // Anyone may append under their own address, and the decoder answers per
+    // registry — 404 for an address the factory never announced — so an
+    // unlabelled namespace gets no link rather than one that leads nowhere.
     let registry = registry_of(&state, &namespace);
+    // A batch's rows never reached the chain one at a time, so it carries no
+    // commitment, and nothing hashes to an empty one.
+    let self_verifying = is_self_verifying(&append.commitment, &append.metadata);
     let ctx = page_ctx(
         &state,
         json!({
             "namespace": namespace,
             "registry": registry,
-            "key": head.key,
-            "self_verifying": is_self_verifying(&head.commitment, &head.metadata),
-            "head": head,
-            "history": history,
-            "revisions": revisions,
-            "page": page,
-            "total_pages": total_pages(revisions, PER_PAGE),
+            "index": index,
+            "self_verifying": self_verifying,
+            "append": append,
         }),
     );
-    html_or_json(&state, &headers, &query, "anchoring_key.html", &ctx)
+    html_or_json(&state, &headers, &query, "anchoring_leaf.html", &ctx)
 }
 
 pub async fn search_page(
@@ -2219,7 +2216,7 @@ pub fn app(state: AppState) -> Router {
         .route("/tokens", get(tokens_page))
         .route("/anchoring", get(anchoring_page))
         .route("/anchoring/{namespace}", get(anchoring_namespace_page))
-        .route("/anchoring/{namespace}/{key}", get(anchoring_key_page))
+        .route("/anchoring/{namespace}/{index}", get(anchoring_leaf_page))
         .route("/search", get(search_page))
         .route("/api/search", get(search_suggest))
         // Public explorer: allow cross-origin reads from any site (the wallet

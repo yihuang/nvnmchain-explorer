@@ -394,8 +394,8 @@ mod tests {
         let contract = crate::decoder::REGISTRY
             .contract("anchoring")
             .expect("anchoring registered");
-        assert!(contract.functions().any(|f| f.name == "anchor"));
-        assert!(contract.events().any(|e| e.name == "Anchored"));
+        assert!(contract.functions().any(|f| f.name == "appendLeaf"));
+        assert!(contract.events().any(|e| e.name == "LeafAppended"));
     }
 
     /// A TIP-20 is recognised by its prefix, not by an entry per token.

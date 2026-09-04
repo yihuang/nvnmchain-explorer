@@ -69,17 +69,14 @@ const LOCAL: &[(&str, &[&str])] = &[
             "function grantRole(string checksum, address account, bytes32 role) external",
             "function revokeRole(string checksum, address account, bytes32 role) external",
             "function hasRole(string checksum, address account, bytes32 role) external view returns (bool)",
-            "function latestRecordDigest(bytes32 checksumHash) external view returns (bytes32)",
-            "function recordKey(bytes32 checksumHash) external pure returns (bytes32)",
-            "function statusKey(bytes32 checksumHash, uint256 index) external pure returns (bytes32)",
             "function recordRole(bytes32 checksumHash, bytes32 role) external pure returns (bytes32)",
-            // Leaves: records that hold no key each and prove against one root.
-            "event LeavesAppended(uint256 indexed firstLeaf, uint256 appended, bytes32 root)",
-            "function appendLeaf(bytes32 commitment, bytes32[] peaks, uint256 count, bytes metadata) external",
-            "function appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes32[] peaks, uint256 count, bytes metadata) external",
+            // Leaves. Both take the precompile's own signatures, because the
+            // registry forwards the call as it came once it has checked the
+            // caller's role -- so what is logged is the precompile's event, not
+            // one of these, and it is declared with the precompile's ABI.
+            "function appendLeaf(bytes32 commitment, bytes metadata) external returns (bytes32 root)",
+            "function appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes metadata) external returns (bytes32 root)",
             "function mmrRoot() external view returns (bytes32)",
-            "function KIND_MMR() external pure returns (bytes32)",
-            "function MMR_KEY() external pure returns (bytes32)",
             "function versionCount(bytes32 checksumHash) external view returns (uint256)",
             "function factory() external view returns (address)",
             "function owner() external view returns (address)",
@@ -91,10 +88,6 @@ const LOCAL: &[(&str, &[&str])] = &[
             "error MissingRole(address account, bytes32 role)",
             "error LastAdmin()",
             "error Unauthorized()",
-            // The last two come from the `MMR` library both contracts link in.
-            "error ChunksMismatch()",
-            "error PeaksDoNotMatch(bytes32 root)",
-            "error ChunkNotAligned(uint256 count, uint256 height)",
         ],
     ),
     (
@@ -740,7 +733,10 @@ pub fn revert_data_in(message: &str) -> Option<String> {
 pub const TRANSFER_SIGNATURE: &str = "Transfer(address,address,uint256)";
 pub const TRANSFER_WITH_MEMO_SIGNATURE: &str = "TransferWithMemo(address,address,uint256,bytes32)";
 pub const APPROVAL_SIGNATURE: &str = "Approval(address,address,uint256)";
-pub const ANCHORED_SIGNATURE: &str = "Anchored(address,bytes32,bytes32,bytes)";
+pub const LEAF_APPENDED_SIGNATURE: &str =
+    "LeafAppended(address,uint256,bytes32,bytes32,bytes32[],bytes)";
+pub const LEAVES_APPENDED_SIGNATURE: &str =
+    "LeavesAppended(address,uint256,uint256,bytes32[],uint8[],bytes32,bytes32[],bytes)";
 /// The factory announcing a registry.
 pub const REGISTRY_DEPLOYED_SIGNATURE: &str =
     "RegistryDeployed(address,address,string,string,string)";
@@ -757,8 +753,10 @@ pub static TRANSFER_WITH_MEMO_TOPIC: LazyLock<String> =
     LazyLock::new(|| keccak_hex(TRANSFER_WITH_MEMO_SIGNATURE.as_bytes()));
 pub static APPROVAL_TOPIC: LazyLock<String> =
     LazyLock::new(|| keccak_hex(APPROVAL_SIGNATURE.as_bytes()));
-pub static ANCHORED_TOPIC: LazyLock<String> =
-    LazyLock::new(|| keccak_hex(ANCHORED_SIGNATURE.as_bytes()));
+pub static LEAF_APPENDED_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(LEAF_APPENDED_SIGNATURE.as_bytes()));
+pub static LEAVES_APPENDED_TOPIC: LazyLock<String> =
+    LazyLock::new(|| keccak_hex(LEAVES_APPENDED_SIGNATURE.as_bytes()));
 pub static REGISTRY_DEPLOYED_TOPIC: LazyLock<String> =
     LazyLock::new(|| keccak_hex(REGISTRY_DEPLOYED_SIGNATURE.as_bytes()));
 
@@ -1284,23 +1282,22 @@ mod tests {
     /// arguments the chain actually indexes.
     #[test]
     fn anchoring_decodes_through_the_bindings() {
-        let (contract, function) = REGISTRY
-            .function(&selector("anchor(bytes32,bytes32,bytes)"))
-            .expect("anchor registered");
-        assert_eq!(contract, "anchoring");
-        assert_eq!(
-            function_signature(function),
-            "anchor(bytes32,bytes32,bytes)"
-        );
+        // A registry forwards this call under the precompile's own signature,
+        // so both declare it and the selector is genuinely shared: whichever
+        // ABI answers, the decode is the same.
+        let (_, function) = REGISTRY
+            .function(&selector("appendLeaf(bytes32,bytes)"))
+            .expect("appendLeaf registered");
+        assert_eq!(function_signature(function), "appendLeaf(bytes32,bytes)");
 
-        // The first two arguments are indexed, so the decoder reads them from
-        // topics; getting that wrong would misplace every value.
-        let (contract, anchored) = REGISTRY
-            .event(&keccak256(b"Anchored(address,bytes32,bytes32,bytes)"))
-            .expect("Anchored registered");
+        // The namespace and the leaf index are indexed, so the decoder reads
+        // them from topics; getting that wrong would misplace every value.
+        let (contract, appended) = REGISTRY
+            .event(&keccak256(LEAF_APPENDED_SIGNATURE.as_bytes()))
+            .expect("LeafAppended registered");
         assert_eq!(contract, "anchoring");
-        let indexed: Vec<bool> = anchored.inputs.iter().map(|i| i.indexed).collect();
-        assert_eq!(indexed, [true, true, false, false]);
+        let indexed: Vec<bool> = appended.inputs.iter().map(|i| i.indexed).collect();
+        assert_eq!(indexed, [true, true, false, false, false, false]);
     }
     use ethers_core::abi::encode as abi_encode;
 
@@ -1322,8 +1319,12 @@ mod tests {
                 "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
             ),
             (
-                &*ANCHORED_TOPIC,
-                "0x778db4d46fc7a84c4e5105dcb250cb47092b78648868d3efaf18e1205b25801d",
+                &*LEAF_APPENDED_TOPIC,
+                "0x299ee3fc8eecbb10ce273b5329c6e4f095c550dc1bc7e1756bd6303da53cf12a",
+            ),
+            (
+                &*LEAVES_APPENDED_TOPIC,
+                "0x07d3a61ef7a792265f84d9a96ef8168c654dd0d610d83034971ce6c68c30a378",
             ),
             (
                 &*REGISTRY_DEPLOYED_TOPIC,

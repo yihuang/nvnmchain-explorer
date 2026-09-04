@@ -10,3 +10,4 @@ explorer.db*
 /target/
 Cargo.lock.orig
 /TODO.md
+.cargo/
