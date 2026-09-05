@@ -13,7 +13,7 @@
 //! head word hands back the ABI offset instead of the payload — and
 //! `is_self_verifying` would hash the wrong thing.
 
-use crate::decoder::{keccak_hex, normalize_hex};
+use crate::decoder::{keccak256, keccak_hex, normalize_hex};
 
 /// Fixed at genesis (`IAnchoring.sol`).
 pub const ANCHORING_ADDRESS: &str = "0x0000000000000000000000000000000000000A00";
@@ -29,4 +29,21 @@ pub fn is_self_verifying(commitment: &str, metadata: &str) -> bool {
         return false;
     };
     keccak_hex(&raw) == normalize_hex(commitment)
+}
+
+/// The root: the peaks bagged highest first, `keccak256("bag" ‖ acc ‖ peak)`,
+/// as the precompile derives it. An append event carries the peaks and not the
+/// root, which is this one fold away; no peaks is the empty tree's zero root.
+pub fn bag(peaks: &[[u8; 32]]) -> String {
+    let Some((first, rest)) = peaks.split_first() else {
+        return format!("0x{}", "00".repeat(32));
+    };
+    let root = rest.iter().fold(*first, |acc, peak| {
+        let mut preimage = Vec::with_capacity(3 + 64);
+        preimage.extend_from_slice(b"bag");
+        preimage.extend_from_slice(&acc);
+        preimage.extend_from_slice(peak);
+        keccak256(&preimage)
+    });
+    format!("0x{}", hex::encode(root))
 }

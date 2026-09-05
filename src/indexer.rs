@@ -462,8 +462,9 @@ pub fn anchored_event(
     let arg = |name: &str| param(decoded, name);
     let word = |value: &str| (value.len() == 66).then(|| value.to_string());
     // `0x` + 64 hex digits. A truncated log decodes to a short or empty value,
-    // which would store a root the chain never wrote.
-    let root = word(arg("root")?)?;
+    // which would store a word the chain never wrote.
+    // The root is not in the log: it is what the peaks bag to.
+    let root = crate::anchoring::bag(&peaks(arg("peaks")?)?);
     let batch = decoded.topic0 == *crate::decoder::LEAVES_APPENDED_TOPIC;
     let (index, leaves, commitment) = if batch {
         // `count` is the tree's size after the append, not the size of the
@@ -492,6 +493,19 @@ pub fn anchored_event(
         timestamp: tx.timestamp,
         created_at: db::now_ts(),
     })
+}
+
+/// The peaks as the decoder renders a `bytes32[]`: `[0x…, 0x…]`, or `[]`. A
+/// peak that is not a whole word is a truncated log, and `None`.
+fn peaks(rendered: &str) -> Option<Vec<[u8; 32]>> {
+    rendered
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(str::trim)
+        .filter(|peak| !peak.is_empty())
+        .map(|peak| hex::decode(peak.strip_prefix("0x")?).ok()?.try_into().ok())
+        .collect()
 }
 
 /// One decoded `RegistryDeployed` log as a storable row, or `None` when it does
@@ -1085,11 +1099,11 @@ mod tests {
                 format!("0x{}{}", "00".repeat(12), caller),
                 format!("0x{:064x}", 0),
             ],
-            // abi.encode(commitment, root, bytes32[] peaks, bytes metadata),
-            // both tails empty.
+            // abi.encode(commitment, bytes32[] peaks, bytes metadata): the
+            // root as the one peak, and no metadata.
             "data": format!(
-                "0x{commitment}{root}{:064x}{:064x}{:064x}{:064x}",
-                4 * 32, 5 * 32, 0, 0
+                "0x{commitment}{:064x}{:064x}{:064x}{root}{:064x}",
+                3 * 32, 5 * 32, 1, 0
             ),
             "logIndex": "0x0",
         })

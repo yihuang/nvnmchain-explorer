@@ -811,19 +811,16 @@ static PHRASES: &[Phrase] = &[
     .notes(&[("Owner", Slot::Account("owner"))]),
     // ---- Chain-local ------------------------------------------------------
     phrase(
-        "LeafAppended(address,uint256,bytes32,bytes32,bytes32[],bytes)",
+        "LeafAppended(address,uint256,bytes32,bytes32[],bytes)",
         "leaf appended",
         "Append Leaf",
         &[Slot::Hex("commitment"), Slot::Word("as leaf"), Slot::Value("index")],
     )
-    .notes(&[
-        ("Namespace", Slot::Account("namespace")),
-        ("MMR root", Slot::Hex("root")),
-    ]),
+    .notes(&[("Namespace", Slot::Account("namespace"))]),
     // A batch's rows never reach the chain one at a time, so where the leaf
     // above names what it committed to, this can only say how many arrived.
     phrase(
-        "LeavesAppended(address,uint256,uint256,bytes32[],uint8[],bytes32,bytes32[],bytes)",
+        "LeavesAppended(address,uint256,uint256,(bytes32,uint8)[],bytes32[],bytes)",
         "leaves appended",
         "Append Leaves",
         &[Slot::Span {
@@ -831,10 +828,7 @@ static PHRASES: &[Phrase] = &[
             count: "count",
         }],
     )
-    .notes(&[
-        ("Namespace", Slot::Account("namespace")),
-        ("MMR root", Slot::Hex("root")),
-    ]),
+    .notes(&[("Namespace", Slot::Account("namespace"))]),
     phrase(
         "RegistryDeployed(address,address,string,string,string)",
         "registry deployed",
@@ -1587,10 +1581,9 @@ mod tests {
         // The precompile's, not a registry's: a batch's rows never reach the
         // chain one at a time, so the count and the span are all it can say.
         let namespace = format!("0x{}", "a1".repeat(20));
-        let root = "d81a2e1a3cbe000000000000000000000000000000000000000000000000beef";
         let event = say(
             &precompile_log(
-                "LeavesAppended(address,uint256,uint256,bytes32[],uint8[],bytes32,bytes32[],bytes)",
+                "LeavesAppended(address,uint256,uint256,(bytes32,uint8)[],bytes32[],bytes)",
                 &[
                     format!(
                         "0x{}{}",
@@ -1601,10 +1594,8 @@ mod tests {
                 ],
                 &[
                     EthersToken::Uint(1013.into()),
-                    EthersToken::Array(vec![]),
-                    EthersToken::Array(vec![]),
-                    EthersToken::FixedBytes(hex::decode(root).expect("root")),
-                    EthersToken::Array(vec![]),
+                    EthersToken::Array(vec![]), // chunks
+                    EthersToken::Array(vec![]), // peaks
                     EthersToken::Bytes(vec![]),
                 ],
             ),
@@ -1614,10 +1605,7 @@ mod tests {
         assert_eq!(event.headline, "Append Leaves #0–1012");
         assert_eq!(
             event.details,
-            vec![
-                ("Namespace".into(), "0xA1A1…a1a1".into()),
-                ("MMR root".into(), "0xd81a…beef".into()),
-            ]
+            vec![("Namespace".into(), "0xA1A1…a1a1".into())]
         );
     }
 

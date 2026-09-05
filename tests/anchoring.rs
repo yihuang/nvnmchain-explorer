@@ -80,7 +80,8 @@ fn append_log(topic: &str, namespace: &str, indexed: u64, data: &[Token]) -> Val
     })
 }
 
-/// `LeafAppended`: what one leaf committed to, and the root it left.
+/// `LeafAppended`: what one leaf committed to, and the root it left — carried
+/// as the one peak, since a lone peak bags to itself.
 fn leaf_log(namespace: &str, index: u64, commitment: &str, root: &str, metadata: &str) -> Value {
     append_log(
         &LEAF_APPENDED_TOPIC,
@@ -88,8 +89,7 @@ fn leaf_log(namespace: &str, index: u64, commitment: &str, root: &str, metadata:
         index,
         &[
             Token::FixedBytes(bytes_of(commitment)),
-            Token::FixedBytes(bytes_of(root)),
-            Token::Array(vec![]), // peaks
+            Token::Array(vec![Token::FixedBytes(bytes_of(root))]), // peaks
             Token::Bytes(bytes_of(metadata)),
         ],
     )
@@ -97,7 +97,8 @@ fn leaf_log(namespace: &str, index: u64, commitment: &str, root: &str, metadata:
 
 /// `LeavesAppended`: a span starting at `first`, with `count` the tree's size
 /// afterwards. No commitment of its own — its leaves reached the chain as the
-/// roots of subtrees, which is what the two empty arrays would carry.
+/// roots of subtrees, which is what the empty chunks would carry; the root
+/// rides as the one peak.
 fn leaves_log(namespace: &str, first: u64, count: u64, root: &str, metadata: &str) -> Value {
     append_log(
         &LEAVES_APPENDED_TOPIC,
@@ -105,10 +106,8 @@ fn leaves_log(namespace: &str, first: u64, count: u64, root: &str, metadata: &st
         first,
         &[
             Token::Uint(count.into()),
-            Token::Array(vec![]), // chunkRoots
-            Token::Array(vec![]), // chunkHeights
-            Token::FixedBytes(bytes_of(root)),
-            Token::Array(vec![]), // peaks
+            Token::Array(vec![]),                                  // chunks
+            Token::Array(vec![Token::FixedBytes(bytes_of(root))]), // peaks
             Token::Bytes(bytes_of(metadata)),
         ],
     )
@@ -292,7 +291,7 @@ fn logs_from_other_contracts_are_not_appends() {
     });
     let decoded = decode_event(&foreign).expect("decoded");
     assert_ne!(decoded.name.as_deref(), Some("LeafAppended"));
-    // A log that claims the signature but carries no root yields no row.
+    // A log that claims the signature but carries no peaks yields no row.
     let truncated = json!({
         "address": ANCHORING_ADDRESS,
         "topics": [LEAF_APPENDED_TOPIC.as_str()],

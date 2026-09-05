@@ -74,8 +74,9 @@ const LOCAL: &[(&str, &[&str])] = &[
             // registry forwards the call as it came once it has checked the
             // caller's role -- so what is logged is the precompile's event, not
             // one of these, and it is declared with the precompile's ABI.
-            "function appendLeaf(bytes32 commitment, bytes metadata) external returns (bytes32 root)",
-            "function appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes metadata) external returns (bytes32 root)",
+            "function appendLeaf(bytes32 commitment, bytes metadata) external",
+            "struct Chunk { bytes32 root; uint8 height; }",
+            "function appendLeaves(Chunk[] chunks, bytes metadata) external",
             "function mmrRoot() external view returns (bytes32)",
             "function versionCount(bytes32 checksumHash) external view returns (uint256)",
             "function factory() external view returns (address)",
@@ -733,10 +734,9 @@ pub fn revert_data_in(message: &str) -> Option<String> {
 pub const TRANSFER_SIGNATURE: &str = "Transfer(address,address,uint256)";
 pub const TRANSFER_WITH_MEMO_SIGNATURE: &str = "TransferWithMemo(address,address,uint256,bytes32)";
 pub const APPROVAL_SIGNATURE: &str = "Approval(address,address,uint256)";
-pub const LEAF_APPENDED_SIGNATURE: &str =
-    "LeafAppended(address,uint256,bytes32,bytes32,bytes32[],bytes)";
+pub const LEAF_APPENDED_SIGNATURE: &str = "LeafAppended(address,uint256,bytes32,bytes32[],bytes)";
 pub const LEAVES_APPENDED_SIGNATURE: &str =
-    "LeavesAppended(address,uint256,uint256,bytes32[],uint8[],bytes32,bytes32[],bytes)";
+    "LeavesAppended(address,uint256,uint256,(bytes32,uint8)[],bytes32[],bytes)";
 /// The factory announcing a registry.
 pub const REGISTRY_DEPLOYED_SIGNATURE: &str =
     "RegistryDeployed(address,address,string,string,string)";
@@ -1227,7 +1227,12 @@ mod tests {
             let parsed = contract.functions().count()
                 + contract.events().count()
                 + contract.errors().count();
-            assert_eq!(parsed, declarations.len(), "in `{name}`");
+            // A struct declares a type for the others to use, not a member of its own.
+            let declared = declarations
+                .iter()
+                .filter(|d| !d.starts_with("struct "))
+                .count();
+            assert_eq!(parsed, declared, "in `{name}`");
         }
     }
 
@@ -1297,7 +1302,7 @@ mod tests {
             .expect("LeafAppended registered");
         assert_eq!(contract, "anchoring");
         let indexed: Vec<bool> = appended.inputs.iter().map(|i| i.indexed).collect();
-        assert_eq!(indexed, [true, true, false, false, false, false]);
+        assert_eq!(indexed, [true, true, false, false, false]);
     }
     use ethers_core::abi::encode as abi_encode;
 
@@ -1320,11 +1325,11 @@ mod tests {
             ),
             (
                 &*LEAF_APPENDED_TOPIC,
-                "0x299ee3fc8eecbb10ce273b5329c6e4f095c550dc1bc7e1756bd6303da53cf12a",
+                "0x43a24f34ff55c61c25ca8f226ce1e940c9bc4ca4ef98253d9780a3cf29aa2262",
             ),
             (
                 &*LEAVES_APPENDED_TOPIC,
-                "0x07d3a61ef7a792265f84d9a96ef8168c654dd0d610d83034971ce6c68c30a378",
+                "0xa643a7916be4114a8d4f887b0606856c1f49b02a0a4374c775283987c1e12c2c",
             ),
             (
                 &*REGISTRY_DEPLOYED_TOPIC,
