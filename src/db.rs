@@ -141,9 +141,17 @@ pub fn init_db(path: &str) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // A derived table whose shape changed is dropped and refilled by indexing.
+    // The blocks go with it: the backfill descends from the lowest block held,
+    // so with them kept nothing would revisit what was indexed before.
+    let start_over = |table: &str, why: &str| -> Result<()> {
+        tracing::warn!("{table} {why}: dropping it and every block, to re-index from the chain");
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
+        conn.execute("DROP TABLE IF EXISTS blocks", [])?;
+        Ok(())
+    };
     // `registries` first keyed on address alone, which let any contract's
-    // RegistryDeployed log replace the row a trusted factory wrote. Every row
-    // is re-derivable by indexing, so databases on the old key start over.
+    // RegistryDeployed log replace the row a trusted factory wrote.
     let address_keyed_alone = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('registries') WHERE pk > 0",
@@ -153,11 +161,10 @@ pub fn init_db(path: &str) -> Result<Connection> {
         .unwrap_or(0)
         == 1;
     if address_keyed_alone {
-        conn.execute("DROP TABLE registries", [])?;
+        start_over("registries", "was keyed on address alone")?;
     }
     // `anchored_events` was keyed by `(namespace, key)`; a row is an append at a
-    // leaf index now. Every row is re-derivable by indexing, so a database on
-    // the old shape starts over rather than being migrated.
+    // leaf index now.
     let keyed_by_key = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('anchored_events') WHERE name = 'key'",
@@ -167,7 +174,7 @@ pub fn init_db(path: &str) -> Result<Connection> {
         .unwrap_or(0)
         == 1;
     if keyed_by_key {
-        conn.execute("DROP TABLE anchored_events", [])?;
+        start_over("anchored_events", "was keyed by (namespace, key)")?;
         conn.execute("DROP TABLE IF EXISTS anchored_namespaces", [])?;
     }
     conn.execute_batch(

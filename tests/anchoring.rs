@@ -323,6 +323,46 @@ fn reindexing_a_block_does_not_duplicate() {
     assert_eq!(db::get_namespace_mmr(&db, REGISTRY).0, 1);
 }
 
+/// A database on the old shape is re-indexed from the chain, not merely emptied:
+/// forgetting the blocks is what makes the backfill revisit every one.
+#[test]
+fn a_database_on_the_old_shape_starts_over_from_the_chain() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("anchoring.db");
+    let path = path.to_str().unwrap();
+    let db: Db = Arc::new(Mutex::new(db::init_db(path).expect("init db")));
+    index_append(
+        &db,
+        100,
+        leaf_log(REGISTRY, 0, REGISTRY_COMMITMENT, REGISTRY_ROOT, "0x"),
+    );
+    assert_eq!(db::get_min_block_number(&db), Some(100));
+    // The old shape's tell-tale: a `key` column.
+    db.lock()
+        .unwrap()
+        .execute("ALTER TABLE anchored_events ADD COLUMN key BLOB", [])
+        .expect("the old shape");
+    drop(db);
+
+    let reopened: Db = Arc::new(Mutex::new(db::init_db(path).expect("reopen")));
+    assert_eq!(
+        db::get_min_block_number(&reopened),
+        None,
+        "every block forgotten, so the backfill starts from the head"
+    );
+    assert_eq!(db::count_anchored(&reopened), 0);
+    let keyed: i64 = reopened
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('anchored_events') WHERE name = 'key'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("pragma");
+    assert_eq!(keyed, 0, "recreated on the new shape");
+}
+
 #[test]
 fn appends_are_newest_first_and_the_root_is_the_last_one() {
     let (_dir, db) = temp_db();
