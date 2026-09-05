@@ -68,6 +68,11 @@ enum Slot {
     Role(&'static str),
     /// A registry role's scope: the whole registry, or one record.
     Scope(&'static str),
+    /// A span of leaves, `#first–last`, from a first index and the count after it.
+    Span {
+        first: &'static str,
+        count: &'static str,
+    },
     /// A `RecordCategory`, which crosses the ABI as its `uint8` ordinal.
     Category(&'static str),
 }
@@ -821,7 +826,10 @@ static PHRASES: &[Phrase] = &[
         "LeavesAppended(address,uint256,uint256,bytes32[],uint8[],bytes32,bytes32[],bytes)",
         "leaves appended",
         "Append Leaves",
-        &[Slot::Word("to"), Slot::Value("count"), Slot::Word("leaves from"), Slot::Value("firstLeaf")],
+        &[Slot::Span {
+            first: "firstLeaf",
+            count: "count",
+        }],
     )
     .notes(&[
         ("Namespace", Slot::Account("namespace")),
@@ -1038,6 +1046,16 @@ fn render_slot(slot: &Slot, event: &DecodedEvent, tokens: &Tokens) -> Option<Str
                 .ok()
                 .and_then(|i| RECORD_CATEGORIES.get(i))
                 .map_or(ordinal, |category| category.to_string())
+        }
+        Slot::Span { first, count } => {
+            let first = value_of(params, first)?;
+            match (
+                first.parse::<u64>(),
+                value_of(params, count)?.parse::<u64>(),
+            ) {
+                (Ok(from), Ok(to)) if to > from + 1 => format!("#{from}–{}", to - 1),
+                _ => format!("#{first}"),
+            }
         }
     })
 }
@@ -1593,7 +1611,7 @@ mod tests {
             None,
         );
         assert_eq!(event.kind, "leaves appended");
-        assert_eq!(event.headline, "Append Leaves to 1013 leaves from 0");
+        assert_eq!(event.headline, "Append Leaves #0–1012");
         assert_eq!(
             event.details,
             vec![
