@@ -141,6 +141,20 @@ pub fn init_db(path: &str) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // What a long backfill lives or dies by. Every transaction inserted walks five B-trees --
+    // the primary key and four indexes on `transactions` alone -- and once those outgrow the
+    // page cache each walk becomes a disk read. Against a 333k-block chain the 2 MB default
+    // fell from 361 blocks/s to 194 as the database passed 30 GB, and kept falling.
+    // Negative counts KiB rather than pages; `DB_CACHE_KIB` for a machine with less to spare.
+    let cache_kib: i64 = std::env::var("DB_CACHE_KIB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(512 * 1024);
+    conn.pragma_update(None, "cache_size", -cache_kib)?;
+    // Read pages the cache misses through the page cache of the OS rather than a syscall each.
+    conn.pragma_update(None, "mmap_size", 1_i64 << 30)?;
+    // The index builds and ORDER BYs behind the listing pages, off disk.
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     // A derived table whose shape changed is dropped and refilled by indexing.
     // The blocks go with it: the backfill descends from the lowest block held,
     // so with them kept nothing would revisit what was indexed before.
