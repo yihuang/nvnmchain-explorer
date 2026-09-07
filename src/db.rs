@@ -118,6 +118,18 @@ fn query_count<P: rusqlite::Params>(conn: &Connection, what: &str, sql: &str, pa
         .unwrap_or(0)
 }
 
+/// Whether a table holds anything at all, stopping at the first row rather than
+/// counting. The name is interpolated because SQLite cannot bind an identifier;
+/// every caller passes a literal.
+pub fn table_has_rows(conn: &Connection, table: &str) -> bool {
+    query_count(
+        conn,
+        "table_has_rows",
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)"),
+        [],
+    ) != 0
+}
+
 pub fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -823,16 +835,13 @@ pub fn get_all_tokens(db: &Db, page: u32, per_page: u32) -> Vec<TokenMetadata> {
 /// Every stored token-metadata row (unpaginated), used by the startup repair
 /// that re-fetches values written before the ABI string-decoder fix.
 pub fn get_all_token_metas(db: &Db) -> Vec<TokenMetadata> {
-    let conn = lock(db);
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at FROM token_metadata",
-    ) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map([], row_to_token) else {
-        return Vec::new();
-    };
-    rows.filter_map(|r| r.ok()).collect()
+    query_rows(
+        &lock(db),
+        "get_all_token_metas",
+        &format!("SELECT {TOKEN_COLS} FROM token_metadata"),
+        [],
+        row_to_token,
+    )
 }
 
 pub fn get_token_count(db: &Db) -> i64 {
@@ -997,24 +1006,38 @@ fn apply_transfer_balances(conn: &Connection, transfers: &[&TransferEvent]) -> R
     Ok(())
 }
 
+/// Holders of one token: the balance rows that are holdings, which is what
+/// `idx_tb_holding` covers.
+fn count_holders(conn: &Connection, token: &str) -> rusqlite::Result<i64> {
+    conn.prepare_cached(&format!(
+        "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"
+    ))?
+    .query_row(params![token], |r| r.get(0))
+}
+
+/// Recount one token's holders and write the total onto its metadata row.
+///
+/// The two tables spell an address differently — `token_balances` on the
+/// checksummed text, `token_metadata` on bytes — so the count and the update
+/// bind different forms of the same address.
+fn update_holder_count(conn: &Connection, token: &str) -> Result<()> {
+    let count = count_holders(conn, token)?;
+    exec_cached(
+        conn,
+        "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
+        params![count, now_ts(), hex_blob(token)],
+    )?;
+    Ok(())
+}
+
 /// Keep `token_metadata.holder_count` in sync for tokens touched by this
 /// batch of transfers. Uses the primary-key index so it stays cheap.
 fn refresh_holder_counts(conn: &Connection, transfers: &[&TransferEvent]) -> Result<()> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for t in transfers {
-        if !seen.insert(t.token_addr.clone()) {
-            continue;
+        if seen.insert(t.token_addr.as_str()) {
+            update_holder_count(conn, &t.token_addr)?;
         }
-        let count = conn
-            .prepare_cached(&format!(
-                "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"
-            ))?
-            .query_row(params![t.token_addr], |r| r.get::<_, i64>(0))?;
-        exec_cached(
-            conn,
-            "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
-            params![count, now_ts(), hex_blob(&t.token_addr)],
-        )?;
     }
     Ok(())
 }
@@ -1049,15 +1072,7 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
         n += 1;
     }
     for token in touched {
-        let count = conn.query_row(
-            &format!("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"),
-            params![token],
-            |r| r.get::<_, i64>(0),
-        )?;
-        conn.execute(
-            "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
-            params![count, now_ts(), hex_blob(&token)],
-        )?;
+        update_holder_count(conn, &token)?;
     }
     tracing::info!("rebuilt token balances from {n} transfer events");
     Ok(())
@@ -1305,14 +1320,7 @@ pub fn sync_anchored_namespaces(conn: &Connection) -> Result<()> {
 /// Whether the summary table needs the rebuild above: anchors on record but no
 /// summary rows to show for them (a database that predates the table).
 pub fn anchored_summary_is_stale(conn: &Connection) -> bool {
-    let exists = |what, sql| query_count(conn, what, sql, []) != 0;
-    exists(
-        "anchored_summary_is_stale events",
-        "SELECT EXISTS(SELECT 1 FROM anchored_events LIMIT 1)",
-    ) && !exists(
-        "anchored_summary_is_stale namespaces",
-        "SELECT EXISTS(SELECT 1 FROM anchored_namespaces LIMIT 1)",
-    )
+    table_has_rows(conn, "anchored_events") && !table_has_rows(conn, "anchored_namespaces")
 }
 
 fn row_to_anchored(row: &rusqlite::Row) -> rusqlite::Result<AnchoredEvent> {
@@ -1616,12 +1624,9 @@ pub fn get_all_token_addresses(db: &Db) -> Vec<String> {
 }
 
 pub fn get_token_holder_count(db: &Db, token_addr: &str) -> i64 {
-    query_count(
-        &lock(db),
-        "get_token_holder_count",
-        &format!("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"),
-        params![token_addr],
-    )
+    count_holders(&lock(db), token_addr)
+        .or_warn("get_token_holder_count")
+        .unwrap_or(0)
 }
 
 /// Recompute `token_metadata.holder_count` for every token that has balance
@@ -1633,15 +1638,7 @@ pub fn sync_holder_counts(conn: &Connection) -> Result<()> {
         .query_map([], |r| Ok(addr_from_value(r.get_ref(0)?)))
         .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())?;
     for token in tokens {
-        let count = conn.query_row(
-            &format!("SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"),
-            params![token],
-            |r| r.get::<_, i64>(0),
-        )?;
-        conn.execute(
-            "UPDATE token_metadata SET holder_count=?1, updated_at=?2 WHERE address=?3",
-            params![count, now_ts(), hex_blob(&token)],
-        )?;
+        update_holder_count(conn, &token)?;
     }
     Ok(())
 }

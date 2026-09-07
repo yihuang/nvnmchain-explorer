@@ -875,13 +875,6 @@ fn is_preferred(event: &KnownEvent) -> bool {
     )
 }
 
-fn value_of(params: &[DecodedParam], name: &str) -> Option<String> {
-    params
-        .iter()
-        .find(|p| p.name == name)
-        .map(|p| p.value.clone())
-}
-
 fn token_display<'t>(tokens: &'t Tokens, address: &str) -> Option<&'t TokenDisplay> {
     tokens.get(&address.to_lowercase())
 }
@@ -903,29 +896,27 @@ fn format_amount(tokens: &Tokens, token: &str, raw: &str) -> String {
 }
 
 fn render_slot(slot: &Slot, event: &DecodedEvent, tokens: &Tokens) -> Option<String> {
-    let params = &event.params;
     Some(match slot {
         Slot::Word(word) => (*word).to_string(),
-        Slot::Amount(name) => format_amount(tokens, &event.contract, &value_of(params, name)?),
+        Slot::Amount(name) => format_amount(tokens, &event.contract, event.param(name)?),
         Slot::AmountOf { value, token } => {
-            let token = value_of(params, token)?;
-            format_amount(tokens, &token, &value_of(params, value)?)
+            format_amount(tokens, event.param(token)?, event.param(value)?)
         }
-        Slot::Account(name) => truncate(&value_of(params, name)?),
+        Slot::Account(name) => truncate(event.param(name)?),
         Slot::Token(name) => {
-            let address = value_of(params, name)?;
-            match token_display(tokens, &address) {
+            let address = event.param(name)?;
+            match token_display(tokens, address) {
                 Some(meta) if !meta.symbol.is_empty() => meta.symbol.clone(),
-                _ => truncate(&address),
+                _ => truncate(address),
             }
         }
-        Slot::Value(name) => value_of(params, name)?,
-        Slot::Hex(name) => truncate(&value_of(params, name)?),
+        Slot::Value(name) => event.param(name)?.to_string(),
+        Slot::Hex(name) => truncate(event.param(name)?),
         Slot::Role(name) => {
-            let hash = value_of(params, name)?;
-            role_name(&hash)
+            let hash = event.param(name)?;
+            role_name(hash)
                 .map(String::from)
-                .unwrap_or_else(|| truncate(&hash))
+                .unwrap_or_else(|| truncate(hash))
         }
     })
 }
@@ -957,8 +948,8 @@ fn known_event(
             })
             .filter(|(_, value)| !value.is_empty())
             .collect(),
-        from: value_of(&event.params, "from"),
-        to: value_of(&event.params, "to"),
+        from: event.param("from").map(String::from),
+        to: event.param("to").map(String::from),
         is_fee: false,
         log_index,
     };
@@ -981,8 +972,7 @@ fn known_event(
 /// Adjust events whose meaning turns on an argument: a boolean flag, a
 /// counterparty, an address format.
 fn refine(known: &mut KnownEvent, event: &DecodedEvent, sender: Option<&str>) {
-    let params = &event.params;
-    let flag = |name: &str| value_of(params, name).as_deref() == Some("true");
+    let flag = |name: &str| event.param(name) == Some("true");
 
     match known.kind.as_str() {
         "send" => {
@@ -996,7 +986,7 @@ fn refine(known: &mut KnownEvent, event: &DecodedEvent, sender: Option<&str>) {
                 known.is_fee = true;
                 return;
             }
-            match value_of(params, "memo").map_or(Memo::Nothing, |m| memo::read(&m)) {
+            match event.param("memo").map_or(Memo::Nothing, memo::read) {
                 Memo::Attribution => {
                     known.action = "MPP Payment".into();
                     return;
@@ -1011,9 +1001,9 @@ fn refine(known: &mut KnownEvent, event: &DecodedEvent, sender: Option<&str>) {
             }
         }
         "mint" => {
-            let to = value_of(params, "to").unwrap_or_default();
+            let to = event.param("to").unwrap_or_default();
             if let Some(sender) = sender {
-                if !same_address(sender, &to) {
+                if !same_address(sender, to) {
                     known.action = "Mint to Recipient".into();
                 }
             }

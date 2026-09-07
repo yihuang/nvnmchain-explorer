@@ -102,9 +102,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let mut txs = Vec::with_capacity(raw_txs.len());
-    let mut transfers = Vec::new();
-    let mut anchored = Vec::new();
-    let mut registries = Vec::new();
+    let mut rows = ReceiptRows::default();
     let mut next_log_index = 0u64;
 
     for tx_data in raw_txs {
@@ -122,14 +120,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
             tx.raw = Some(format!("0x{}", hex::encode(buf)));
         }
         if let Some(receipt) = receipt_by_hash.get(tx_hash) {
-            apply_receipt(
-                &mut tx,
-                receipt,
-                &mut transfers,
-                &mut anchored,
-                &mut registries,
-                &mut next_log_index,
-            );
+            apply_receipt(&mut tx, receipt, &mut rows, &mut next_log_index);
         }
         txs.push(tx);
     }
@@ -137,10 +128,10 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
     BlockBundle {
         block,
         txs,
-        transfers,
-        anchored,
+        transfers: rows.transfers,
+        anchored: rows.anchored,
         tokens: Vec::new(),
-        registries,
+        registries: rows.registries,
     }
 }
 
@@ -277,14 +268,18 @@ async fn attach_token_metadata(
     }
 }
 
-fn apply_receipt(
-    tx: &mut Transaction,
-    receipt: &Value,
-    transfers: &mut Vec<TransferEvent>,
-    anchored: &mut Vec<AnchoredEvent>,
-    registries: &mut Vec<RegistryDeployed>,
-    next_log_index: &mut u64,
-) {
+/// The rows a block's receipts contribute, accumulated across its transactions:
+/// three outputs of one walk over the logs, so the walk is handed one place to
+/// put them.
+#[derive(Default)]
+struct ReceiptRows {
+    transfers: Vec<TransferEvent>,
+    anchored: Vec<AnchoredEvent>,
+    registries: Vec<RegistryDeployed>,
+}
+
+/// Copy onto a transaction what only its receipt knows.
+fn apply_receipt_fields(tx: &mut Transaction, receipt: &Value) {
     tx.receipt_data = Some(serde_json::to_string(receipt).unwrap_or_else(|_| "{}".into()));
     tx.status = receipt
         .get("status")
@@ -307,17 +302,13 @@ fn apply_receipt(
     if let Some(fee_token) = receipt.get("feeToken").and_then(Value::as_str) {
         tx.fee_token = Some(checksum_address(fee_token));
     }
-    if let Some(fee_amount) = receipt.get("feeAmount") {
-        tx.fee_amount = match fee_amount {
-            Value::String(s) if s.starts_with("0x") => {
-                num_bigint::BigInt::parse_bytes(&s.as_bytes()[2..], 16)
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| s.clone())
-            }
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            _ => tx.fee_amount.clone(),
-        };
+    // A receipt that omits the fee — or reports it as neither a string nor a
+    // number — leaves standing whatever the transaction object already said.
+    if let Some(fee_amount) = receipt
+        .get("feeAmount")
+        .filter(|v| v.is_string() || v.is_number())
+    {
+        tx.fee_amount = crate::rpc::decimal_amount(fee_amount);
     }
     if let Some(egp) = receipt.get("effectiveGasPrice") {
         tx.base_fee = match egp {
@@ -325,9 +316,105 @@ fn apply_receipt(
             _ => crate::rpc::int_to_hex_str(egp),
         };
     }
+}
 
-    // Decode Transfer / TransferWithMemo logs so address/token transfer tabs
-    // have data.
+/// The fee a receipt did not state, read off the transfer that settled it.
+///
+/// The fee is a TIP-20 transfer into the Fee Manager, so a receipt without a
+/// `feeAmount` still says what was charged. Only the fee token's own transfer
+/// counts: another token moving there is somebody's payment, not the fee.
+fn derive_fee_from_transfer(tx: &mut Transaction, log: &Value, to: &str, amount: &str) {
+    if amount.is_empty() || tx.fee_amount.parse::<i64>().map(|n| n > 0).unwrap_or(false) {
+        return;
+    }
+    let emitter = log
+        .get("address")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    let is_fee_token = tx
+        .fee_token
+        .as_deref()
+        .map(|f| f.to_lowercase() == emitter)
+        .unwrap_or(false);
+    if is_fee_token && to.eq_ignore_ascii_case(crate::decoder::FEE_MANAGER_ADDRESS) {
+        tx.fee_amount = amount.to_string();
+    }
+}
+
+/// Index one receipt log: anything the explorer stores per log lands in `rows`,
+/// and a transfer may also tell the transaction what it was charged.
+fn index_log(tx: &mut Transaction, log: &Value, log_index: i64, rows: &mut ReceiptRows) {
+    // Only the precompile's own log carries a trustworthy namespace: the caller
+    // it records is the sender it saw, which a contract emitting the same
+    // signature could claim to be anyone. Rejected before decoding, so an
+    // impostor's payload is never worth decoding.
+    let topic0 = log.pointer("/topics/0").and_then(Value::as_str);
+    let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
+    if topic0 == Some(crate::decoder::ANCHORED_TOPIC.as_str())
+        && !emitter.eq_ignore_ascii_case(ANCHORING_ADDRESS)
+    {
+        return;
+    }
+
+    let Some(decoded) = decode_event(log) else {
+        return;
+    };
+    // Both anchoring events are matched on topic0 rather than the decoded
+    // display name, which is a UI label: renaming one must not silently stop
+    // indexing it.
+    if decoded.topic0 == *crate::decoder::REGISTRY_DEPLOYED_TOPIC {
+        // The emitting factory rides in the row — reads decide which factory to
+        // trust, the way transfer rows record their token.
+        if let Some(event) = registry_deployed(&decoded, tx) {
+            rows.registries.push(event);
+        }
+        return;
+    }
+    if decoded.topic0 == *crate::decoder::ANCHORED_TOPIC {
+        match anchored_event(&decoded, tx, log_index) {
+            Some(event) => rows.anchored.push(event),
+            None => warn!("undecodable Anchored log {log_index} in {}", tx.hash),
+        }
+        return;
+    }
+    // Transfers, so the address and token transfer tabs have data.
+    if !matches!(
+        decoded.name.as_deref(),
+        Some("Transfer") | Some("TransferWithMemo")
+    ) {
+        return;
+    }
+    let from = decoded.param("from").unwrap_or_default();
+    let to = decoded.param("to").unwrap_or_default();
+    let amount = decoded.param("amount").unwrap_or_default();
+    derive_fee_from_transfer(tx, log, to, amount);
+    // A log that does not carry all three is not a transfer, whatever its
+    // topic0 says — a foreign contract may emit anything under it.
+    if from.is_empty() || to.is_empty() || amount.is_empty() {
+        return;
+    }
+    rows.transfers.push(TransferEvent {
+        id: 0,
+        tx_hash: tx.hash.clone(),
+        block_number: tx.block_number,
+        log_index,
+        token_addr: checksum_address(emitter),
+        from_addr: from.to_string(),
+        to_addr: to.to_string(),
+        amount: amount.to_string(),
+        timestamp: tx.timestamp,
+        created_at: db::now_ts(),
+    });
+}
+
+fn apply_receipt(
+    tx: &mut Transaction,
+    receipt: &Value,
+    rows: &mut ReceiptRows,
+    next_log_index: &mut u64,
+) {
+    apply_receipt_fields(tx, receipt);
     let logs = receipt
         .get("logs")
         .and_then(Value::as_array)
@@ -344,101 +431,8 @@ fn apply_receipt(
             .filter(|n| *n >= 0)
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
-
-        // Only the precompile's own log carries a trustworthy namespace: the
-        // caller it records is the sender it saw, which a contract emitting the
-        // same signature could claim to be anyone. Rejected before decoding, so
-        // an impostor's payload is never worth decoding.
-        let topic0 = log.pointer("/topics/0").and_then(Value::as_str);
-        let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
-        if topic0 == Some(crate::decoder::ANCHORED_TOPIC.as_str())
-            && !emitter.eq_ignore_ascii_case(ANCHORING_ADDRESS)
-        {
-            continue;
-        }
-
-        let Some(decoded) = decode_event(log) else {
-            continue;
-        };
-        // Both anchoring events are matched on topic0 rather than the decoded
-        // display name, which is a UI label: renaming one must not silently
-        // stop indexing it.
-        if decoded.topic0 == *crate::decoder::REGISTRY_DEPLOYED_TOPIC {
-            // The emitting factory rides in the row — reads decide which
-            // factory to trust, the way transfer rows record their token.
-            if let Some(event) = registry_deployed(&decoded, tx) {
-                registries.push(event);
-            }
-            continue;
-        }
-        if decoded.topic0 == *crate::decoder::ANCHORED_TOPIC {
-            match anchored_event(&decoded, tx, log_index) {
-                Some(event) => anchored.push(event),
-                None => warn!("undecodable Anchored log {log_index} in {}", tx.hash),
-            }
-            continue;
-        }
-        if !matches!(
-            decoded.name.as_deref(),
-            Some("Transfer") | Some("TransferWithMemo")
-        ) {
-            continue;
-        }
-        let mut from = String::new();
-        let mut to = String::new();
-        let mut amount = String::new();
-        for p in &decoded.params {
-            match p.name.as_str() {
-                "from" => from = p.value.clone(),
-                "to" => to = p.value.clone(),
-                "amount" => amount = p.value.clone(),
-                _ => {}
-            }
-        }
-        // The receipt often omits `feeAmount`; the fee is settled as a
-        // Transfer to the Fee Manager, so derive it from that log.
-        if tx.fee_amount.parse::<i64>().map(|n| n <= 0).unwrap_or(true) {
-            let token = log
-                .get("address")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_lowercase();
-            let fee_manager = crate::decoder::FEE_MANAGER_ADDRESS.to_lowercase();
-            let fee_token_matches = tx
-                .fee_token
-                .as_deref()
-                .map(|f| f.to_lowercase() == token)
-                .unwrap_or(false);
-            if fee_token_matches && to.to_lowercase() == fee_manager && !amount.is_empty() {
-                tx.fee_amount = amount.clone();
-            }
-        }
-        if from.is_empty() || to.is_empty() || amount.is_empty() {
-            continue;
-        }
-        let token = checksum_address(log.get("address").and_then(Value::as_str).unwrap_or(""));
-        transfers.push(TransferEvent {
-            id: 0,
-            tx_hash: tx.hash.clone(),
-            block_number: tx.block_number,
-            log_index,
-            token_addr: token,
-            from_addr: from,
-            to_addr: to,
-            amount,
-            timestamp: tx.timestamp,
-            created_at: db::now_ts(),
-        });
+        index_log(tx, log, log_index, rows);
     }
-}
-
-/// One decoded argument of a log, by the name `decode_event` gave it.
-fn param<'a>(decoded: &'a crate::decoder::DecodedEvent, name: &str) -> Option<&'a str> {
-    decoded
-        .params
-        .iter()
-        .find(|p| p.name == name)
-        .map(|p| p.value.as_str())
 }
 
 /// One decoded `Anchored` log as a storable row, or `None` when the log does
@@ -449,7 +443,7 @@ pub fn anchored_event(
     tx: &Transaction,
     log_index: i64,
 ) -> Option<AnchoredEvent> {
-    let arg = |name: &str| param(decoded, name);
+    let arg = |name: &str| decoded.param(name);
     let (key, commitment) = (arg("key")?, arg("commitment")?);
     // `0x` + 64 hex digits. A truncated log decodes to a short or empty value,
     // which would store a head the chain never wrote.
@@ -478,7 +472,7 @@ pub fn registry_deployed(
     decoded: &crate::decoder::DecodedEvent,
     tx: &Transaction,
 ) -> Option<RegistryDeployed> {
-    let arg = |name: &str| param(decoded, name).map(str::to_string);
+    let arg = |name: &str| decoded.param(name).map(str::to_string);
     let address = |name: &str| arg(name).filter(|a| crate::decoder::is_valid_address(a));
     let factory = checksum_address(&decoded.contract);
     if !crate::decoder::is_valid_address(&factory) {
@@ -541,6 +535,46 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Bring a database written by an older build back in line with what the read
+/// paths assume. Every step is idempotent, so this runs on every start.
+///
+/// Each recompute is guarded rather than run unconditionally, and the lock is
+/// taken per step: a rebuild reads whole tables, and holding the connection for
+/// that long is long enough for page views to notice.
+fn repair_derived_tables(db: &Db) {
+    let (has_transfers, has_balances) = {
+        let conn = db::lock(db);
+        (
+            db::table_has_rows(&conn, "transfer_events"),
+            db::table_has_rows(&conn, "token_balances"),
+        )
+    };
+    if has_transfers && !has_balances {
+        // Transfers on record but no incremental balances: a database from
+        // before they were maintained per block. Rebuild once, and holder
+        // counts and holdings are correct from here on.
+        let conn = db::lock(db);
+        if let Err(e) = db::rebuild_token_balances(&conn) {
+            warn!("token balance rebuild failed: {e:#}");
+        }
+    } else if has_balances {
+        // Holder counts written before the BLOB-key fix are stale; recounting
+        // them walks the balances' primary key and nothing else.
+        let conn = db::lock(db);
+        if let Err(e) = db::sync_holder_counts(&conn) {
+            warn!("holder count sync failed: {e:#}");
+        }
+    }
+    // Seed the /anchoring summary for databases that predate it; after this
+    // each block maintains it incrementally.
+    let conn = db::lock(db);
+    if db::anchored_summary_is_stale(&conn) {
+        if let Err(e) = db::sync_anchored_namespaces(&conn) {
+            warn!("anchored namespace sync failed: {e:#}");
+        }
+    }
 }
 
 /// Sleep for `dur` unless shutdown was requested, in which case return
@@ -819,50 +853,7 @@ pub async fn run_forever(
         }
     });
     let rebuild_db = db.clone();
-    tokio::spawn(async move {
-        let conn = db::lock(&rebuild_db);
-        let has_transfers = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM transfer_events LIMIT 1)",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n != 0)
-            .unwrap_or(false);
-        let has_balances = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM token_balances LIMIT 1)",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n != 0)
-            .unwrap_or(false);
-        drop(conn);
-        // Legacy databases have transfers but no incremental balances yet;
-        // rebuild once so holder counts and holdings stay correct.
-        if has_transfers && !has_balances {
-            let conn = db::lock(&rebuild_db);
-            if let Err(e) = db::rebuild_token_balances(&conn) {
-                warn!("token balance rebuild failed: {e:#}");
-            }
-        } else if has_balances {
-            // Backfill token_metadata.holder_count (stale rows written
-            // before the BLOB-key fix); cheap and idempotent.
-            let conn = db::lock(&rebuild_db);
-            if let Err(e) = db::sync_holder_counts(&conn) {
-                warn!("holder count sync failed: {e:#}");
-            }
-        }
-        // Seed the /anchoring summary for databases that predate it; after
-        // this each block maintains it incrementally. Guarded, because the
-        // recompute reads every anchor ever written while holding the lock.
-        let conn = db::lock(&rebuild_db);
-        if db::anchored_summary_is_stale(&conn) {
-            if let Err(e) = db::sync_anchored_namespaces(&conn) {
-                warn!("anchored namespace sync failed: {e:#}");
-            }
-        }
-    });
+    tokio::spawn(async move { repair_derived_tables(&rebuild_db) });
 
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
     let writer_db = db.clone();
@@ -1031,14 +1022,7 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
     };
     // Rides along so the nav's anchoring gate is a memory read on every page
     // view rather than a query. One tick of lag on the tab appearing.
-    let has_anchors: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM anchored_namespaces LIMIT 1)",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        != 0;
+    let has_anchors = db::table_has_rows(&conn, "anchored_namespaces");
 
     let stats = serde_json::json!({
         "latest_block": latest_block,
@@ -1102,17 +1086,10 @@ mod tests {
             created_at: 0,
         };
         let receipt = json!({"status": "0x1", "logs": logs});
-        let (mut anchored, mut transfers, mut registries) = (Vec::new(), Vec::new(), Vec::new());
+        let mut rows = ReceiptRows::default();
         let mut next_log_index = 0u64;
-        apply_receipt(
-            &mut tx,
-            &receipt,
-            &mut transfers,
-            &mut anchored,
-            &mut registries,
-            &mut next_log_index,
-        );
-        (tx, anchored)
+        apply_receipt(&mut tx, &receipt, &mut rows, &mut next_log_index);
+        (tx, rows.anchored)
     }
 
     #[test]

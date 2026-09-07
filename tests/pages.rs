@@ -309,6 +309,54 @@ async fn the_blocks_listing_descends_from_the_tip_over_the_gaps() {
     assert_eq!(numbers, [100], "101 is above the requested start");
 }
 
+/// Pressing Enter in the search box resolves to one destination, and the
+/// candidates are tried in the order a reader means them. A block hash and a
+/// transaction hash are the same shape, so only asking the index tells them
+/// apart.
+#[tokio::test]
+async fn search_resolves_each_kind_of_identifier() {
+    let (_dir, base) = serve().await;
+    let hit = |page: &Value| {
+        let m = &page["match"];
+        (
+            m["type"].as_str().unwrap_or("").to_string(),
+            m["url"].as_str().unwrap_or("").to_string(),
+        )
+    };
+
+    let height = get_json(&base, "/search?q=100").await;
+    assert_eq!(hit(&height), ("block".into(), "/block/100".into()));
+
+    let block_hash = format!("0x{}", "ab".repeat(32));
+    let by_hash = get_json(&base, &format!("/search?q={block_hash}")).await;
+    assert_eq!(hit(&by_hash), ("block".into(), "/block/100".into()));
+
+    let tx = get_json(&base, &format!("/search?q={TX_HASH}")).await;
+    assert_eq!(hit(&tx), ("transaction".into(), format!("/tx/{TX_HASH}")));
+
+    let address = get_json(&base, &format!("/search?q={SENDER}")).await;
+    assert_eq!(
+        hit(&address),
+        (
+            "address".into(),
+            format!("/address/{}", checksum_address(SENDER))
+        )
+    );
+
+    // A name, which is neither a height nor a hash nor an address.
+    let symbol = get_json(&base, "/search?q=pathUSD").await;
+    assert_eq!(
+        hit(&symbol),
+        (
+            "token".into(),
+            format!("/token/{}", checksum_address(TOKEN))
+        )
+    );
+
+    let nothing = get_json(&base, "/search?q=matchesnothing").await;
+    assert_eq!(nothing["match"], Value::Null);
+}
+
 #[tokio::test]
 async fn a_successful_transaction_says_what_it_did() {
     let (_dir, base) = serve().await;
