@@ -273,6 +273,42 @@ async fn a_block_links_only_to_neighbours_that_are_indexed() {
     assert!(html.contains("step-off"), "and a dead end back");
 }
 
+/// Newest first, and only the heights the index holds: the fixture has 100 and
+/// 101 but not 99, and a row for a missing block would link to a 404.
+#[tokio::test]
+async fn the_blocks_listing_descends_from_the_tip_over_the_gaps() {
+    let (_dir, base) = serve().await;
+    let page = get_json(&base, "/blocks?").await;
+
+    let numbers: Vec<i64> = page["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|b| b["number"].as_i64().expect("number"))
+        .collect();
+    assert_eq!(numbers, [101, 100], "newest first, and nothing below 100");
+    assert_eq!(page["first_num"], json!(101));
+    assert_eq!(page["last_num"], json!(100));
+
+    // Each row carries the gas percentage the bar is drawn from; the block row
+    // itself has no such column.
+    assert!(
+        page["blocks"][0]["gas_pct"].is_string(),
+        "gas_pct rides on the row"
+    );
+
+    // `from` starts the walk somewhere other than the tip, which is how the
+    // "Older →" link pages backwards.
+    let older = get_json(&base, "/blocks?from=100").await;
+    let numbers: Vec<i64> = older["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|b| b["number"].as_i64().expect("number"))
+        .collect();
+    assert_eq!(numbers, [100], "101 is above the requested start");
+}
+
 #[tokio::test]
 async fn a_successful_transaction_says_what_it_did() {
     let (_dir, base) = serve().await;

@@ -519,10 +519,25 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
         return Ok(());
     }
     info!("repairing {} token metadata row(s)", corrupt.len());
+    // Fetched together, the way a block's new tokens are: every row here is one
+    // round trip, and a database that needs repairing tends to need a lot of it.
+    let mut set = tokio::task::JoinSet::new();
     for addr in corrupt {
-        let meta = fetch_token_metadata(rpc, &addr).await;
-        if let Err(e) = db::save_token_metadata(db, &meta) {
-            warn!("failed to repair token metadata for {addr}: {e:#}");
+        let rpc = rpc.clone();
+        set.spawn(async move { fetch_token_metadata(&rpc, &addr).await });
+    }
+    while let Some(res) = set.join_next().await {
+        match res {
+            // Written as they arrive: the writes take the lock, so they queue anyway.
+            Ok(meta) => {
+                if let Err(e) = db::save_token_metadata(db, &meta) {
+                    warn!(
+                        "failed to repair token metadata for {}: {e:#}",
+                        meta.address
+                    );
+                }
+            }
+            Err(e) => warn!("token metadata repair task failed: {e:#}"),
         }
     }
     Ok(())
