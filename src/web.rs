@@ -849,15 +849,19 @@ async fn sse_step(
                     .unwrap_or(state.last_num);
                 let start = state.last_num + 1;
                 let end = tip.min(start + SSE_MAX_REPLAY as i64 - 1);
-                for num in start..=end.max(start - 1) {
-                    if let Some(b) = db::get_block_by_number(&state.db, num) {
-                        let txs = db::get_block_transactions(&state.db, num);
-                        state.pending.push_back(crate::models::block_event_json(
-                            &b,
-                            &txs,
-                            crate::models::STREAM_TX_CAP,
-                        ));
-                    }
+                // Two range queries for the whole span, not two per height: a
+                // client that fell far behind replays up to `SSE_MAX_REPLAY`.
+                let blocks = db::get_blocks_in_range(&state.db, start, end);
+                let txs = db::get_transactions_in_range(&state.db, start, end);
+                // Oldest first, since the writer emits in number order.
+                for block in blocks.into_iter().rev() {
+                    let first = txs.partition_point(|t| t.block_number < block.number);
+                    let past = txs.partition_point(|t| t.block_number <= block.number);
+                    state.pending.push_back(crate::models::block_event_json(
+                        &block,
+                        &txs[first..past],
+                        crate::models::STREAM_TX_CAP,
+                    ));
                 }
                 state.last_num = state.last_num.max(end);
                 if let Some(v) = state.pending.pop_front() {
@@ -950,18 +954,17 @@ pub async fn blocks_page(
     let latest = db::get_latest_block(&state.db);
     let latest_num = latest.as_ref().map(|b| b.number).unwrap_or(0);
     let end = from.unwrap_or_else(|| (latest_num - (page - 1) * per_page).max(0));
-
-    let mut blocks: Vec<Value> = Vec::new();
-    let mut i = end;
-    while i > end - per_page && i >= 0 {
-        if let Some(b) = db::get_block_by_number(&state.db, i) {
-            let pct = block_pct(b.gas_used, b.gas_limit);
+    let start = (end - per_page + 1).max(0);
+    // One range query: the listing shows whichever of these heights are indexed.
+    let blocks: Vec<Value> = db::get_blocks_in_range(&state.db, start, end)
+        .into_iter()
+        .map(|b| {
+            let gas_pct = block_pct(b.gas_used, b.gas_limit);
             let mut v = serde_json::to_value(b).unwrap_or(Value::Null);
-            v["gas_pct"] = json!(pct);
-            blocks.push(v);
-        }
-        i -= 1;
-    }
+            v["gas_pct"] = json!(gas_pct);
+            v
+        })
+        .collect();
 
     let ctx = page_ctx_for(
         &state,

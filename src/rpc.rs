@@ -284,17 +284,6 @@ impl ChainRpc {
             .to_string())
     }
 
-    pub async fn eth_call(&self, to: &str, data: &str, block: &str) -> Result<String> {
-        let result = self
-            .call("eth_call", json!([{"to": to, "data": data}, block]))
-            .await?;
-        Ok(result
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("0x")
-            .to_string())
-    }
-
     pub async fn eth_get_logs(&self, filter: Value) -> Result<Vec<Value>> {
         let result = self.call("eth_getLogs", json!([filter])).await?;
         Ok(result.as_array().cloned().unwrap_or_default())

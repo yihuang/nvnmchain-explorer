@@ -570,6 +570,20 @@ pub fn get_min_block_number(db: &Db) -> Option<i64> {
     .flatten()
 }
 
+/// Blocks between two heights, newest first. Fewer than the range's width is
+/// normal: backfill descends, so the index has holes until it lands.
+pub fn get_blocks_in_range(db: &Db, from: i64, to: i64) -> Vec<Block> {
+    query_rows(
+        &lock(db),
+        "get_blocks_in_range",
+        &format!(
+            "SELECT {BLOCK_COLS} FROM blocks WHERE number BETWEEN ?1 AND ?2 ORDER BY number DESC"
+        ),
+        params![from, to],
+        row_to_block,
+    )
+}
+
 pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
     query_rows(
         &lock(db),
@@ -663,6 +677,21 @@ pub fn get_transaction(db: &Db, hash: &str) -> Option<Transaction> {
         "get_transaction",
         &format!("SELECT {TX_COLS} FROM transactions WHERE hash=?1"),
         params![hex_blob(hash)],
+        row_to_tx,
+    )
+}
+
+/// Transactions of every block in a range, in block then position order, so a
+/// caller replaying a span groups them itself instead of asking per block.
+pub fn get_transactions_in_range(db: &Db, from: i64, to: i64) -> Vec<Transaction> {
+    query_rows(
+        &lock(db),
+        "get_transactions_in_range",
+        &format!(
+            "SELECT {TX_COLS} FROM transactions WHERE block_number BETWEEN ?1 AND ?2 \
+             ORDER BY block_number, position"
+        ),
+        params![from, to],
         row_to_tx,
     )
 }
