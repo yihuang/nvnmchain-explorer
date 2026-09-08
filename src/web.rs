@@ -1676,9 +1676,8 @@ pub async fn anchoring_namespace_page(
     }
     let namespace = checksummed;
     let page = page_param(&query);
-    // Each row's envelope tag, so a record leaf reads apart from a status leaf without
-    // opening it. Only the tag: naming every field of every row would decode a page of
-    // payloads to show one word each.
+    // Each row's envelope tag, read off its first word: a record leaf reads apart from a
+    // status leaf without decoding either.
     let appends: Vec<Value> = db::get_namespace_appends(&state.db, &namespace, page, PER_PAGE)
         .into_iter()
         .map(|row| {
@@ -1736,9 +1735,8 @@ pub async fn anchoring_leaf_page(
     // A batch's rows never reached the chain one at a time, so it carries no
     // commitment, and nothing hashes to an empty one.
     let self_verifying = is_self_verifying(&append.commitment, &append.metadata);
-    // Named fields when the payload leads with a tag we know, so the page shows the
-    // envelope rather than one run of hex. None for a batch, and for any shape added
-    // since -- the raw bytes stay below either way.
+    // The envelope's fields, named, when the payload leads with a tag we know; the raw
+    // bytes stay on the page either way.
     let envelope = decode_envelope(&append.metadata).map(|(kind, fields)| {
         json!({
             "kind": kind,

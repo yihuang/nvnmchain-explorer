@@ -2,13 +2,13 @@
 //! T10. It keeps the leaf count and the peaks, so its two append events are the
 //! only record of which leaves arrived and what they carried.
 //!
-//! What a payload *means* is deliberately not here: those shapes track a
-//! contract in another repo, so reading them belongs to the decoder that
-//! versions with it (`nvnmchain-anchoring`). `decode_envelope` names the fields
-//! of the two envelopes a registry commits to and stops there -- a convenience
-//! over reading them out of the hex, not a second decoder. A payload is only meaningful with
-//! its namespace beside it — one contract per registry, so the same commitment
-//! under two namespaces is two different records.
+//! What a payload *means* is not read here: those shapes track a contract in
+//! another repo, and reading them belongs to the decoder that versions with it
+//! (`nvnmchain-anchoring`). `decode_envelope` only names the fields of the two
+//! envelopes a registry commits to, so a page shows them rather than one run of
+//! hex. A payload is only meaningful with its namespace beside it — one contract
+//! per registry, so the same commitment under two namespaces is two different
+//! records.
 //!
 //! That split is why the log is ingested here rather than read back from a
 //! general indexer: `metadata` is a dynamic `bytes`, so one decoding it as the
@@ -17,15 +17,10 @@
 
 use crate::decoder::{decode_abi_args, keccak256, keccak_hex, normalize_hex};
 
-/// The fields of the envelopes a registry commits to, under the `bytes32` tag each
-/// leads with.
-///
-/// The module note above says what a payload *means* is not read here, and it still is
-/// not: this only names fields already on the page as one run of hex. What bounds it is
-/// the tag -- wire format an indexer matches on, so a registry that grows a new envelope
-/// falls through to the raw bytes rather than being decoded as the wrong shape. Which
-/// version is current, what a status implies, how versions fold into a record: still the
-/// decoder that versions with the contract.
+/// The envelopes a registry commits to: the `bytes32` tag each leads with, and the
+/// fields behind it, named as `nvnmchain-anchoring` names them. Only the layout: what a
+/// field means, and how versions fold into a record, stays with that decoder. A payload
+/// leading with a tag not listed here falls through to its raw bytes.
 const ENVELOPES: &[(&str, &[(&str, &str)])] = &[
     (
         "record",
@@ -35,7 +30,7 @@ const ENVELOPES: &[(&str, &[(&str, &str)])] = &[
             ("index", "uint256"),
             ("uri", "string"),
             ("checksum", "string"),
-            ("algo", "string"),
+            ("checksum_algo", "string"),
             ("metadata", "string"),
             ("category", "uint8"),
             ("data_pointer", "string"),
@@ -56,44 +51,38 @@ const ENVELOPES: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-/// The tag a payload leads with, as the ASCII an indexer matches on.
-fn kind_tag(raw: &[u8]) -> Option<String> {
+/// The tag `raw` leads with, if it is one of the envelopes': the name, then zeroes to
+/// the end of the word.
+fn tag_of(raw: &[u8]) -> Option<&'static str> {
     let word = raw.get(..32)?;
-    let text: Vec<u8> = word.iter().copied().take_while(|b| *b != 0).collect();
-    let tag = String::from_utf8(text).ok()?;
-    // The rest of the word must be padding, or this is not a tag at all.
-    if tag.is_empty() || !word[tag.len()..].iter().all(|b| *b == 0) {
-        return None;
-    }
-    Some(tag)
+    ENVELOPES.iter().map(|(name, _)| *name).find(|name| {
+        word.starts_with(name.as_bytes()) && word[name.len()..].iter().all(|b| *b == 0)
+    })
 }
 
-/// The envelope tag a payload leads with, if it is one we declare. Cheap enough for a
-/// listing, where naming every field of every row would decode a page of payloads to
-/// show one word each.
-pub fn envelope_kind(metadata: &str) -> Option<String> {
-    let raw = hex::decode(metadata.strip_prefix("0x").unwrap_or(metadata)).ok()?;
-    let tag = kind_tag(&raw)?;
-    ENVELOPES.iter().find(|(name, _)| *name == tag)?;
-    Some(tag)
+/// The envelope tag `metadata` leads with, if any. Reads one word, so a listing labels
+/// every row without decoding a page of payloads.
+pub fn envelope_kind(metadata: &str) -> Option<&'static str> {
+    let hexed = metadata.strip_prefix("0x").unwrap_or(metadata);
+    tag_of(&hex::decode(hexed.get(..64)?).ok()?)
 }
 
-/// One envelope's fields as `(name, value)`, or `None` when the payload does not lead
-/// with a tag this knows -- a batch's payload, an empty one, or a shape added since.
-pub fn decode_envelope(metadata: &str) -> Option<(String, Vec<(String, String)>)> {
+/// An envelope's fields after its tag, named, or `None` for a payload that leads with
+/// no tag the table knows: a batch's, an empty one, a shape added since.
+pub fn decode_envelope(metadata: &str) -> Option<(&'static str, Vec<(&'static str, String)>)> {
     let raw = hex::decode(metadata.strip_prefix("0x").unwrap_or(metadata)).ok()?;
-    let tag = kind_tag(&raw)?;
+    let tag = tag_of(&raw)?;
     let fields = ENVELOPES.iter().find(|(name, _)| *name == tag)?.1;
     let types: Vec<&str> = fields.iter().map(|(_, ty)| *ty).collect();
     let values = decode_abi_args(&types, &raw);
-    // `decode_abi_args` hands back nothing at all when the bytes do not fit the types.
     if values.len() != fields.len() {
-        return None;
+        return None; // the bytes do not fit the layout
     }
     let named = fields
         .iter()
-        .map(|(name, _)| (*name).to_string())
+        .map(|(name, _)| *name)
         .zip(values)
+        .skip(1)
         .collect();
     Some((tag, named))
 }

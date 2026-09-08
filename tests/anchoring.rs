@@ -709,13 +709,12 @@ async fn anchoring_pages_serve_json_and_html() {
     assert_eq!(leaf["append"]["root"], json!(REGISTRY_ROOT));
     assert_eq!(leaf["append"]["metadata"], json!(REGISTRY_METADATA));
     assert_eq!(leaf["index"], json!(0));
-    // `{"v":1}` is not an envelope, so it is not named as one: what a payload *means*
-    // still belongs to the indexer, and only a payload leading with a tag we declare
-    // gets its fields named here.
+    // `{"v":1}` leads with no envelope tag, so nothing is named over it.
     assert!(
         leaf["envelope"].is_null(),
         "a payload that is not an envelope stays raw"
     );
+    assert!(namespace["appends"][0]["kind"].is_null());
     // A record leaf commits to the digest of its envelope, so the explorer can
     // still say whether a payload verifies itself.
     assert_eq!(leaf["self_verifying"], json!(false));
@@ -1002,33 +1001,73 @@ d3165e996779b149cb1746685a0a93977d009dab90c1c914af7eb71e559ac256\
 
 #[test]
 fn an_envelope_decodes_to_its_named_fields() {
-    let (kind, fields) =
-        nvnmchain_explorer::anchoring::decode_envelope(STATUS_ENVELOPE).expect("a status envelope");
+    use nvnmchain_explorer::anchoring::{decode_envelope, envelope_kind};
+    assert_eq!(envelope_kind(STATUS_ENVELOPE), Some("status"));
+    let (kind, fields) = decode_envelope(STATUS_ENVELOPE).expect("a status envelope");
     assert_eq!(kind, "status");
-    let named: Vec<(&str, &str)> = fields
-        .iter()
-        .map(|(n, v)| (n.as_str(), v.as_str()))
-        .collect();
-    assert_eq!(named[0].0, "kind");
-    assert_eq!(named[1].1, "0xd3165e996779b149cb1746685a0a93977d009dab90c1c914af7eb71e559ac256");
-    assert_eq!(named[2], ("index", "1"));
-    assert_eq!(named[3], ("status", "Active"));
-    assert_eq!(named[5], ("seq", "1209169"));
+    let named: Vec<(&str, &str)> = fields.iter().map(|(n, v)| (*n, v.as_str())).collect();
+    assert_eq!(
+        named[0],
+        (
+            "checksum_hash",
+            "0xd3165e996779b149cb1746685a0a93977d009dab90c1c914af7eb71e559ac256"
+        )
+    );
+    assert_eq!(named[1], ("index", "1"));
+    assert_eq!(named[2], ("status", "Active"));
+    assert_eq!(named[4], ("seq", "1209169"));
 }
 
 #[test]
 fn a_payload_without_a_tag_we_know_stays_raw() {
-    // A batch's payload, an empty one, and a shape added since: each falls through
-    // so the page shows the bytes rather than naming the wrong fields over them.
-    for payload in ["0x", "0xdeadbeef", &"0x00".repeat(1) as &str] {
-        assert!(
-            nvnmchain_explorer::anchoring::decode_envelope(payload).is_none(),
-            "{payload} should not decode"
-        );
+    use nvnmchain_explorer::anchoring::{decode_envelope, envelope_kind};
+    // A batch's payload, an empty one, a short one: each falls through, so the page
+    // shows the bytes rather than naming the wrong fields over them.
+    for payload in ["0x", "0xdeadbeef", "0x00"] {
+        assert!(envelope_kind(payload).is_none(), "{payload}");
+        assert!(decode_envelope(payload).is_none(), "{payload}");
     }
     // A well-formed word that spells a tag nothing declares.
     let mut word = b"ballot".to_vec();
     word.resize(32, 0);
     let unknown = format!("0x{}", hex::encode(&word));
-    assert!(nvnmchain_explorer::anchoring::decode_envelope(&unknown).is_none());
+    assert!(envelope_kind(&unknown).is_none());
+    assert!(decode_envelope(&unknown).is_none());
+    // A tag with something after it in the word is not a tag.
+    let mut smudged = word.clone();
+    smudged[6] = 1;
+    assert!(envelope_kind(&format!("0x{}", hex::encode(&smudged))).is_none());
+}
+
+/// The pages name an envelope leaf: the tag on the listing row, the fields on the leaf.
+#[tokio::test]
+async fn an_envelope_leaf_is_named_on_its_pages() {
+    let (_dir, db) = temp_db();
+    index_append(
+        &db,
+        900,
+        leaf_log(
+            REGISTRY,
+            0,
+            REGISTRY_COMMITMENT,
+            REGISTRY_ROOT,
+            STATUS_ENVELOPE,
+        ),
+    );
+    let base = serve_db(db).await;
+    let listing = json_at(format!("{base}/anchoring/{REGISTRY}?format=json")).await;
+    assert_eq!(listing["appends"][0]["kind"], json!("status"));
+    let leaf = json_at(format!("{base}/anchoring/{REGISTRY}/0?format=json")).await;
+    assert_eq!(leaf["envelope"]["kind"], json!("status"));
+    let fields = leaf["envelope"]["fields"].as_array().expect("fields");
+    assert!(
+        fields
+            .iter()
+            .any(|f| f["name"] == "status" && f["value"] == "Active"),
+        "{fields:?}"
+    );
+    assert!(
+        fields.iter().all(|f| f["name"] != "kind"),
+        "the tag is the kind, not a field"
+    );
 }

@@ -56,8 +56,7 @@
             <div class="w-40 px-3 py-3 mono truncate">
                 <a href="/anchoring/{{ namespace }}/{{ row.index }}" class="text-blue-400 hover:text-blue-300">{% if row.leaves == 1 %}#{{ row.index }}{% else %}#{{ row.index }}–{{ row.index + row.leaves - 1 }}{% endif %}</a>
             </div>
-            {# The envelope tag, for the registries whose leaves are envelopes. A batch
-               carries none, and neither does a namespace committing to its own shapes. #}
+            {# The envelope tag; a batch carries none, nor a namespace with its own shapes. #}
             <div class="w-24 px-3 py-3">{% if row.kind %}<span class="badge">{{ row.kind }}</span>{% else %}<span class="text-faint">—</span>{% endif %}</div>
             {# A batch's leaves reach the chain as the roots of subtrees, so it
                has no commitment of its own to show. #}

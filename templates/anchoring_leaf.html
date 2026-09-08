@@ -38,18 +38,17 @@
             <div class="kv-value mono">{{ append.root }}</div>
         </div>
         {% if envelope %}
-        {# The fields the tag says are there. Their meaning still belongs to the decoder
-           linked below; this only saves reading them out of the hex by hand. #}
+        {# The fields the tag says are there; what they mean belongs to the decoder linked below. #}
         <div class="kv-row">
             <div class="kv-label">Envelope</div>
             <div class="kv-value"><span class="badge">{{ envelope.kind }}</span></div>
         </div>
-        {% for field in envelope.fields %}{% if field.name != "kind" %}
+        {% for field in envelope.fields %}
         <div class="kv-row">
             <div class="kv-label text-dim">&nbsp;&nbsp;{{ field.name }}</div>
             <div class="kv-value mono text-xs pre-wrap break-all">{{ field.value }}</div>
         </div>
-        {% endif %}{% endfor %}
+        {% endfor %}
         {% endif %}
         <div class="kv-row">
             <div class="kv-label">{% if envelope %}Metadata (raw){% else %}Metadata{% endif %}</div>
