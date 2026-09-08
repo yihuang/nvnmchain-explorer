@@ -482,6 +482,42 @@ fn a_database_on_the_old_registry_key_is_rekeyed() {
 }
 
 #[test]
+fn a_database_with_single_column_address_indexes_gets_the_composite_ones() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("legacy-indexes.db");
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
+    conn.execute_batch(
+        "DROP INDEX idx_tx_from_block; DROP INDEX idx_tx_to_block;
+         CREATE INDEX idx_tx_from ON transactions(from_addr);
+         CREATE INDEX idx_tx_to ON transactions(to_addr);",
+    )
+    .expect("the indexes an older explorer built");
+    drop(conn);
+
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("reopen");
+    let names: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='index' AND tbl_name='transactions' AND name LIKE 'idx_tx_%'
+             ORDER BY name",
+        )
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(
+        names,
+        [
+            "idx_tx_block_number",
+            "idx_tx_from_block",
+            "idx_tx_timestamp",
+            "idx_tx_to_block"
+        ]
+    );
+}
+
+#[test]
 fn blob_hex_round_trip() {
     // Block with one transaction (so the tx row is exercised too).
     let (_dir, db) = temp_db("blob.db");

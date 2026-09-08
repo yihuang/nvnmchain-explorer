@@ -231,8 +231,15 @@ pub fn init_db(path: &str) -> Result<Connection> {
             created_at INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_tx_block_number ON transactions(block_number);
-        CREATE INDEX IF NOT EXISTS idx_tx_from ON transactions(from_addr);
-        CREATE INDEX IF NOT EXISTS idx_tx_to ON transactions(to_addr);
+        -- (from_addr) and (to_addr) alone made the address page sort every
+        -- transaction the address ever made to serve 25 rows; these hand them
+        -- back in page order. The DROPs migrate databases that predate them.
+        DROP INDEX IF EXISTS idx_tx_from;
+        DROP INDEX IF EXISTS idx_tx_to;
+        CREATE INDEX IF NOT EXISTS idx_tx_from_block
+            ON transactions(from_addr, block_number, position);
+        CREATE INDEX IF NOT EXISTS idx_tx_to_block
+            ON transactions(to_addr, block_number, position);
         CREATE INDEX IF NOT EXISTS idx_tx_timestamp ON transactions(timestamp);
 
         CREATE TABLE IF NOT EXISTS token_metadata (
@@ -727,23 +734,41 @@ pub fn get_recent_transactions(db: &Db, limit: usize) -> Vec<Transaction> {
     )
 }
 
+/// One page of an address's transactions, newest first: by block, then by
+/// position in it.
+///
+/// Two walks, one down each address index and each cut at the page's end, then
+/// merged. `from_addr=? OR to_addr=?` had SQLite fetch every transaction the
+/// address ever made, whole, and sort them to hand back twenty-five. A
+/// transaction to itself sits on both indexes and is read once, as sent.
 pub fn get_address_transactions(
     db: &Db,
     address: &str,
     page: u32,
     per_page: u32,
 ) -> Vec<Transaction> {
+    let (limit, offset) = (i64::from(per_page), page_offset(page, per_page));
     query_rows(
         &lock(db),
         "get_address_transactions",
         &format!(
-            "SELECT {TX_COLS} FROM transactions WHERE from_addr=?1 OR to_addr=?1 \
-             ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
+            "SELECT {TX_COLS} FROM (
+                 SELECT * FROM (SELECT hash AS h, block_number AS b, position AS p
+                                FROM transactions WHERE from_addr=?1
+                                ORDER BY block_number DESC, position DESC LIMIT ?4)
+                 UNION ALL
+                 SELECT * FROM (SELECT hash, block_number, position
+                                FROM transactions WHERE to_addr=?1 AND from_addr<>?1
+                                ORDER BY block_number DESC, position DESC LIMIT ?4)
+                 ORDER BY b DESC, p DESC LIMIT ?2 OFFSET ?3
+             ) page JOIN transactions ON hash = page.h
+             ORDER BY page.b DESC, page.p DESC"
         ),
         params![
             hex_blob(address),
-            per_page as i64,
-            page_offset(page, per_page)
+            limit,
+            offset,
+            limit.saturating_add(offset)
         ],
         row_to_tx,
     )
