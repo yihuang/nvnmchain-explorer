@@ -26,7 +26,7 @@ pub struct Settings {
     pub batch_size: u64,
     /// Max blocks fetched in parallel by the indexer.
     pub index_concurrency: usize,
-    /// The anchoring indexer's UI, when one is deployed. Anchored payloads mean
+    /// The anchoring indexer's UI, when one is deployed. A leaf's payload means
     /// something to an application, not to a chain explorer, so the pages link
     /// out rather than decoding envelopes here.
     pub anchoring_url: Option<String>,

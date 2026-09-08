@@ -490,6 +490,126 @@ async fn an_address_counts_every_transfer_not_just_the_page() {
     );
 }
 
+/// The address page merges what an address sent with what it received, newest
+/// first, and a page boundary neither repeats nor skips a transaction.
+#[test]
+fn an_address_page_merges_sent_and_received_in_block_order() {
+    let (_dir, db) = temp_db("address-order.db");
+    let me = checksum_address(RECIPIENT);
+    let other = checksum_address(TOKEN);
+    // Two blocks, each with: one sent, one received, one to itself, one not its.
+    for (block_number, byte) in [(100, "a1"), (101, "b2")] {
+        let mut block = block();
+        block.number = block_number;
+        block.hash = format!("0x{}", byte.repeat(32));
+        let parties = [(&me, &other), (&other, &me), (&me, &me), (&other, &other)];
+        let txs = parties
+            .iter()
+            .enumerate()
+            .map(|(position, (from, to))| {
+                let hash = format!("0x{}{:02x}", byte.repeat(31), position);
+                let mut tx = transaction(&hash, 1, successful_receipt());
+                tx.block_number = block_number;
+                tx.position = position as i64;
+                tx.from_addr = (*from).clone();
+                tx.to_addr = Some((*to).clone());
+                tx
+            })
+            .collect();
+        let bundle = BlockBundle {
+            block,
+            txs,
+            transfers: Vec::new(),
+            anchored: Vec::new(),
+            tokens: Vec::new(),
+            registries: Vec::new(),
+        };
+        db::save_block_bundle(&db, &bundle).expect("save");
+    }
+
+    let pages: Vec<Vec<(i64, i64)>> = (1..=4)
+        .map(|page| {
+            db::get_address_transactions(&db, &me, page, 2)
+                .iter()
+                .map(|tx| (tx.block_number, tx.position))
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        pages,
+        [
+            vec![(101, 2), (101, 1)],
+            vec![(101, 0), (100, 2)],
+            vec![(100, 1), (100, 0)],
+            vec![],
+        ]
+    );
+    assert_eq!(db::get_address_transaction_count(&db, &me), 6);
+}
+
+/// The transfers tab merges the two sides the same way.
+#[test]
+fn an_address_transfer_page_merges_sent_and_received_in_block_order() {
+    let (_dir, db) = temp_db("transfer-order.db");
+    let me = checksum_address(RECIPIENT);
+    let other = checksum_address(SENDER);
+    for (block_number, byte) in [(100, "a1"), (101, "b2")] {
+        let mut block = block();
+        block.number = block_number;
+        block.hash = format!("0x{}", byte.repeat(32));
+        let parties = [(&me, &other), (&other, &me), (&me, &me), (&other, &other)];
+        let transfers = parties
+            .iter()
+            .enumerate()
+            .map(|(log_index, (from, to))| TransferEvent {
+                id: 0,
+                tx_hash: TX_HASH.into(),
+                block_number,
+                log_index: log_index as i64,
+                token_addr: checksum_address(TOKEN),
+                from_addr: (*from).clone(),
+                to_addr: (*to).clone(),
+                amount: "1".into(),
+                timestamp: 1_700_000_000,
+                created_at: 0,
+            })
+            .collect();
+        let bundle = BlockBundle {
+            block,
+            txs: Vec::new(),
+            transfers,
+            anchored: Vec::new(),
+            tokens: Vec::new(),
+            registries: Vec::new(),
+        };
+        db::save_block_bundle(&db, &bundle).expect("save");
+    }
+
+    let pages: Vec<Vec<(i64, i64)>> = (1..=4)
+        .map(|page| {
+            db::get_address_transfers(&db, &me, page, 2)
+                .iter()
+                .map(|row| {
+                    (
+                        row["block_number"].as_i64().unwrap(),
+                        row["log_index"].as_i64().unwrap(),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        pages,
+        [
+            vec![(101, 2), (101, 1)],
+            vec![(101, 0), (100, 2)],
+            vec![(100, 1), (100, 0)],
+            vec![],
+        ]
+    );
+    assert_eq!(db::get_address_transfer_count(&db, &me), 6);
+}
+
 #[tokio::test]
 async fn a_token_lists_its_holders() {
     let (_dir, base) = serve().await;

@@ -136,19 +136,25 @@ pub struct ContractLabel {
     pub created_at: i64,
 }
 
-/// One `Anchored` log: the commitment `namespace` published under `key`.
-///
-/// The precompile keeps only the head, so this table is the whole history —
-/// `(namespace, key)` by block and log index replays a key.
+/// One append to a namespace's tree: a leaf of its own, or the span a batch
+/// added. The precompile keeps only the tree, never what went into it, so these
+/// rows are the whole record of what built it.
 #[derive(Debug, Clone, Serialize)]
 pub struct AnchoredEvent {
     pub tx_hash: String,
     pub block_number: i64,
     pub log_index: i64,
-    /// The calling address, which is the namespace the commitment lives in.
+    /// The calling address, which is the namespace the leaves live in.
     pub namespace: String,
-    pub key: String,
+    /// Where this append started: the leaf's own index, or a batch's first.
+    pub index: i64,
+    /// How many leaves it added — one, or the batch's size.
+    pub leaves: i64,
+    /// What a single leaf committed to. Empty for a batch, whose leaves reach
+    /// the chain as the roots of subtrees and never one at a time.
     pub commitment: String,
+    /// The MMR root the append left behind.
+    pub root: String,
     /// The emitted payload, never stored on chain (`0x…`).
     pub metadata: String,
     pub timestamp: i64,

@@ -155,9 +155,9 @@ The indexer is built for a sub-second chain:
 | `/address/{addr}` | Address info (transactions, transfers, holdings, contract) |
 | `/token/{addr}` | Token metadata, transfers, and holders |
 | `/tokens` | Token list |
-| `/anchoring` | Namespaces that have anchored, plus the latest commitments |
-| `/anchoring/{namespace}` | A namespace's keys, each at its head commitment |
-| `/anchoring/{namespace}/{key}` | Every revision of one key, newest first |
+| `/anchoring` | Namespaces that have appended, plus the latest appends |
+| `/anchoring/{namespace}` | A namespace's tree, and the appends that built it |
+| `/anchoring/{namespace}/{index}` | One leaf: what it committed to, and the append that put it there |
 | `/search?q=...` | Smart redirect (block#/tx/address/token auto-detection) |
 | `/api/search?q=...` | Suggestions for the search box, answered from the index |
 | `/api/events` | SSE live feed — pushes each newly indexed tip block (drives the home page's streaming "Latest Blocks" panel) |
@@ -197,18 +197,33 @@ talks to no third party.
 
 ### Anchoring
 
-The anchoring pages show the commitment log itself: what was anchored, by whom,
-in what order. The nav entry appears once the chain has anchored something; the
-routes answer either way.
+The precompile keeps one Merkle Mountain Range per caller, never the payloads.
+So these pages show the log that built each tree: which leaves arrived, under
+whom, in what order, and the root each append left. The nav entry appears once
+the chain has appended something; the routes answer either way.
+
+A leaf never moves, so an index has one append and one payload, for good. A
+batch is one row over the span it added and carries no commitment of its own,
+since its leaves reach the chain as the roots of subtrees.
 
 What a payload *means* belongs to the application that wrote it. Set
 `ANCHORING_URL` to whatever reads those envelopes — for the registry ones,
 [nvnmchain-anchoring](https://github.com/mmsqe/nvnmchain-anchoring) `serve` —
-and each key page links out to `{ANCHORING_URL}/registries/{namespace}/records`.
+and a registry's pages link out to its `records` and `roles` there. Only a
+namespace the factory announced gets the link, since anyone may append under
+their own address and the decoder 404s for one it has no registry for.
 
 Set `REGISTRY_FACTORY` to the deployed `RegistryFactory` to label the namespaces
 it deployed with their registry name. Deployments are indexed either way, so
 setting it later needs no re-sync; unset, nothing is trusted as a registry.
+
+One `Registry` is deployed per registry — the precompile partitions by caller,
+so the address *is* the namespace — at an address no table could hold in
+advance. `RegistryDeployed` is what says which addresses are registries, so
+their pages show the `Registry` interface and the factory's shows its own.
+A registry's log decodes here too: records restate what `LeafAppended` already
+carries, and `RoleGranted`/`RoleRevoked` are the whole record of a role, which
+is never a leaf.
 
 ## Indexer
 
