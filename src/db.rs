@@ -141,19 +141,17 @@ pub fn init_db(path: &str) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    // What a long backfill lives or dies by. Every transaction inserted walks five B-trees --
-    // the primary key and four indexes on `transactions` alone -- and once those outgrow the
-    // page cache each walk becomes a disk read. Against a 333k-block chain the 2 MB default
-    // fell from 361 blocks/s to 194 as the database passed 30 GB, and kept falling.
-    // Negative counts KiB rather than pages; `DB_CACHE_KIB` for a machine with less to spare.
+    // Every insert walks the table's B-trees, and once they outgrow the page cache each
+    // walk is a disk read: with the 2 MB default a backfill halved past 30 GB. Negative
+    // counts KiB rather than pages; `DB_CACHE_KIB` for a machine with less to spare.
     let cache_kib: i64 = std::env::var("DB_CACHE_KIB")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(512 * 1024);
     conn.pragma_update(None, "cache_size", -cache_kib)?;
-    // Read pages the cache misses through the page cache of the OS rather than a syscall each.
+    // Misses read through the OS page cache rather than a syscall each.
     conn.pragma_update(None, "mmap_size", 1_i64 << 30)?;
-    // The index builds and ORDER BYs behind the listing pages, off disk.
+    // Sorts and index builds off disk.
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     // A derived table whose shape changed is dropped and refilled by indexing.
     // The blocks go with it: the backfill descends from the lowest block held,
@@ -1427,6 +1425,11 @@ pub fn get_namespace_mmr(db: &Db, namespace: &str) -> (i64, String) {
 ///
 /// Paged like every other listing: nothing bounds how often a namespace
 /// appends, and every row carries its whole metadata payload.
+///
+/// Ordered by `leaf_index`, the order `idx_anchored_ns_leaf` stores, so a page is a
+/// walk down the index and not a sort of every append the namespace made. Leaves are
+/// appended in log order, so it is the block order too; the block columns only break a
+/// tie at one index.
 pub fn get_namespace_appends(
     db: &Db,
     namespace: &str,
@@ -1438,7 +1441,7 @@ pub fn get_namespace_appends(
         "get_namespace_appends",
         &format!(
             "SELECT {ANCHORED_COLS} FROM anchored_events WHERE namespace=?1
-             ORDER BY block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3"
+             ORDER BY leaf_index DESC, block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3"
         ),
         params![
             hex_blob(namespace),
@@ -1449,12 +1452,14 @@ pub fn get_namespace_appends(
     )
 }
 
-/// Appends on record for one namespace, for paging the listing above.
+/// Appends on record for one namespace, for paging the listing above: the summary row
+/// the insert path keeps, not a count over every append the namespace made.
 pub fn count_namespace_appends(db: &Db, namespace: &str) -> i64 {
     query_count(
         &lock(db),
         "count_namespace_appends",
-        "SELECT COUNT(*) FROM anchored_events WHERE namespace=?1",
+        // A subquery, so a namespace with no row answers zero rather than nothing.
+        "SELECT COALESCE((SELECT anchor_count FROM anchored_namespaces WHERE namespace=?1), 0)",
         params![hex_blob(namespace)],
     )
 }

@@ -709,9 +709,12 @@ async fn anchoring_pages_serve_json_and_html() {
     assert_eq!(leaf["append"]["root"], json!(REGISTRY_ROOT));
     assert_eq!(leaf["append"]["metadata"], json!(REGISTRY_METADATA));
     assert_eq!(leaf["index"], json!(0));
+    // `{"v":1}` is not an envelope, so it is not named as one: what a payload *means*
+    // still belongs to the indexer, and only a payload leading with a tag we declare
+    // gets its fields named here.
     assert!(
-        leaf.get("envelope").is_none(),
-        "envelopes belong to the indexer"
+        leaf["envelope"].is_null(),
+        "a payload that is not an envelope stays raw"
     );
     // A record leaf commits to the digest of its envelope, so the explorer can
     // still say whether a payload verifies itself.
@@ -983,4 +986,49 @@ fn the_anchoring_tab_waits_for_the_first_anchor() {
         nav(true).contains(r#"href="/anchoring""#),
         "nav once something is anchored"
     );
+}
+
+/// The real `status` envelope off leaf 2,418,337 of us-nyappdiv on the replayed chain:
+/// the last status the registry wrote, and the shape every status leaf takes.
+const STATUS_ENVELOPE: &str = "0x\
+7374617475730000000000000000000000000000000000000000000000000000\
+d3165e996779b149cb1746685a0a93977d009dab90c1c914af7eb71e559ac256\
+0000000000000000000000000000000000000000000000000000000000000001\
+00000000000000000000000000000000000000000000000000000000000000c0\
+000000000000000000000000327aff2e3880f9b48c434aea1b804b3b5d0d5832\
+0000000000000000000000000000000000000000000000000000000000127351\
+0000000000000000000000000000000000000000000000000000000000000006\
+4163746976650000000000000000000000000000000000000000000000000000";
+
+#[test]
+fn an_envelope_decodes_to_its_named_fields() {
+    let (kind, fields) =
+        nvnmchain_explorer::anchoring::decode_envelope(STATUS_ENVELOPE).expect("a status envelope");
+    assert_eq!(kind, "status");
+    let named: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(named[0].0, "kind");
+    assert_eq!(named[1].1, "0xd3165e996779b149cb1746685a0a93977d009dab90c1c914af7eb71e559ac256");
+    assert_eq!(named[2], ("index", "1"));
+    assert_eq!(named[3], ("status", "Active"));
+    assert_eq!(named[5], ("seq", "1209169"));
+}
+
+#[test]
+fn a_payload_without_a_tag_we_know_stays_raw() {
+    // A batch's payload, an empty one, and a shape added since: each falls through
+    // so the page shows the bytes rather than naming the wrong fields over them.
+    for payload in ["0x", "0xdeadbeef", &"0x00".repeat(1) as &str] {
+        assert!(
+            nvnmchain_explorer::anchoring::decode_envelope(payload).is_none(),
+            "{payload} should not decode"
+        );
+    }
+    // A well-formed word that spells a tag nothing declares.
+    let mut word = b"ballot".to_vec();
+    word.resize(32, 0);
+    let unknown = format!("0x{}", hex::encode(&word));
+    assert!(nvnmchain_explorer::anchoring::decode_envelope(&unknown).is_none());
 }

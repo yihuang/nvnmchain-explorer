@@ -22,7 +22,7 @@ use tera::Tera;
 use tokio::sync::{broadcast, watch};
 use tower_http::cors::CorsLayer;
 
-use crate::anchoring::is_self_verifying;
+use crate::anchoring::{decode_envelope, envelope_kind, is_self_verifying};
 use crate::config::Settings;
 use crate::contracts::{
     abis_for_address, get_contract_name, get_known_token, get_precompile_name, identify_address,
@@ -1676,7 +1676,20 @@ pub async fn anchoring_namespace_page(
     }
     let namespace = checksummed;
     let page = page_param(&query);
-    let appends = db::get_namespace_appends(&state.db, &namespace, page, PER_PAGE);
+    // Each row's envelope tag, so a record leaf reads apart from a status leaf without
+    // opening it. Only the tag: naming every field of every row would decode a page of
+    // payloads to show one word each.
+    let appends: Vec<Value> = db::get_namespace_appends(&state.db, &namespace, page, PER_PAGE)
+        .into_iter()
+        .map(|row| {
+            let kind = envelope_kind(&row.metadata);
+            let mut value = json!(row);
+            if let (Some(object), Some(kind)) = (value.as_object_mut(), kind) {
+                object.insert("kind".into(), json!(kind));
+            }
+            value
+        })
+        .collect();
     // Labelled when the configured factory deployed this namespace.
     let registry = registry_of(&state, &namespace);
     let (leaves, root) = db::get_namespace_mmr(&state.db, &namespace);
@@ -1723,6 +1736,18 @@ pub async fn anchoring_leaf_page(
     // A batch's rows never reached the chain one at a time, so it carries no
     // commitment, and nothing hashes to an empty one.
     let self_verifying = is_self_verifying(&append.commitment, &append.metadata);
+    // Named fields when the payload leads with a tag we know, so the page shows the
+    // envelope rather than one run of hex. None for a batch, and for any shape added
+    // since -- the raw bytes stay below either way.
+    let envelope = decode_envelope(&append.metadata).map(|(kind, fields)| {
+        json!({
+            "kind": kind,
+            "fields": fields
+                .into_iter()
+                .map(|(name, value)| json!({"name": name, "value": value}))
+                .collect::<Vec<_>>(),
+        })
+    });
     let ctx = page_ctx(
         &state,
         json!({
@@ -1730,6 +1755,7 @@ pub async fn anchoring_leaf_page(
             "registry": registry,
             "index": index,
             "self_verifying": self_verifying,
+            "envelope": envelope,
             "append": append,
         }),
     );
