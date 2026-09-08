@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use nvnmchain_explorer::config::Settings;
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::decoder::{checksum_address, keccak256, keccak_hex, TRANSFER_TOPIC};
-use nvnmchain_explorer::models::{Block, BlockBundle, Transaction, TransferEvent};
+use nvnmchain_explorer::models::{
+    Block, BlockBundle, RegistryDeployed, Transaction, TransferEvent,
+};
 use nvnmchain_explorer::signatures;
 use nvnmchain_explorer::tokens::TokenMeta;
 use serde_json::{json, Value};
@@ -23,6 +25,8 @@ const TX_HASH: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const FAILED_TX_HASH: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const UNKNOWN_LOG_TX_HASH: &str =
     "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const REGISTRY_FACTORY: &str = "0x00000000000000000000000000000000000FAC70";
+const REGISTRY: &str = "0x4444444444444444444444444444444444444444";
 
 fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -183,7 +187,17 @@ fn transfer_bundle() -> BlockBundle {
         transfers,
         anchored: Vec::new(),
         tokens: Vec::new(),
-        registries: Vec::new(),
+        // One registry the configured factory deployed, so the search box has
+        // a name to find and somewhere other than an address page to send it.
+        registries: vec![RegistryDeployed {
+            factory: REGISTRY_FACTORY.into(),
+            registry: REGISTRY.into(),
+            creator: SENDER.into(),
+            name: "docs".into(),
+            description: "docs about docs".into(),
+            block_number: 101,
+            created_at: 0,
+        }],
     }
 }
 
@@ -223,6 +237,7 @@ async fn serve() -> (tempfile::TempDir, String) {
     // chain — which would make these tests both slow and non-deterministic.
     cfg.signature_lookup_url = None;
     cfg.rpc_url = "http://127.0.0.1:1".into();
+    cfg.registry_factory = Some(REGISTRY_FACTORY.into());
     let tera = web::build_tera(db.clone()).expect("templates");
     let state = AppState {
         db,
@@ -713,6 +728,15 @@ async fn the_search_box_suggests_what_is_being_typed() {
         json!(format!("/token/{}", checksum_address(TOKEN)))
     );
 
+    // A registry by name, sent to its tree rather than its address page.
+    let registry = suggest(&base, "doc").await;
+    assert_eq!(registry[0]["type"], json!("registry"));
+    assert_eq!(registry[0]["label"], json!("docs"));
+    assert_eq!(
+        registry[0]["url"],
+        json!(format!("/anchoring/{}", checksum_address(REGISTRY)))
+    );
+
     // A precompile by name, which no database row describes. Matched as a
     // substring, so a partial second word still finds it.
     for term in ["fee", "fee man", "manager"] {
@@ -771,9 +795,11 @@ async fn a_virtual_address_is_recognised_in_search() {
 #[tokio::test]
 async fn search_terms_are_never_patterns() {
     let (_dir, base) = serve().await;
-    // Leaked wildcards would make these match pathUSD; escaped, they cannot.
+    // Leaked wildcards would make these match pathUSD or the docs registry;
+    // escaped, they cannot.
     assert!(suggest(&base, "%path%").await.is_empty());
     assert!(suggest(&base, "_ath").await.is_empty());
+    assert!(suggest(&base, "d_cs").await.is_empty());
     assert!(suggest(&base, "' OR 1=1 --").await.is_empty());
     // And one character matches too much to rank at all.
     assert!(suggest(&base, "p").await.is_empty());

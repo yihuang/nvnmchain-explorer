@@ -946,44 +946,54 @@ pub fn get_token_by_symbol_or_name(db: &Db, q: &str) -> Option<TokenMetadata> {
     )
 }
 
-/// Tokens whose symbol or name contains `q`, best matches first: exact symbol,
-/// symbol prefix, name prefix, then the rest. Ranked in SQL so the ordering is
-/// one scan.
-pub fn search_tokens(db: &Db, q: &str, limit: u32) -> Vec<TokenMetadata> {
-    // One character matches too much to rank; two is where a partial name
-    // starts meaning something (the precompile search draws the same line).
-    let q = q.to_lowercase();
+/// A typed search term as the operands a ranked name search binds: the term
+/// itself, then inside `LIKE` patterns matching it anywhere and as a prefix.
+/// Bound, never interpolated, with its own `%`, `_` and `\` escaped, so a
+/// wildcard a reader types is matched as a character rather than as a pattern.
+///
+/// Case is left to the comparison: `LIKE` folds ASCII case on its own and `=`
+/// does under `COLLATE NOCASE`, which is all `lower()` folds too — and
+/// `lower()` copies every name on every row it is asked about, three times
+/// over in a ranked scan.
+///
+/// `None` under two characters: one matches too much to rank, and two is where
+/// a partial name starts meaning something (the precompile search draws the
+/// same line).
+fn search_term(q: &str) -> Option<(String, String, String)> {
     if q.len() < 2 {
-        return Vec::new();
+        return None;
     }
-    // `q` is bound, never interpolated; the wildcards are added here so a
-    // literal `%` a reader types is matched as one rather than as a wildcard.
     let escaped = q
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
+    Some((q.to_string(), format!("%{escaped}%"), format!("{escaped}%")))
+}
+
+/// Tokens whose symbol or name contains `q`, best matches first: exact symbol,
+/// symbol prefix, name prefix, then the rest. Ranked in SQL so the ordering is
+/// one scan.
+pub fn search_tokens(db: &Db, q: &str, limit: u32) -> Vec<TokenMetadata> {
+    let Some((exact, anywhere, prefix)) = search_term(q) else {
+        return Vec::new();
+    };
     query_rows(
         &lock(db),
         "search_tokens",
         &format!(
             "SELECT {TOKEN_COLS} FROM token_metadata
-             WHERE lower(symbol) LIKE ?2 ESCAPE '\\' OR lower(name) LIKE ?2 ESCAPE '\\'
+             WHERE symbol LIKE ?2 ESCAPE '\\' OR name LIKE ?2 ESCAPE '\\'
              ORDER BY
                  CASE
-                     WHEN lower(symbol) = ?1 THEN 0
-                     WHEN lower(symbol) LIKE ?3 ESCAPE '\\' THEN 1
-                     WHEN lower(name) LIKE ?3 ESCAPE '\\' THEN 2
+                     WHEN symbol = ?1 COLLATE NOCASE THEN 0
+                     WHEN symbol LIKE ?3 ESCAPE '\\' THEN 1
+                     WHEN name LIKE ?3 ESCAPE '\\' THEN 2
                      ELSE 3
                  END,
                  holder_count DESC, symbol
              LIMIT ?4"
         ),
-        params![
-            q,
-            format!("%{escaped}%"),
-            format!("{escaped}%"),
-            limit as i64,
-        ],
+        params![exact, anywhere, prefix, limit as i64],
         row_to_token,
     )
 }
@@ -1460,6 +1470,35 @@ pub fn get_anchored_namespaces(
                 "last_timestamp": r.get::<_, i64>(4)?,
             }))
         },
+    )
+}
+
+/// `factory`'s registries whose name contains `q`, as `(address, name)`: exact
+/// first, then prefix, then anywhere, the way [`search_tokens`] ranks.
+///
+/// A registry's address is derived at deployment, so the same corpus loaded onto
+/// two chains gives the same names at different addresses. The name is the only
+/// identifier a reader carries between them, which is why it is worth searching.
+/// Trusting one factory for it is the rule [`get_registry`] applies.
+pub fn search_registries(db: &Db, q: &str, factory: &str, limit: u32) -> Vec<(String, String)> {
+    let Some((exact, anywhere, prefix)) = search_term(q) else {
+        return Vec::new();
+    };
+    query_rows(
+        &lock(db),
+        "search_registries",
+        "SELECT address, name FROM registries
+         WHERE factory = ?4 AND name LIKE ?2 ESCAPE '\\'
+         ORDER BY
+             CASE
+                 WHEN name = ?1 COLLATE NOCASE THEN 0
+                 WHEN name LIKE ?3 ESCAPE '\\' THEN 1
+                 ELSE 2
+             END,
+             name
+         LIMIT ?5",
+        params![exact, anywhere, prefix, hex_blob(factory), limit as i64],
+        |r| Ok((blob_addr(&r.get::<_, Vec<u8>>(0)?), r.get::<_, String>(1)?)),
     )
 }
 

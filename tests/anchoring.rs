@@ -577,6 +577,67 @@ fn a_deployment_labels_its_namespace_for_the_configured_factory_only() {
     assert!(db::get_registry(&db, &other, REGISTRY).is_none());
 }
 
+/// A registry is found by its name, the one identifier that survives a move
+/// between chains: exact before prefix before anywhere, in any case, with a
+/// wildcard a reader types matching itself. Only under the factory that
+/// deployed it — the same trust rule as the listing's label.
+#[test]
+fn a_registry_is_found_by_name_under_its_factory_only() {
+    let (_dir, db) = temp_db();
+    let block = test_block(400);
+    let tx = test_tx(&block);
+    let other = format!("0x{}", "44".repeat(20));
+    let at = |byte: &str| format!("0x{}", byte.repeat(20));
+    // Four names that match `docs` in every way the ranking tells apart — the
+    // anywhere match sorts first alphabetically, so rank must beat name — and
+    // a fifth that would rank as a prefix, were another factory's word taken.
+    let deployed = [
+        (FACTORY, at("11"), "a-docs"),
+        (FACTORY, REGISTRY.to_string(), "docs"),
+        (FACTORY, at("22"), "docs-index"),
+        (FACTORY, at("55"), "old_docs"),
+        (other.as_str(), at("66"), "docs-elsewhere"),
+    ];
+    let registries = deployed
+        .iter()
+        .map(|(factory, registry, name)| {
+            deployment_from_log(&registry_deployed_log(factory, registry, name), &tx)
+        })
+        .collect();
+    let bundle = BlockBundle {
+        block,
+        txs: vec![tx],
+        transfers: vec![],
+        anchored: vec![],
+        tokens: vec![],
+        registries,
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
+
+    let names = |q: &str, factory: &str| -> Vec<String> {
+        db::search_registries(&db, q, factory, 8)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    };
+    let ranked = ["docs", "docs-index", "a-docs", "old_docs"];
+    assert_eq!(names("docs", FACTORY), ranked);
+    assert_eq!(names("DOCS", FACTORY), ranked);
+    // The address beside the name is the one the anchoring page is keyed on.
+    assert_eq!(
+        db::search_registries(&db, "docs", FACTORY, 1),
+        [(REGISTRY.to_string(), "docs".to_string())]
+    );
+    // A wildcard is a character: the `_` typed finds the `_` stored and nothing
+    // else. One character is too short to rank at all.
+    assert_eq!(names("old_docs", FACTORY), ["old_docs"]);
+    assert!(names("d_cs", FACTORY).is_empty());
+    assert!(names("%docs%", FACTORY).is_empty());
+    assert!(names("d", FACTORY).is_empty());
+    // Another factory's word is not taken.
+    assert_eq!(names("docs", &other), ["docs-elsewhere"]);
+}
+
 #[test]
 fn an_impostors_deployment_cannot_unlabel_a_registry() {
     // RegistryDeployed is recorded from whoever emits it, so a contract can

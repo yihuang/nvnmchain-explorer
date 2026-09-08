@@ -1967,6 +1967,21 @@ pub async fn search_suggest(
                 format!("{} · {}", meta.symbol, truncate_hash(&meta.address, 8, 6)),
             ));
         }
+        // A registry goes to its anchoring page, not its address page: the tree is
+        // what a reader came for, and the address differs from chain to chain while
+        // the name does not. With no factory configured there are no registries.
+        if let Some(factory) = state.cfg.registry_factory.as_deref() {
+            for (address, name) in
+                db::search_registries(&state.db, q, factory, SUGGESTION_LIMIT as u32)
+            {
+                results.push(suggestion(
+                    "registry",
+                    format!("/anchoring/{address}"),
+                    name,
+                    truncate_hash(&address, 8, 6),
+                ));
+            }
+        }
         for (address, name) in search_named(q, SUGGESTION_LIMIT) {
             results.push(suggestion(
                 "precompile",
