@@ -510,6 +510,18 @@ impl DecodedCall {
     }
 }
 
+impl DecodedEvent {
+    /// One argument by the name the ABI gives it. A foreign contract may emit
+    /// anything under a known `topic0`, so a declared argument can still be
+    /// absent — the caller decides what that means.
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.value.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ABI type parsing + decoding (ethers-core / ethabi)
 // ---------------------------------------------------------------------------
@@ -1025,25 +1037,15 @@ pub fn extract_balance_changes(receipt: &Value, tx: &Transaction) -> Vec<Value> 
                 // looked up by that spelling.
                 let token =
                     checksum_address(log.get("address").and_then(Value::as_str).unwrap_or(""));
-                let mut from = String::new();
-                let mut to = String::new();
-                let mut amount = String::new();
-                for p in &decoded.params {
-                    match p.name.as_str() {
-                        "from" => from = p.value.clone(),
-                        "to" => to = p.value.clone(),
-                        "amount" => amount = p.value.clone(),
-                        _ => {}
-                    }
-                }
+                let amount = decoded.param("amount").unwrap_or_default();
                 changes.push(json!({
-                    "address": from,
+                    "address": decoded.param("from").unwrap_or_default(),
                     "token": token,
                     "change": format!("-{amount}"),
                     "is_fee": false,
                 }));
                 changes.push(json!({
-                    "address": to,
+                    "address": decoded.param("to").unwrap_or_default(),
                     "token": token,
                     "change": format!("+{amount}"),
                     "is_fee": false,

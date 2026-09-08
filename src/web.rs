@@ -133,12 +133,18 @@ fn page_ctx_for(
     map.insert("query".into(), json!(""));
     // From the stats blob, so the nav's anchoring gate costs no query.
     map.insert("has_anchors".into(), json!(has_anchors(state)));
+    merge_into(&mut map, extra);
+    Value::Object(map)
+}
+
+/// Fold one JSON object's keys into another, the incoming ones winning. A
+/// non-object contributes nothing; every context merged here is a `json!({…})`.
+fn merge_into(map: &mut serde_json::Map<String, Value>, extra: Value) {
     if let Value::Object(o) = extra {
         for (k, v) in o {
             map.insert(k, v);
         }
     }
-    Value::Object(map)
 }
 
 /// Whether the chain has ever anchored, which is all the nav needs to know.
@@ -754,6 +760,8 @@ pub async fn home(
             "stats": stats,
             "recent_blocks": recent_blocks,
             "recent_txs": recent_txs,
+            "recent_block_count": state.cfg.recent_block_count,
+            "recent_tx_count": state.cfg.recent_tx_count,
             "latest_num": latest_num,
             "chain_head": chain_head,
             "indexed_display": comma_num(indexed_count),
@@ -873,15 +881,19 @@ async fn sse_step(
                     .unwrap_or(state.last_num);
                 let start = state.last_num + 1;
                 let end = tip.min(start + SSE_MAX_REPLAY as i64 - 1);
-                for num in start..=end.max(start - 1) {
-                    if let Some(b) = db::get_block_by_number(&state.db, num) {
-                        let txs = db::get_block_transactions(&state.db, num);
-                        state.pending.push_back(crate::models::block_event_json(
-                            &b,
-                            &txs,
-                            crate::models::STREAM_TX_CAP,
-                        ));
-                    }
+                // Two range queries for the whole span, not two per height: a
+                // client that fell far behind replays up to `SSE_MAX_REPLAY`.
+                let blocks = db::get_blocks_in_range(&state.db, start, end);
+                let txs = db::get_transactions_in_range(&state.db, start, end);
+                // Oldest first, since the writer emits in number order.
+                for block in blocks.into_iter().rev() {
+                    let first = txs.partition_point(|t| t.block_number < block.number);
+                    let past = txs.partition_point(|t| t.block_number <= block.number);
+                    state.pending.push_back(crate::models::block_event_json(
+                        &block,
+                        &txs[first..past],
+                        crate::models::STREAM_TX_CAP,
+                    ));
                 }
                 state.last_num = state.last_num.max(end);
                 if let Some(v) = state.pending.pop_front() {
@@ -941,6 +953,12 @@ pub async fn block_page(
         })
         .collect();
     let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
+    // Looked up rather than inferred from the tip: the index has gaps while it
+    // backfills, so a number below the tip is not necessarily there to link to.
+    let neighbour = |n: i64| db::get_block_by_number(&state.db, n).map(|b| b.number);
+    let previous = (block.number > 0)
+        .then(|| neighbour(block.number - 1))
+        .flatten();
     let ctx = page_ctx(
         &state,
         json!({
@@ -949,6 +967,8 @@ pub async fn block_page(
             "gas_pct": gas_pct,
             "base_fee_gwei": format_token_amount(&block.base_fee, 9),
             "burnt_fees": burnt,
+            "previous_block": previous,
+            "next_block": neighbour(block.number + 1),
         }),
     );
     html_or_json(&state, &headers, &query, "block.html", &ctx)
@@ -966,18 +986,17 @@ pub async fn blocks_page(
     let latest = db::get_latest_block(&state.db);
     let latest_num = latest.as_ref().map(|b| b.number).unwrap_or(0);
     let end = from.unwrap_or_else(|| (latest_num - (page - 1) * per_page).max(0));
-
-    let mut blocks: Vec<Value> = Vec::new();
-    let mut i = end;
-    while i > end - per_page && i >= 0 {
-        if let Some(b) = db::get_block_by_number(&state.db, i) {
-            let pct = block_pct(b.gas_used, b.gas_limit);
+    let start = (end - per_page + 1).max(0);
+    // One range query: the listing shows whichever of these heights are indexed.
+    let blocks: Vec<Value> = db::get_blocks_in_range(&state.db, start, end)
+        .into_iter()
+        .map(|b| {
+            let gas_pct = block_pct(b.gas_used, b.gas_limit);
             let mut v = serde_json::to_value(b).unwrap_or(Value::Null);
-            v["gas_pct"] = json!(pct);
-            blocks.push(v);
-        }
-        i -= 1;
-    }
+            v["gas_pct"] = json!(gas_pct);
+            v
+        })
+        .collect();
 
     let ctx = page_ctx_for(
         &state,
@@ -1062,6 +1081,211 @@ async fn fetch_missing_trace(
     Some(flat)
 }
 
+/// The one call a transaction made, built from the transaction itself. Stands
+/// in when there is neither a trace nor a `calls` array, so the page always
+/// has a call tree to render.
+fn top_level_call(tx: &crate::models::Transaction) -> Value {
+    json!({
+        "depth": 0,
+        "type": "CALL",
+        "to": tx.to_addr.clone(),
+        "from": tx.from_addr.clone(),
+        "data": tx.input.clone(),
+        "decoded": decode_function_call(&tx.input).map(|d| d.to_json()).unwrap_or(Value::Null),
+        "gas": "0",
+        "gas_used": "0",
+        "children": [],
+    })
+}
+
+/// Attach `symbol`, `formatted` and `positive` to balance-change rows.
+///
+/// Every row gets all three whether or not its token is known: Tera errors on a
+/// missing map key, so one unknown token would take the page down.
+fn enrich_balance_changes(state: &AppState, changes: &mut [Value]) {
+    let mut token_addrs: Vec<String> = changes
+        .iter()
+        .filter_map(|c| c.get("token").and_then(Value::as_str).map(String::from))
+        .filter(|a| !a.is_empty())
+        .collect();
+    token_addrs.dedup();
+    let metas = db::get_tokens_metadata(&state.db, &token_addrs);
+
+    for change in changes.iter_mut() {
+        let raw = change
+            .get("change")
+            .and_then(Value::as_str)
+            .unwrap_or("0")
+            .to_string();
+        let display = change
+            .get("token")
+            .and_then(Value::as_str)
+            .and_then(|token| metas.get(token))
+            .map(|meta| (meta.symbol.clone(), meta.decimals));
+        // What an unknown token's row shows instead: the raw signed integer.
+        let unformatted = change.get("change").cloned().unwrap_or_else(|| json!(""));
+        let Some(row) = change.as_object_mut() else {
+            continue;
+        };
+        if let Some((symbol, decimals)) = display {
+            let (sign, amount) = raw
+                .strip_prefix('+')
+                .map(|a| ("+", a))
+                .or_else(|| raw.strip_prefix('-').map(|a| ("-", a)))
+                .unwrap_or(("", raw.as_str()));
+            row.insert("symbol".into(), json!(symbol));
+            row.insert(
+                "formatted".into(),
+                json!(format!("{sign}{}", format_token_amount(amount, decimals))),
+            );
+        }
+        row.insert("positive".into(), json!(raw.starts_with('+')));
+        row.entry("symbol").or_insert_with(|| json!(""));
+        row.entry("formatted").or_insert(unformatted);
+    }
+}
+
+/// Mark the replayed top-level calls with what the replay said about each.
+/// Outcomes are in `calls` order, skipping calls with no destination — exactly
+/// the order [`replay_tx_calls`] batched them in — and every call after the one
+/// that reverted never executed.
+fn apply_replay_outcomes(calls: &mut [Value], outcomes: &[Option<String>]) {
+    let mut outcomes = outcomes.iter();
+    for call in calls.iter_mut() {
+        if call.get("depth").and_then(Value::as_i64) != Some(0) {
+            continue;
+        }
+        if call
+            .get("to")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+        {
+            continue;
+        }
+        let Some(outcome) = outcomes.next() else {
+            break;
+        };
+        match outcome {
+            Some(err) => {
+                call["status"] = json!("failed");
+                call["error"] = json!(err);
+                break;
+            }
+            None => call["status"] = json!("success"),
+        }
+    }
+}
+
+/// Decide what each call did, and — when the transaction failed — why.
+///
+/// A trace-based chain carries the error on the failing trace node; a
+/// tempo-style one records nothing, so the calls are replayed with one batched
+/// `eth_call` to find which of them reverted. Best-effort throughout: an RPC
+/// hiccup costs the page its per-call badges, not the page.
+///
+/// Returns the reason to show, which the replay may be the only source of.
+async fn resolve_call_statuses(
+    state: &AppState,
+    tx: &crate::models::Transaction,
+    calls: &mut [Value],
+    mut fail_reason: Option<String>,
+) -> Option<String> {
+    if tx.status == 0 {
+        if fail_reason.is_none() {
+            fail_reason = calls
+                .iter()
+                .find_map(|c| c.get("error").and_then(Value::as_str))
+                .map(String::from);
+        }
+        if fail_reason.is_none() {
+            let outcomes = replay_tx_calls(&state.rpc, tx).await;
+            fail_reason = outcomes.iter().find_map(|o| o.clone());
+            apply_replay_outcomes(calls, &outcomes);
+        }
+    } else if calls
+        .iter()
+        .filter(|c| c.get("depth").and_then(Value::as_i64) == Some(0))
+        .count()
+        == 1
+    {
+        // Successful tx on an atomic chain: a lone top-level call executed.
+        calls[0]["status"] = json!("success");
+    }
+    // A synthetic fallback call (no per-call data at all) mirrors the tx result.
+    if let Some(first) = calls.first_mut() {
+        if first.get("status").is_none() {
+            first["status"] = json!(if tx.status == 1 { "success" } else { "failed" });
+            if tx.status == 0 {
+                if let Some(reason) = &fail_reason {
+                    first["error"] = json!(reason);
+                }
+            }
+        }
+    }
+    fail_reason
+}
+
+/// The gas, fee and identity fields of a transaction, as context keys.
+///
+/// All of it is parsed from the canonical RLP encoding at render time rather
+/// than stored per column, so this is where the transaction page pays for the
+/// columns the schema does not carry.
+fn gas_and_fee_ctx(
+    state: &AppState,
+    tx: &crate::models::Transaction,
+    receipt: Option<&Value>,
+) -> Value {
+    let parsed = tx
+        .raw
+        .as_deref()
+        .map(crate::decoder::parse_raw_tx)
+        .unwrap_or_default();
+    let gas_price = receipt
+        .and_then(|r| r.get("effectiveGasPrice").and_then(Value::as_str))
+        .map(parse_hex_i64)
+        .unwrap_or(0);
+    let gas_used = tx.gas_used;
+    let gas_limit = parsed.gas_limit.unwrap_or(0);
+    let tx_type = parsed.tx_type.unwrap_or(0x76);
+    let method_id = parsed
+        .calls
+        .first()
+        .and_then(|c| c.get("data").and_then(Value::as_str))
+        .and_then(|d| d.strip_prefix("0x"))
+        .filter(|h| h.len() >= 8)
+        .map(|h| format!("0x{}", &h[..8]))
+        .unwrap_or_else(|| "0x".into());
+    let gas_pct = if gas_limit > 0 {
+        format!("{:.2}", gas_used as f64 / gas_limit as f64 * 100.0)
+    } else {
+        String::new()
+    };
+    let fee_token_meta = tx
+        .fee_token
+        .as_deref()
+        .and_then(|f| db::get_token_metadata(&state.db, f));
+    let fee_breakdown = fee_breakdown(tx, gas_used, gas_price, fee_token_meta.as_ref());
+    json!({
+        "gas_price": gas_price,
+        "gas_used": gas_used,
+        "gas_limit": gas_limit,
+        "gas_pct": gas_pct,
+        "max_fee": parsed.max_fee_per_gas.unwrap_or(0),
+        "max_priority": parsed.max_priority_fee_per_gas.unwrap_or(0),
+        "base_fee": parse_hex_i64(&tx.base_fee),
+        "tx_type": tx_type,
+        "tx_type_hex": format!("{tx_type:02x}"),
+        "nonce": parsed.nonce.unwrap_or(0),
+        "nonce_key": parsed.nonce_key,
+        "method_id": method_id,
+        "fee_token": tx.fee_token,
+        "fee_amount": tx.fee_amount,
+        "fee_breakdown": fee_breakdown,
+        "fee_token_meta": fee_token_meta,
+    })
+}
+
 pub async fn tx_page(
     State(state): State<AppState>,
     Path(tx_hash): Path<String>,
@@ -1101,17 +1325,14 @@ pub async fn tx_page(
 
     let mut calls = extract_calls(&tx, trace.as_deref().unwrap_or(&[]));
     if calls.is_empty() {
-        calls.push(json!({
-            "depth": 0,
-            "type": "CALL",
-            "to": tx.to_addr.clone(),
-            "from": tx.from_addr.clone(),
-            "data": tx.input.clone(),
-            "decoded": decode_function_call(&tx.input).map(|d| d.to_json()).unwrap_or(Value::Null),
-            "gas": "0",
-            "gas_used": "0",
-            "children": [],
-        }));
+        calls.push(top_level_call(&tx));
+    }
+    // Name the calls no built-in ABI explains, from the signature directory.
+    name_unknown_calls(&state, &mut calls).await;
+    // Indent each call by depth for the tree view.
+    for call in calls.iter_mut() {
+        let depth = call.get("depth").and_then(Value::as_i64).unwrap_or(0);
+        call["indent"] = json!(depth * 20);
     }
 
     let decoded_events: Vec<DecodedEvent> = receipt
@@ -1125,64 +1346,7 @@ pub async fn tx_page(
         .as_ref()
         .map(|r| extract_balance_changes(r, &tx))
         .unwrap_or_default();
-    // Attach symbol + formatted amount to token balance changes.
-    {
-        let mut token_addrs: Vec<String> = balance_changes
-            .iter()
-            .filter_map(|c| c.get("token").and_then(Value::as_str).map(String::from))
-            .filter(|a| !a.is_empty())
-            .collect();
-        token_addrs.dedup();
-        let metas = db::get_tokens_metadata(&state.db, &token_addrs);
-        for c in balance_changes.iter_mut() {
-            let Some(token) = c.get("token").and_then(Value::as_str) else {
-                continue;
-            };
-            if let Some(m) = metas.get(token) {
-                let raw = c
-                    .get("change")
-                    .and_then(Value::as_str)
-                    .unwrap_or("0")
-                    .to_string();
-                let (sign, amt) = raw
-                    .strip_prefix('+')
-                    .map(|a| ("+", a))
-                    .or_else(|| raw.strip_prefix('-').map(|a| ("-", a)))
-                    .unwrap_or(("", raw.as_str()));
-                c["symbol"] = json!(m.symbol);
-                c["formatted"] = json!(format!("{sign}{}", format_token_amount(amt, m.decimals)));
-            }
-        }
-    }
-    for change in balance_changes.iter_mut() {
-        let positive = change
-            .get("change")
-            .and_then(Value::as_str)
-            .map(|c| c.starts_with('+'))
-            .unwrap_or(false);
-        change["positive"] = json!(positive);
-        // Ensure every row has display keys (Tera errors on missing map keys).
-        change
-            .as_object_mut()
-            .expect("balance change is an object")
-            .entry("symbol")
-            .or_insert_with(|| json!(""));
-        let default_formatted = change.get("change").cloned().unwrap_or_else(|| json!(""));
-        change
-            .as_object_mut()
-            .expect("balance change is an object")
-            .entry("formatted")
-            .or_insert(default_formatted);
-    }
-
-    // Name the calls no built-in ABI explains, from the signature directory.
-    name_unknown_calls(&state, &mut calls).await;
-
-    // Indent each call by depth for the tree view.
-    for call in calls.iter_mut() {
-        let depth = call.get("depth").and_then(Value::as_i64).unwrap_or(0);
-        call["indent"] = json!(depth * 20);
-    }
+    enrich_balance_changes(&state, &mut balance_changes);
 
     // Metadata for every token the page mentions, so amounts read in the
     // token's own units rather than as raw integers. One batched query.
@@ -1194,46 +1358,6 @@ pub async fn tx_page(
             .chain(tx.fee_token.clone()),
     );
 
-    // Gas/fee/identity fields are parsed from the canonical RLP encoding at
-    // runtime rather than stored per column.
-    let parsed = tx
-        .raw
-        .as_deref()
-        .map(crate::decoder::parse_raw_tx)
-        .unwrap_or_default();
-    let gas_price = receipt
-        .as_ref()
-        .and_then(|r| r.get("effectiveGasPrice").and_then(Value::as_str))
-        .map(parse_hex_i64)
-        .unwrap_or(0);
-    let gas_used = tx.gas_used;
-    let gas_limit = parsed.gas_limit.unwrap_or(0);
-    let max_fee = parsed.max_fee_per_gas.unwrap_or(0);
-    let max_priority = parsed.max_priority_fee_per_gas.unwrap_or(0);
-    let base_fee = parse_hex_i64(&tx.base_fee);
-    let tx_type = parsed.tx_type.unwrap_or(0x76);
-    let nonce = parsed.nonce.unwrap_or(0);
-    let nonce_key = parsed.nonce_key;
-    let method_id = parsed
-        .calls
-        .first()
-        .and_then(|c| c.get("data").and_then(Value::as_str))
-        .and_then(|d| d.strip_prefix("0x"))
-        .filter(|h| h.len() >= 8)
-        .map(|h| format!("0x{}", &h[..8]))
-        .unwrap_or_else(|| "0x".into());
-    let fee_token = tx.fee_token.clone();
-    let fee_amount = tx.fee_amount.clone();
-    let fee_token_meta = fee_token
-        .as_deref()
-        .and_then(|f| db::get_token_metadata(&state.db, f));
-
-    let gas_pct = if gas_limit > 0 {
-        format!("{:.2}", gas_used as f64 / gas_limit as f64 * 100.0)
-    } else {
-        String::new()
-    };
-    let tx_type_hex = format!("{tx_type:02x}");
     let mut method = tx_method_badge(&tx.input);
     if method.is_none() {
         // Tempo-style txs have no top-level input; badge from the first call.
@@ -1243,81 +1367,8 @@ pub async fn tx_page(
             .and_then(tx_method_badge);
     }
 
-    let (fee_payer, signature_type, mut fail_reason) = tx_extras(&tx, receipt.as_ref());
-
-    // Per-call status. Trace-based chains carry the error on the failed trace
-    // node; tempo-style chains record nothing, so replay the calls with one
-    // batched eth_call to find which one reverted. Best-effort: any RPC
-    // hiccup degrades to the generic Failed badge.
-    if tx.status == 0 {
-        if fail_reason.is_none() {
-            if let Some(err) = calls
-                .iter()
-                .find_map(|c| c.get("error").and_then(Value::as_str))
-            {
-                fail_reason = Some(err.to_string());
-            }
-        }
-        if fail_reason.is_none() {
-            let outcomes = replay_tx_calls(&state.rpc, &tx).await;
-            fail_reason = outcomes.iter().find_map(|o| o.clone());
-            if !outcomes.is_empty() {
-                let mut k = 0;
-                let mut seen_failure = false;
-                for call in calls.iter_mut() {
-                    if call.get("depth").and_then(Value::as_i64) != Some(0) {
-                        continue;
-                    }
-                    if call
-                        .get("to")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .is_empty()
-                    {
-                        continue;
-                    }
-                    if k >= outcomes.len() {
-                        break;
-                    }
-                    // Calls after the reverting one never executed.
-                    if seen_failure {
-                        break;
-                    }
-                    match &outcomes[k] {
-                        Some(err) => {
-                            call["status"] = json!("failed");
-                            call["error"] = json!(err);
-                            seen_failure = true;
-                        }
-                        None => {
-                            call["status"] = json!("success");
-                        }
-                    }
-                    k += 1;
-                }
-            }
-        }
-    } else {
-        // Successful tx on an atomic chain: a lone top-level call executed.
-        let top_level: Vec<&Value> = calls
-            .iter()
-            .filter(|c| c.get("depth").and_then(Value::as_i64) == Some(0))
-            .collect();
-        if top_level.len() == 1 {
-            calls[0]["status"] = json!("success");
-        }
-    }
-    // Synthetic fallback call (no data at all) mirrors the tx result.
-    if let Some(first) = calls.first_mut() {
-        if first.get("status").is_none() {
-            first["status"] = json!(if tx.status == 1 { "success" } else { "failed" });
-            if tx.status == 0 {
-                if let Some(r) = &fail_reason {
-                    first["error"] = json!(r);
-                }
-            }
-        }
-    }
+    let (fee_payer, signature_type, fail_reason) = tx_extras(&tx, receipt.as_ref());
+    let fail_reason = resolve_call_statuses(&state, &tx, &mut calls, fail_reason).await;
     decode_call_reverts(&mut calls);
 
     let failed_calls = calls
@@ -1344,8 +1395,10 @@ pub async fn tx_page(
         })
         .collect();
 
-    let ctx = page_ctx(
-        &state,
+    let mut extra = serde_json::Map::new();
+    merge_into(&mut extra, gas_and_fee_ctx(&state, &tx, receipt.as_ref()));
+    merge_into(
+        &mut extra,
         json!({
             "tx": tx,
             "block": block,
@@ -1355,31 +1408,16 @@ pub async fn tx_page(
             "events": events,
             "summary": summary,
             "known_events": known,
-            "fee_breakdown": fee_breakdown(&tx, gas_used, gas_price, fee_token_meta.as_ref()),
             "balance_changes": balance_changes,
             "fee_payer": fee_payer,
             "signature_type": signature_type,
             "fail_reason": fail_reason,
             "failed_calls": failed_calls,
-            "gas_price": gas_price,
-            "gas_used": gas_used,
-            "gas_limit": gas_limit,
-            "max_fee": max_fee,
-            "max_priority": max_priority,
-            "base_fee": base_fee,
-            "tx_type": tx_type,
-            "tx_type_hex": tx_type_hex,
-            "nonce": nonce,
-            "nonce_key": nonce_key,
-            "method_id": method_id,
-            "gas_pct": gas_pct,
-            "fee_token": fee_token,
-            "fee_amount": fee_amount,
-            "fee_token_meta": fee_token_meta,
             "method": method,
             "active_tab": query.get("tab").cloned().unwrap_or_else(|| "overview".into()),
         }),
     );
+    let ctx = page_ctx(&state, Value::Object(extra));
     html_or_json(&state, &headers, &query, "tx.html", &ctx)
 }
 
@@ -1760,6 +1798,47 @@ pub async fn anchoring_leaf_page(
     html_or_json(&state, &headers, &query, "anchoring_leaf.html", &ctx)
 }
 
+/// One destination the search box can send the reader to.
+fn destination(kind: &str, id: &str, url: String) -> Value {
+    json!({ "type": kind, "id": id, "url": url })
+}
+
+/// Where `q` should land, or `None` when nothing on the chain answers to it.
+///
+/// The candidates are tried in the order a reader means them. A block hash and
+/// a transaction hash are the same shape, so only asking the index tells them
+/// apart — and an address is answered whether or not anything has touched it,
+/// since being told "no transactions" beats being told "not found".
+fn resolve_search(db: &Db, q: &str) -> Option<Value> {
+    let block = |number: i64| destination("block", &number.to_string(), format!("/block/{number}"));
+    let token = |meta: crate::models::TokenMetadata| {
+        destination("token", &meta.address, format!("/token/{}", meta.address))
+    };
+    // Digits only, so `parse` cannot take a sign the reader did not type.
+    let height = (!q.is_empty() && q.chars().all(|c| c.is_ascii_digit()))
+        .then(|| q.parse::<i64>().ok())
+        .flatten();
+
+    height
+        .filter(|n| db::get_block_by_number(db, *n).is_some())
+        // Spelled as the reader typed it, leading zeros and all.
+        .map(|_| destination("block", q, format!("/block/{q}")))
+        .or_else(|| {
+            db::get_transaction(db, q).map(|_| destination("transaction", q, format!("/tx/{q}")))
+        })
+        .or_else(|| db::get_block_by_hash(db, q).map(|b| block(b.number)))
+        .or_else(|| {
+            let checksummed = checksum_address(q);
+            is_valid_address(&checksummed)
+                .then(|| destination("address", &checksummed, format!("/address/{checksummed}")))
+        })
+        .or_else(|| db::get_token_metadata(db, q).map(token))
+        // Exact symbol or name first, then the best partial match — so pressing
+        // Enter lands where the suggestions said it would.
+        .or_else(|| db::get_token_by_symbol_or_name(db, q).map(token))
+        .or_else(|| db::search_tokens(db, q, 1).into_iter().next().map(token))
+}
+
 pub async fn search_page(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1774,58 +1853,7 @@ pub async fn search_page(
         return Redirect::to("/").into_response();
     }
 
-    let mut found: Option<Value> = None;
-    if q.chars().all(|c| c.is_ascii_digit()) && !q.is_empty() {
-        if let Ok(n) = q.parse::<i64>() {
-            if db::get_block_by_number(&state.db, n).is_some() {
-                found = Some(json!({"type": "block", "id": q, "url": format!("/block/{q}")}));
-            }
-        }
-    }
-    if found.is_none() && db::get_transaction(&state.db, &q).is_some() {
-        found = Some(json!({"type": "transaction", "id": q, "url": format!("/tx/{q}")}));
-    }
-    if found.is_none() {
-        if let Some(b) = db::get_block_by_hash(&state.db, &q) {
-            found = Some(json!({
-                "type": "block",
-                "id": b.number.to_string(),
-                "url": format!("/block/{}", b.number),
-            }));
-        }
-    }
-    if found.is_none() {
-        let checksummed = checksum_address(&q);
-        if is_valid_address(&checksummed) {
-            found = Some(json!({
-                "type": "address",
-                "id": checksummed,
-                "url": format!("/address/{checksummed}"),
-            }));
-        }
-        if found.is_none() {
-            if let Some(meta) = db::get_token_metadata(&state.db, &q) {
-                found = Some(json!({
-                    "type": "token",
-                    "id": meta.address,
-                    "url": format!("/token/{}", meta.address),
-                }));
-            }
-        }
-    }
-    if found.is_none() {
-        // Exact symbol or name first, then the best partial match — so
-        // pressing Enter lands where the suggestions said it would.
-        let matched = db::get_token_by_symbol_or_name(&state.db, &q)
-            .or_else(|| db::search_tokens(&state.db, &q, 1).into_iter().next());
-        if let Some(meta) = matched {
-            found = Some(json!({
-                "type": "token",
-                "id": meta.address,
-                "url": format!("/token/{}", meta.address),
-            }));
-        }
-    }
+    let found = resolve_search(&state.db, &q);
 
     if wants_json(&headers, &query) {
         return Json(json!({"query": q, "match": found})).into_response();

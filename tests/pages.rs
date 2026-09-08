@@ -252,6 +252,111 @@ async fn get_json(base: &str, path: &str) -> Value {
         .unwrap_or_else(|e| panic!("GET {path} json: {e}"))
 }
 
+/// A neighbour is offered only where one is indexed. The fixture holds 100 and
+/// 101 but not 99, which is what a backfilling index looks like, and a link to 99
+/// would 404.
+#[tokio::test]
+async fn a_block_links_only_to_neighbours_that_are_indexed() {
+    let (_dir, base) = serve().await;
+    let page = get_json(&base, "/block/100?").await;
+
+    assert_eq!(page["next_block"], json!(101));
+    assert_eq!(page["previous_block"], Value::Null, "99 is not indexed");
+
+    let html = reqwest::get(format!("{base}/block/100"))
+        .await
+        .expect("GET /block/100")
+        .text()
+        .await
+        .expect("block html");
+    assert!(html.contains("href=\"/block/101\""), "a link forward");
+    assert!(html.contains("step-off"), "and a dead end back");
+}
+
+/// Newest first, and only the heights the index holds: the fixture has 100 and
+/// 101 but not 99, and a row for a missing block would link to a 404.
+#[tokio::test]
+async fn the_blocks_listing_descends_from_the_tip_over_the_gaps() {
+    let (_dir, base) = serve().await;
+    let page = get_json(&base, "/blocks?").await;
+
+    let numbers: Vec<i64> = page["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|b| b["number"].as_i64().expect("number"))
+        .collect();
+    assert_eq!(numbers, [101, 100], "newest first, and nothing below 100");
+    assert_eq!(page["first_num"], json!(101));
+    assert_eq!(page["last_num"], json!(100));
+
+    // Each row carries the gas percentage the bar is drawn from; the block row
+    // itself has no such column.
+    assert!(
+        page["blocks"][0]["gas_pct"].is_string(),
+        "gas_pct rides on the row"
+    );
+
+    // `from` starts the walk somewhere other than the tip, which is how the
+    // "Older →" link pages backwards.
+    let older = get_json(&base, "/blocks?from=100").await;
+    let numbers: Vec<i64> = older["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|b| b["number"].as_i64().expect("number"))
+        .collect();
+    assert_eq!(numbers, [100], "101 is above the requested start");
+}
+
+/// Pressing Enter in the search box resolves to one destination, and the
+/// candidates are tried in the order a reader means them. A block hash and a
+/// transaction hash are the same shape, so only asking the index tells them
+/// apart.
+#[tokio::test]
+async fn search_resolves_each_kind_of_identifier() {
+    let (_dir, base) = serve().await;
+    let hit = |page: &Value| {
+        let m = &page["match"];
+        (
+            m["type"].as_str().unwrap_or("").to_string(),
+            m["url"].as_str().unwrap_or("").to_string(),
+        )
+    };
+
+    let height = get_json(&base, "/search?q=100").await;
+    assert_eq!(hit(&height), ("block".into(), "/block/100".into()));
+
+    let block_hash = format!("0x{}", "ab".repeat(32));
+    let by_hash = get_json(&base, &format!("/search?q={block_hash}")).await;
+    assert_eq!(hit(&by_hash), ("block".into(), "/block/100".into()));
+
+    let tx = get_json(&base, &format!("/search?q={TX_HASH}")).await;
+    assert_eq!(hit(&tx), ("transaction".into(), format!("/tx/{TX_HASH}")));
+
+    let address = get_json(&base, &format!("/search?q={SENDER}")).await;
+    assert_eq!(
+        hit(&address),
+        (
+            "address".into(),
+            format!("/address/{}", checksum_address(SENDER))
+        )
+    );
+
+    // A name, which is neither a height nor a hash nor an address.
+    let symbol = get_json(&base, "/search?q=pathUSD").await;
+    assert_eq!(
+        hit(&symbol),
+        (
+            "token".into(),
+            format!("/token/{}", checksum_address(TOKEN))
+        )
+    );
+
+    let nothing = get_json(&base, "/search?q=matchesnothing").await;
+    assert_eq!(nothing["match"], Value::Null);
+}
+
 #[tokio::test]
 async fn a_successful_transaction_says_what_it_did() {
     let (_dir, base) = serve().await;
