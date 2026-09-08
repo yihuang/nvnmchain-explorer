@@ -286,8 +286,13 @@ pub fn init_db(path: &str) -> Result<Connection> {
         DROP INDEX IF EXISTS idx_transfer_token;
         CREATE INDEX IF NOT EXISTS idx_transfer_token_block
             ON transfer_events(token_addr, block_number, log_index);
-        CREATE INDEX IF NOT EXISTS idx_transfer_from ON transfer_events(from_addr);
-        CREATE INDEX IF NOT EXISTS idx_transfer_to ON transfer_events(to_addr);
+        -- The address page walks these the same way, one down each side.
+        DROP INDEX IF EXISTS idx_transfer_from;
+        DROP INDEX IF EXISTS idx_transfer_to;
+        CREATE INDEX IF NOT EXISTS idx_transfer_from_block
+            ON transfer_events(from_addr, block_number, log_index);
+        CREATE INDEX IF NOT EXISTS idx_transfer_to_block
+            ON transfer_events(to_addr, block_number, log_index);
 
         CREATE TABLE IF NOT EXISTS anchored_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1173,53 +1178,59 @@ fn row_to_transfer_json(row: &rusqlite::Row) -> rusqlite::Result<Value> {
     }))
 }
 
-/// One page of transfers matching `filter`, joined to their transactions.
+/// One page of transfers, joined to their transactions. `keys` selects the
+/// page's rows as `(i, b, l)`: id, block number, log index, in page order.
 ///
 /// Joined rather than read per row: the listing wants four fields, and fetching
 /// each transaction whole would re-materialize its raw RLP and stored trace
 /// once per line of the page.
-fn transfer_page(
-    db: &Db,
-    what: &str,
-    filter: &str,
-    key: &str,
-    page: u32,
-    per_page: u32,
-) -> Vec<Value> {
+fn transfer_page(db: &Db, what: &str, keys: &str, params: impl rusqlite::Params) -> Vec<Value> {
     let sql = format!(
         "SELECT {TRANSFER_COLS}, t.from_addr, t.to_addr, t.timestamp, t.status
-         FROM transfer_events e LEFT JOIN transactions t ON t.hash = e.tx_hash
-         WHERE {filter}
-         ORDER BY e.block_number DESC, e.log_index DESC LIMIT ?2 OFFSET ?3"
+         FROM ({keys}) page
+         JOIN transfer_events e ON e.id = page.i
+         LEFT JOIN transactions t ON t.hash = e.tx_hash
+         ORDER BY page.b DESC, page.l DESC"
     );
-    query_rows(
-        &lock(db),
-        what,
-        &sql,
-        params![hex_blob(key), per_page as i64, page_offset(page, per_page)],
-        row_to_transfer_json,
-    )
+    query_rows(&lock(db), what, &sql, params, row_to_transfer_json)
 }
 
 pub fn get_token_transfers(db: &Db, token_addr: &str, page: u32, per_page: u32) -> Vec<Value> {
     transfer_page(
         db,
         "get_token_transfers",
-        "e.token_addr=?1",
-        token_addr,
-        page,
-        per_page,
+        "SELECT id AS i, block_number AS b, log_index AS l FROM transfer_events
+         WHERE token_addr=?1 ORDER BY block_number DESC, log_index DESC LIMIT ?2 OFFSET ?3",
+        params![
+            hex_blob(token_addr),
+            i64::from(per_page),
+            page_offset(page, per_page)
+        ],
     )
 }
 
+/// Newest first, by block and log index. Two walks, one down each address
+/// index and each cut at the page's end, then merged, as
+/// [`get_address_transactions`] does; a transfer to itself is read once.
 pub fn get_address_transfers(db: &Db, address: &str, page: u32, per_page: u32) -> Vec<Value> {
+    let (limit, offset) = (i64::from(per_page), page_offset(page, per_page));
     transfer_page(
         db,
         "get_address_transfers",
-        "e.from_addr=?1 OR e.to_addr=?1",
-        address,
-        page,
-        per_page,
+        "SELECT * FROM (SELECT id AS i, block_number AS b, log_index AS l
+                        FROM transfer_events WHERE from_addr=?1
+                        ORDER BY block_number DESC, log_index DESC LIMIT ?4)
+         UNION ALL
+         SELECT * FROM (SELECT id, block_number, log_index
+                        FROM transfer_events WHERE to_addr=?1 AND from_addr<>?1
+                        ORDER BY block_number DESC, log_index DESC LIMIT ?4)
+         ORDER BY b DESC, l DESC LIMIT ?2 OFFSET ?3",
+        params![
+            hex_blob(address),
+            limit,
+            offset,
+            limit.saturating_add(offset)
+        ],
     )
 }
 

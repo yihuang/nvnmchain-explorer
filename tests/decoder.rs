@@ -518,6 +518,43 @@ fn a_database_with_single_column_address_indexes_gets_the_composite_ones() {
 }
 
 #[test]
+fn a_database_with_single_column_transfer_indexes_gets_the_composite_ones() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("legacy-transfer-indexes.db");
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("init_db");
+    conn.execute_batch(
+        "DROP INDEX idx_transfer_from_block; DROP INDEX idx_transfer_to_block;
+         CREATE INDEX idx_transfer_from ON transfer_events(from_addr);
+         CREATE INDEX idx_transfer_to ON transfer_events(to_addr);",
+    )
+    .expect("the indexes an older explorer built");
+    drop(conn);
+
+    let conn = nvnmchain_explorer::db::init_db(path.to_str().unwrap()).expect("reopen");
+    let names: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='index' AND tbl_name='transfer_events' AND name LIKE 'idx_transfer_%'
+             ORDER BY name",
+        )
+        .expect("prepare")
+        .query_map([], |r| r.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(
+        names,
+        [
+            "idx_transfer_block",
+            "idx_transfer_from_block",
+            "idx_transfer_to_block",
+            "idx_transfer_token_block",
+            "idx_transfer_tx_hash"
+        ]
+    );
+}
+
+#[test]
 fn blob_hex_round_trip() {
     // Block with one transaction (so the tx row is exercised too).
     let (_dir, db) = temp_db("blob.db");
