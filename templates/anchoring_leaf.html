@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}Leaf {{ index }} of {{ truncate_hash(h=namespace) }} – nvnmchain Explorer{% endblock %}
 {% block content %}
 
@@ -23,7 +24,7 @@
         {% if append.commitment %}
         <div class="kv-row">
             <div class="kv-label">Commitment</div>
-            <div class="kv-value mono">{{ append.commitment }}</div>
+            <div class="kv-value mono">{{ append.commitment }}{{ ui::copy(text=append.commitment, label="Copy commitment") }}</div>
         </div>
         {% else %}
         {# A batch reaches the chain as the roots of subtrees, so no leaf of it
@@ -52,9 +53,12 @@
         {% endif %}
         <div class="kv-row">
             <div class="kv-label">{% if envelope %}Metadata (raw){% else %}Metadata{% endif %}</div>
-            {# Truncated: a payload is whatever the caller committed to, and the
-               whole of it belongs in the decoder linked below, not the layout. #}
-            <div class="kv-value mono text-xs pre-wrap break-all">{{ truncate_hash(h=append.metadata, prefix=512, suffix=6) }}</div>
+            {# Whole: the commitment above is its keccak256, and checking that by hand
+               needs every byte. #}
+            <div class="kv-value">
+                {{ ui::copy(text=append.metadata, label="Copy metadata") }}
+                <div class="mono text-xs pre-wrap break-all raw-payload">{{ append.metadata }}</div>
+            </div>
         </div>
         <div class="kv-row">
             <div class="kv-label">Appended in</div>
