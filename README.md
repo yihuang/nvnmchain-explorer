@@ -140,6 +140,7 @@ The indexer is built for a sub-second chain:
 | `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
 | `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
+| `NAME_SEARCH_URL` | unset | nvnmchain-anchoring's registry name index, so the search box takes half a name |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -183,7 +184,10 @@ Tempo's, so no binding carries them. Their ABIs are the JSON under `abi/`,
 compiled in; `anchoring.json` is nvnmchain-contracts' build of it.
 
 The anchoring pages read that contract over RPC, not the index: the corpus it
-was seeded with at genesis emitted no events.
+was seeded with at genesis emitted no events. So does the search box, for a whole
+registry name or a record's checksum — all the contract matches. Half a name matches
+only in nvnmchain-anchoring's index: set `NAME_SEARCH_URL` and the box takes it from
+there, at a request per keystroke.
 
 Each decoded log is also said in words, from the phrasing table in
 `src/summary.rs`, and the transaction page leads with that sentence. Two tests
@@ -250,6 +254,7 @@ src/
   summary.rs    what a transaction did, in a sentence
   memo.rs       TIP-20 transfer memos
   signatures.rs names for selectors no built-in ABI declares
+  name_search.rs  registry names from nvnmchain-anchoring, when one is configured
   tempo_address.rs  TIP-1022 virtual addresses
   contracts.rs  precompile / token labels
   anchoring.rs  the anchoring contract's views

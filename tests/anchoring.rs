@@ -1,11 +1,16 @@
 //! The anchoring pages, over a stub node that answers like the contract: 30 registries,
 //! registry 1 with 27 records and its record 1 with 30 versions, so every listing pages.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{B256, U256};
 use alloy_sol_types::SolCall;
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{
+    extract::{Query, State},
+    routing::post,
+    Json, Router,
+};
 use nvnmchain_explorer::anchoring::{
     recordsCall, recordsReturn, registriesByNameCall, registriesByNameReturn, registriesCall,
     registriesReturn, PageResponse, Record, Registry,
@@ -181,12 +186,21 @@ async fn stub_node(registries: u64) -> String {
 
 /// The explorer, reading `rpc_url`.
 async fn serve(rpc_url: String) -> (tempfile::TempDir, String) {
+    serve_with(rpc_url, None).await
+}
+
+/// The explorer over a stub node, and the name index beside it when there is one.
+async fn serve_with(
+    rpc_url: String,
+    name_search_url: Option<String>,
+) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let conn = db::init_db(dir.path().join("anchoring.db").to_str().unwrap()).unwrap();
     let db = Arc::new(Mutex::new(conn));
     let mut cfg = Settings::from_env();
     cfg.signature_lookup_url = None;
     cfg.rpc_url = rpc_url;
+    cfg.name_search_url = name_search_url;
     let state = AppState {
         tera: web::build_tera(db.clone()).unwrap(),
         db,
@@ -340,4 +354,99 @@ async fn a_node_that_does_not_answer_is_a_bad_gateway() {
         page["error"].as_str().unwrap().contains("eth_getStorageAt"),
         "{page}"
     );
+}
+
+/// The search box, for what only the contract knows: the index holds no registry name
+/// and no checksum.
+#[tokio::test]
+async fn the_search_box_finds_a_registry_by_name_and_a_record_by_checksum() {
+    let (_dir, base) = serve(stub_node(30).await).await;
+
+    let (status, named) = get(&base, "/search?q=reg-4").await;
+    assert_eq!(status, 200);
+    assert_eq!(named["match"]["type"], "registry");
+    assert_eq!(named["match"]["url"], "/anchoring/4");
+
+    let (_, anchored) = get(&base, "/search?q=sum-1").await;
+    assert_eq!(anchored["match"]["type"], "record");
+    assert_eq!(anchored["match"]["url"], "/anchoring/1/1");
+
+    let (_, nothing) = get(&base, "/search?q=nothing-of-the-sort").await;
+    assert_eq!(nothing["match"], Value::Null);
+
+    let (_, suggestions) = get(&base, "/api/search?q=reg-4").await;
+    let kinds: Vec<&str> = suggestions["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["type"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"registry"), "{suggestions}");
+}
+
+/// A stub name index: the registries whose name starts with the query, in id order,
+/// written as the service writes them -- proto JSON, so an id is a string.
+async fn stub_name_index() -> String {
+    async fn search(Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+        let name = params
+            .get("name")
+            .cloned()
+            .unwrap_or_default()
+            .to_lowercase();
+        // Prefix is the only mode the box asks for; the explorer bounds the page itself.
+        let rows: Vec<Value> = (1..=30)
+            .map(registry)
+            .filter(|r| r.name.to_lowercase().starts_with(&name))
+            .map(|r| json!({"id": r.id.to_string(), "name": r.name}))
+            .collect();
+        Json(json!({"registries": rows, "pagination": null}))
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/NVNM-Chain/nvnmchain/anchoring/v1/registries/search",
+        axum::routing::get(search),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    format!("http://{addr}")
+}
+
+/// Half a name matches only in the index beside the chain: the contract answers a whole
+/// one and nothing less.
+#[tokio::test]
+async fn the_search_box_takes_half_a_name_from_the_index() {
+    let (_dir, base) = serve_with(stub_node(30).await, Some(stub_name_index().await)).await;
+
+    let (_, suggestions) = get(&base, "/api/search?q=reg-1").await;
+    let rows: Vec<(&str, &str)> = suggestions["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| (row["type"].as_str().unwrap(), row["url"].as_str().unwrap()))
+        .collect();
+    assert!(
+        rows.contains(&("registry", "/anchoring/1")),
+        "{suggestions}"
+    );
+    assert!(
+        rows.contains(&("registry", "/anchoring/10")),
+        "{suggestions}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|(_, url)| *url == "/anchoring/1")
+            .count(),
+        1,
+        "the contract's exact hit is not repeated by the index's: {suggestions}"
+    );
+
+    // Enter on half a name lands where the first suggestion pointed.
+    let (_, found) = get(&base, "/search?q=reg-2").await;
+    assert_eq!(found["match"]["url"], "/anchoring/20");
+
+    // Without an index, the same half name finds nothing.
+    let (_dir, bare) = serve(stub_node(30).await).await;
+    let (_, none) = get(&bare, "/search?q=reg-2").await;
+    assert_eq!(none["match"], Value::Null);
 }

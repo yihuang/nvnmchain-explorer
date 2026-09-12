@@ -34,6 +34,7 @@ use crate::decoder::{
     event_signature, extract_balance_changes, extract_calls, flatten_trace, function_signature,
     keccak_hex, revert_data_in, DecodedEvent, REGISTRY,
 };
+use crate::name_search;
 use crate::rpc::ChainRpc;
 use crate::signatures;
 use crate::summary::{build_summary, known_events, Failure, TokenDisplay, Tokens};
@@ -1805,7 +1806,15 @@ pub async fn search_page(
         return Redirect::to("/").into_response();
     }
 
-    let found = resolve_search(&state.db, &q);
+    let found = match resolve_search(&state.db, &q) {
+        found @ Some(_) => found,
+        // A registry's name and a record's checksum are the contract's state, which no
+        // index here holds, so they are only known by asking it.
+        None => anchoring_hits(&state, &q, 1)
+            .await
+            .first()
+            .map(|hit| destination(hit.kind, &hit.id, hit.url.clone())),
+    };
 
     if wants_json(&headers, &query) {
         return Json(json!({"query": q, "match": found})).into_response();
@@ -1823,11 +1832,71 @@ pub async fn search_page(
 }
 
 /// Enough suggestions to be useful, few enough to read without scrolling.
+/// Somewhere the anchoring contract can send the reader.
+struct Hit {
+    kind: &'static str,
+    id: String,
+    url: String,
+    label: String,
+    sublabel: String,
+}
+
+impl Hit {
+    fn registry(id: u64, name: String) -> Self {
+        Self {
+            kind: "registry",
+            id: id.to_string(),
+            url: format!("/anchoring/{id}"),
+            label: name,
+            sublabel: format!("Registry #{id}"),
+        }
+    }
+
+    fn record(record: &anchoring::Record) -> Self {
+        Self {
+            kind: "record",
+            id: record.checksum.clone(),
+            url: format!("/anchoring/{}/{}", record.registryId, record.recordId),
+            label: record.checksum.clone(),
+            sublabel: format!("Record in registry #{}", record.registryId),
+        }
+    }
+}
+
+/// What the contract knows about `q`, best first: a registry by its whole name, a record by
+/// its checksum, then registries whose name starts with it, which only the index beside the
+/// chain matches. Empty when neither knows it, or cannot be reached.
+async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    if let Ok((registries, records)) = anchoring::lookup(&state.rpc, q).await {
+        hits.extend(
+            registries
+                .iter()
+                .map(|r| Hit::registry(r.id, r.name.clone())),
+        );
+        hits.extend(records.iter().map(Hit::record));
+    }
+    if hits.len() < limit {
+        if let Some(base) = state.cfg.name_search_url.as_deref() {
+            for named in name_search::prefix(state.rpc.http_client(), base, q, limit).await {
+                let hit = Hit::registry(named.id, named.name);
+                if !hits.iter().any(|seen| seen.url == hit.url) {
+                    hits.push(hit);
+                }
+            }
+        }
+    }
+    hits.truncate(limit);
+    hits
+}
+
 const SUGGESTION_LIMIT: usize = 8;
 
 /// Suggestions for what the reader is typing, for the search box.
 ///
-/// Answered from the index — no RPC — so a keystroke costs a few lookups.
+/// Answered from the index, apart from the anchoring contract's registries and records,
+/// which are its state: a name-shaped query asks the contract, and the name index when one
+/// is configured.
 /// Anything that is definitely a hash or an address is offered whether indexed
 /// or not: being told "not found" on the page beats no suggestion at all.
 pub async fn search_suggest(
@@ -1918,6 +1987,9 @@ pub async fn search_suggest(
                 },
                 format!("{} · {}", meta.symbol, truncate_hash(&meta.address, 8, 6)),
             ));
+        }
+        for hit in anchoring_hits(&state, q, SUGGESTION_LIMIT).await {
+            results.push(suggestion(hit.kind, hit.url, hit.label, hit.sublabel));
         }
         for (address, name) in search_named(q, SUGGESTION_LIMIT) {
             results.push(suggestion(
