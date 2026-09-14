@@ -1864,7 +1864,7 @@ impl Hit {
 }
 
 /// What the contract knows about `q`, best first: a registry by its whole name, a record by
-/// its checksum, then registries whose name starts with it, which only the index beside the
+/// its checksum, then registries whose name contains it, which only the index beside the
 /// chain matches. Empty when neither knows it, or cannot be reached.
 async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
     let mut hits = Vec::new();
@@ -1878,7 +1878,7 @@ async fn anchoring_hits(state: &AppState, q: &str, limit: usize) -> Vec<Hit> {
     }
     if hits.len() < limit {
         if let Some(base) = state.cfg.name_search_url.as_deref() {
-            for named in name_search::prefix(state.rpc.http_client(), base, q, limit).await {
+            for named in name_search::matching(state.rpc.http_client(), base, q, limit).await {
                 let hit = Hit::registry(named.id, named.name);
                 if !hits.iter().any(|seen| seen.url == hit.url) {
                     hits.push(hit);
