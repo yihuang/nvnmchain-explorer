@@ -107,13 +107,13 @@ fn tempo_contracts() -> Vec<(&'static str, JsonAbi)> {
 }
 
 /// Contracts that are not Tempo's, so no binding carries them; without these their calls decode to
-/// a bare selector. JSON under `abi/`: canonical deployments, and the anchoring contract as
-/// nvnmchain-contracts builds it.
+/// a bare selector. The canonical deployments are vendored under `abi/`; anchoring comes from the
+/// nvnmchain-contracts submodule, so it cannot drift from the contract it decodes.
 const VENDORED: &[(&str, &str)] = &[
     ("multicall3", include_str!("../abi/multicall3.json")),
     ("permit2", include_str!("../abi/permit2.json")),
     ("createx", include_str!("../abi/createx.json")),
-    ("anchoring", include_str!("../abi/anchoring.json")),
+    ("anchoring", include_str!("../contracts/layout/anchoring.abi.json")),
 ];
 
 /// One parsed ABI and the name it was registered under.

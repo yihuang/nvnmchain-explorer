@@ -21,6 +21,7 @@ codebase is validated against. Point it anywhere with `NVNM_RPC` (the legacy
 ## Quick start
 
 ```bash
+git submodule update --init contracts   # the anchoring ABI is compiled in from it
 cargo run --release
 ```
 
@@ -180,8 +181,10 @@ are Solidity signatures at the top of `src/decoder.rs`: a typo there does not
 parse, and tests pin the selectors they hash to.
 
 Multicall3, Permit2, CreateX and the anchoring contract at `0x…0a00` are not
-Tempo's, so no binding carries them. Their ABIs are the JSON under `abi/`,
-compiled in; `anchoring.json` is nvnmchain-contracts' build of it.
+Tempo's, so no binding carries them. The first three are vendored JSON under
+`abi/`. Anchoring comes from the nvnmchain-contracts submodule at `contracts/`,
+which generates `layout/anchoring.abi.json` beside the bytecode Tempo's genesis
+uses, so the explorer cannot decode against an ABI the contract no longer has.
 
 The anchoring pages read that contract over RPC, not the index: the corpus it
 was seeded with at genesis emitted no events. So does the search box, for a whole
