@@ -113,7 +113,10 @@ const VENDORED: &[(&str, &str)] = &[
     ("multicall3", include_str!("../abi/multicall3.json")),
     ("permit2", include_str!("../abi/permit2.json")),
     ("createx", include_str!("../abi/createx.json")),
-    ("anchoring", include_str!("../contracts/layout/anchoring.abi.json")),
+    (
+        "anchoring",
+        include_str!("../contracts/layout/anchoring.abi.json"),
+    ),
 ];
 
 /// One parsed ABI and the name it was registered under.
