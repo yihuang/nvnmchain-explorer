@@ -63,7 +63,6 @@ fn precompile_labels() -> &'static HashMap<String, String> {
                 "0xC077e00000000000000000000000000000000000",
                 "Current Committee",
             ),
-            (crate::anchoring::ANCHORING_ADDRESS, "Anchoring"),
         ];
         pairs
             .iter()
@@ -72,10 +71,8 @@ fn precompile_labels() -> &'static HashMap<String, String> {
     })
 }
 
-/// Contracts that are not Tempo's own but are deployed at canonical addresses
-/// everywhere, including here. Kept apart from the precompiles: they are
-/// ordinary contracts, and calling them precompiles would misreport what they
-/// are on their own page.
+/// Ordinary contracts at fixed addresses: canonical deployments, and the anchoring contract this
+/// chain places in genesis. Kept apart from the precompiles, which they are not.
 fn deployed_contracts() -> &'static HashMap<String, String> {
     static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -83,6 +80,7 @@ fn deployed_contracts() -> &'static HashMap<String, String> {
             ("0xcA11bde05977b3631167028862bE2a173976CA11", "Multicall3"),
             ("0x000000000022D473030F116dDEE9F6B43aC78BA3", "Permit2"),
             ("0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed", "CreateX"),
+            ("0x0000000000000000000000000000000000000a00", "Anchoring"),
         ]
         .iter()
         .map(|(a, label)| (checksum_address(a), label.to_string()))
@@ -218,7 +216,7 @@ pub fn identify_address(addr: &str) -> AddressInfo {
     }
 }
 
-/// The name of a canonical deployed contract (Multicall3, Permit2, CreateX).
+/// The name of a contract at a fixed address (Multicall3, Permit2, CreateX, Anchoring).
 pub fn deployed_contract_name(addr: &str) -> Option<String> {
     deployed_contracts().get(&checksum_address(addr)).cloned()
 }
@@ -293,15 +291,12 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
         ),
         ("0x000000000022d473030f116ddee9f6b43ac78ba3", &["permit2"]),
         ("0xba5ed099633d3b313e4d5f7bdc1305d3c28ba5ed", &["createx"]),
+        ("0x0000000000000000000000000000000000000a00", &["anchoring"]),
     ];
 
     let lowered = addr.trim().to_lowercase();
     if let Some((_, abis)) = BY_ADDRESS.iter().find(|(a, _)| *a == lowered) {
         return abis;
-    }
-    // Not in the table above because the address is a constant, not a literal.
-    if lowered == crate::anchoring::ANCHORING_ADDRESS.to_lowercase() {
-        return &["anchoring"];
     }
     // Every TIP-20 is the same interface at a different address.
     if is_tip20_token(&lowered) {
@@ -382,20 +377,6 @@ mod tests {
             abis_for_address(&fee_manager.to_uppercase().replace("0X", "0x")),
             ["fee_manager", "fee_amm"]
         );
-    }
-
-    /// The precompile's own interface. The test above only asks that the ABI
-    /// named exists, which passed while this address named the group holding
-    /// the registry factory's event.
-    #[test]
-    fn the_anchoring_precompile_shows_its_own_interface() {
-        let abis = abis_for_address(crate::anchoring::ANCHORING_ADDRESS);
-        assert_eq!(abis, ["anchoring"]);
-        let contract = crate::decoder::REGISTRY
-            .contract("anchoring")
-            .expect("anchoring registered");
-        assert!(contract.functions().any(|f| f.name == "appendLeaf"));
-        assert!(contract.events().any(|e| e.name == "LeafAppended"));
     }
 
     /// A TIP-20 is recognised by its prefix, not by an entry per token.
