@@ -853,6 +853,27 @@ static PHRASES: &[Phrase] = &[
         ("Registry", Slot::Value("registryId")),
         ("Record", Slot::Value("checksum")),
     ]),
+    // The module admin multisig: a call to the anchoring contract proposed by one owner,
+    // confirmed by another, and run once the second confirmation lands.
+    phrase(
+        "Proposed(uint256,address,bytes)",
+        "proposal made",
+        "Propose",
+        &[Slot::Word("by"), Slot::Account("owner")],
+    )
+    .notes(&[("Proposal", Slot::Value("id"))]),
+    phrase(
+        "Confirmed(uint256,address,uint8)",
+        "proposal confirmed",
+        "Confirm",
+        &[Slot::Word("by"), Slot::Account("owner")],
+    )
+    .notes(&[
+        ("Proposal", Slot::Value("id")),
+        ("Confirmations", Slot::Value("confirmations")),
+    ]),
+    phrase("Executed(uint256,bytes)", "proposal executed", "Execute", &[])
+        .notes(&[("Proposal", Slot::Value("id"))]),
 ];
 
 // ---------------------------------------------------------------------------

@@ -71,8 +71,9 @@ fn precompile_labels() -> &'static HashMap<String, String> {
     })
 }
 
-/// Ordinary contracts at fixed addresses: canonical deployments, and the anchoring contract this
-/// chain places in genesis. Kept apart from the precompiles, which they are not.
+/// Ordinary contracts at fixed addresses: canonical deployments, and the two this chain places
+/// in genesis, the anchoring contract and its module admin. Kept apart from the precompiles,
+/// which they are not.
 fn deployed_contracts() -> &'static HashMap<String, String> {
     static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -81,6 +82,7 @@ fn deployed_contracts() -> &'static HashMap<String, String> {
             ("0x000000000022D473030F116dDEE9F6B43aC78BA3", "Permit2"),
             ("0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed", "CreateX"),
             ("0x0000000000000000000000000000000000000a00", "Anchoring"),
+            ("0x0582bfb2e8561d48636e78f0e6b139d5a842be8f", "Module Admin"),
         ]
         .iter()
         .map(|(a, label)| (checksum_address(a), label.to_string()))
@@ -170,7 +172,7 @@ pub fn identify_address(addr: &str) -> AddressInfo {
     }
 }
 
-/// The name of a contract at a fixed address (Multicall3, Permit2, CreateX, Anchoring).
+/// The name of a contract at a fixed address (Multicall3, Permit2, CreateX, Anchoring, Module Admin).
 pub fn deployed_contract_name(addr: &str) -> Option<String> {
     deployed_contracts().get(&checksum_address(addr)).cloned()
 }
@@ -242,6 +244,10 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
         ("0x000000000022d473030f116ddee9f6b43ac78ba3", &["permit2"]),
         ("0xba5ed099633d3b313e4d5f7bdc1305d3c28ba5ed", &["createx"]),
         ("0x0000000000000000000000000000000000000a00", &["anchoring"]),
+        (
+            "0x0582bfb2e8561d48636e78f0e6b139d5a842be8f",
+            &["module_admin"],
+        ),
     ];
 
     let lowered = addr.trim().to_lowercase();
@@ -312,6 +318,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The module admin's ABI is vendored from the same submodule as the anchoring contract's,
+    /// so the registry decodes the calls the two owners send it and the event it emits when
+    /// the break-glass grant runs.
+    #[test]
+    fn the_module_admin_shows_its_own_interface() {
+        let module_admin = "0x0582bfb2e8561d48636e78f0e6b139d5a842be8f";
+        assert_eq!(abis_for_address(module_admin), ["module_admin"]);
+        assert_eq!(
+            deployed_contract_name(module_admin).as_deref(),
+            Some("Module Admin")
+        );
+        let contract = crate::decoder::REGISTRY
+            .contract("module_admin")
+            .expect("module_admin registered");
+        for function in ["propose", "confirm", "owners"] {
+            assert!(
+                contract.functions().any(|f| f.name == function),
+                "`{function}` missing from the module admin ABI"
+            );
+        }
+        assert!(contract.events().any(|e| e.name == "Executed"));
     }
 
     /// The lookup must not care how an address is spelled.
