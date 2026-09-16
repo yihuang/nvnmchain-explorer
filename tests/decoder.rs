@@ -507,7 +507,8 @@ fn a_database_with_single_column_address_indexes_gets_the_composite_ones() {
     conn.execute_batch(
         "DROP INDEX idx_tx_from_block; DROP INDEX idx_tx_to_block;
          CREATE INDEX idx_tx_from ON transactions(from_addr);
-         CREATE INDEX idx_tx_to ON transactions(to_addr);",
+         CREATE INDEX idx_tx_to ON transactions(to_addr);
+         CREATE INDEX idx_tx_block_number ON transactions(block_number);",
     )
     .expect("the indexes an older explorer built");
     drop(conn);
@@ -527,7 +528,7 @@ fn a_database_with_single_column_address_indexes_gets_the_composite_ones() {
     assert_eq!(
         names,
         [
-            "idx_tx_block_number",
+            "idx_tx_block_position",
             "idx_tx_from_block",
             "idx_tx_timestamp",
             "idx_tx_to_block"
@@ -630,6 +631,28 @@ fn blob_hex_round_trip() {
     assert_eq!(parsed.calls.len(), 1);
     let call_to = parsed.calls[0]["to"].as_str().unwrap().to_lowercase();
     assert_eq!(call_to, "0x20c0000000000000000000000000000000000000");
+}
+
+/// A re-index carrying no trace, raw bytes or receipt keeps the ones stored: the
+/// trace the transaction page cached, the raw bytes a failed decode left out.
+#[test]
+fn a_rewrite_without_the_blobs_keeps_them() {
+    let (_dir, db) = temp_db("keep-blobs.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.raw = Some("0xabcd".into());
+    tx.trace_data = Some("[]".into());
+    tx.receipt_data = Some("{}".into());
+    db::save_transaction(&db, &tx).unwrap();
+
+    let bare = parse_transaction(&raw_block["transactions"][0], &block);
+    assert!(bare.raw.is_none() && bare.trace_data.is_none());
+    db::save_transaction(&db, &bare).unwrap();
+    let stored = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(stored.raw.as_deref(), Some("0xabcd"));
+    assert_eq!(stored.trace_data.as_deref(), Some("[]"));
+    assert_eq!(stored.receipt_data.as_deref(), Some("{}"));
 }
 
 #[test]
