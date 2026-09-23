@@ -58,6 +58,8 @@
     </div>
 </div>
 
+{{ ui::pager(page=page, total_pages=total_pages) }}
+
 <div class="card mt-4">
     <div class="card-header flex items-center justify-between">
         <span>{% if events_more %}Latest transactions{% else %}Transactions{% endif %}</span>
@@ -82,7 +84,5 @@
     </div>
     {% endfor %}
 </div>
-
-{{ ui::pager(page=page, total_pages=total_pages) }}
 
 {% endblock %}
