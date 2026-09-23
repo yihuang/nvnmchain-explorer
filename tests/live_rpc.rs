@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use nvnmchain_explorer::config::{DEFAULT_CHAIN_ID, DEFAULT_RPC_URL, DEFAULT_WS_URL};
 use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::indexer::{fetch_block_bundle, index_block};
-use nvnmchain_explorer::rpc::ChainRpc;
+use nvnmchain_explorer::rpc::{parse_int_any, ChainRpc};
 use nvnmchain_explorer::web::{self, AppState};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -416,38 +416,34 @@ async fn web_api_serves_indexed_data() {
 /// The seeded ones cannot: they arrived in the dump, without an event.
 #[tokio::test]
 async fn anchoring_events_link_a_registry_to_its_tx() {
-    let rpc = ChainRpc::new(DEFAULT_RPC_URL).expect("rpc client");
+    let rpc = rpc();
     let (_dir, db) = temp_db();
-    let Ok(head) = rpc.eth_block_number().await else {
-        eprintln!("skipping: node unreachable");
+    let head = rpc.eth_block_number().await.expect("head");
+    // The latest write within the node's 100k-block log range.
+    let logs = rpc
+        .eth_get_logs(json!({
+            "address": nvnmchain_explorer::anchoring::ADDRESS,
+            "fromBlock": format!("0x{:x}", head.saturating_sub(99_999)),
+            "toBlock": format!("0x{head:x}"),
+        }))
+        .await
+        .expect("anchoring logs");
+    let Some(block) = logs.last().and_then(|l| l.get("blockNumber")) else {
+        eprintln!("skipping: no anchoring write in the last 100k blocks");
         return;
     };
-    // Walk back from the head, or from `NVNM_ANCHORING_BLOCK` when a run's
-    // writes are known to sit further back than the window below.
-    let from: u64 = std::env::var("NVNM_ANCHORING_BLOCK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(head);
-    let mut found = Vec::new();
-    for n in (from.saturating_sub(400)..=from).rev() {
-        index_block(&rpc, &db, n).await.expect("index");
-        let id: Option<i64> = db::lock(&db)
-            .query_row(
-                "SELECT registry_id FROM anchoring_events LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(id) = id {
-            found = db::get_anchoring_events(&db, id);
-            break;
-        }
-    }
-    if found.is_empty() {
-        eprintln!("skipping: no anchoring write in the last 400 blocks");
-        return;
-    }
+    let block = parse_int_any(block);
+    index_block(&rpc, &db, block as u64).await.expect("index");
+    let id: i64 = db::lock(&db)
+        .query_row(
+            "SELECT registry_id FROM anchoring_events LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the block's anchoring row");
+    let found = db::get_anchoring_events(&db, id);
     let event = &found[0];
+    assert_eq!(event.block_number, block);
     println!(
         "registry {} {} in tx {} block {}",
         event.registry_id, event.event, event.tx_hash, event.block_number
