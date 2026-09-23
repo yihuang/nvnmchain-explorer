@@ -34,16 +34,28 @@ fn rpc() -> ChainRpc {
 /// this one has been reset out from under these tests once already.
 async fn block_with_txs(rpc: &ChainRpc) -> Option<(u64, Vec<String>)> {
     let head = rpc.eth_block_number().await.ok()?;
-    for number in (head.saturating_sub(600)..=head).rev() {
-        let block = rpc.eth_get_block_by_number(number, false).await.ok()??;
-        let hashes: Vec<String> = block
-            .get("transactions")
-            .and_then(Value::as_array)?
+    // In batches: most blocks on a quiet chain are empty, and 600 of them one
+    // round trip at a time is a minute per test.
+    for chunk in (head.saturating_sub(600)..=head).rev().collect::<Vec<_>>().chunks(64) {
+        let calls = chunk
             .iter()
-            .filter_map(|h| h.as_str().map(str::to_string))
+            .map(|n| {
+                (
+                    "eth_getBlockByNumber".to_string(),
+                    json!([format!("0x{n:x}"), false]),
+                )
+            })
             .collect();
-        if !hashes.is_empty() {
-            return Some((number, hashes));
+        for (number, res) in chunk.iter().zip(rpc.batch_call(calls).await.ok()?) {
+            let Ok(block) = res else { continue };
+            let hashes: Vec<String> = block
+                .get("transactions")
+                .and_then(Value::as_array)
+                .map(|txs| txs.iter().filter_map(|h| h.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            if !hashes.is_empty() {
+                return Some((*number, hashes));
+            }
         }
     }
     None
