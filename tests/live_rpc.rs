@@ -441,7 +441,7 @@ async fn anchoring_events_link_a_registry_to_its_tx() {
             |r| r.get(0),
         )
         .expect("the block's anchoring row");
-    let found = db::get_anchoring_events(&db, id);
+    let found = db::get_anchoring_events(&db, id, 25);
     let event = &found[0];
     assert_eq!(event.block_number, block);
     println!(

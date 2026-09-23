@@ -60,8 +60,8 @@
 
 <div class="card mt-4">
     <div class="card-header flex items-center justify-between">
-        <span>Transactions</span>
-        <span class="badge">{{ events | length }}</span>
+        <span>{% if events_more %}Latest transactions{% else %}Transactions{% endif %}</span>
+        <span class="badge">{{ events | length }}{% if events_more %}+{% endif %}</span>
     </div>
     <div class="flex table-header">
         <div class="w-40 px-3">Event</div>

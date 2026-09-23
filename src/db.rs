@@ -1077,15 +1077,16 @@ pub(crate) fn insert_anchoring(conn: &Connection, event: &AnchoringEvent) -> Res
     Ok(inserted != 0)
 }
 
-/// Every write to one registry, newest first: a handful at most, so no paging.
-pub fn get_anchoring_events(db: &Db, registry_id: i64) -> Vec<AnchoringEvent> {
+/// The latest `limit` writes to one registry, newest first.
+pub fn get_anchoring_events(db: &Db, registry_id: i64, limit: u32) -> Vec<AnchoringEvent> {
     query_rows(
         &lock(db),
         "get_anchoring_events",
         "SELECT tx_hash, block_number, log_index, timestamp, event, registry_id, record_id, caller
          FROM anchoring_events WHERE registry_id = ?1
-         ORDER BY block_number DESC, log_index DESC",
-        params![registry_id],
+         ORDER BY block_number DESC, log_index DESC
+         LIMIT ?2",
+        params![registry_id, limit],
         |row| {
             Ok(AnchoringEvent {
                 tx_hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),

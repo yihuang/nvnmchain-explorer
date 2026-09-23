@@ -535,14 +535,14 @@ async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
         .await
         .expect("backfill");
 
-    let events = db::get_anchoring_events(&db, 1500);
+    let events = db::get_anchoring_events(&db, 1500, 25);
     assert_eq!(events.len(), 1);
     assert_eq!(
         (events[0].event.as_str(), events[0].timestamp),
         ("AddRegistry", 100)
     );
     assert!(
-        db::get_anchoring_events(&db, 1700).is_empty(),
+        db::get_anchoring_events(&db, 1700, 25).is_empty(),
         "block 1700 is not indexed"
     );
     assert_eq!(

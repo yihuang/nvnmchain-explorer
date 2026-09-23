@@ -844,7 +844,7 @@ fn anchoring_events_read_back_by_registry() {
     db::save_block_bundle(&db, &bundle).expect("save");
     db::save_block_bundle(&db, &bundle).expect("re-save");
 
-    let events = db::get_anchoring_events(&db, 2190);
+    let events = db::get_anchoring_events(&db, 2190, 25);
     assert_eq!(
         events.len(),
         2,
@@ -854,7 +854,10 @@ fn anchoring_events_read_back_by_registry() {
     assert_eq!(events[0].record_id, 7);
     assert_eq!(events[0].tx_hash, tx.hash);
     assert_eq!(events[0].caller, checksum_address(caller));
-    assert!(db::get_anchoring_events(&db, 2191).is_empty());
+    assert!(db::get_anchoring_events(&db, 2191, 25).is_empty());
+    let latest = db::get_anchoring_events(&db, 2190, 1);
+    assert_eq!(latest.len(), 1, "the limit holds");
+    assert_eq!(latest[0].event, "AddRecord", "and keeps the newest");
 
     let conn = db::lock(&db);
     assert_eq!(
