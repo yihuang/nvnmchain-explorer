@@ -9,7 +9,9 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use crate::models::{Block, BlockBundle, TokenMetadata, Transaction, TransferEvent};
+use crate::models::{
+    AnchoringEvent, Block, BlockBundle, TokenMetadata, Transaction, TransferEvent,
+};
 
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -282,6 +284,23 @@ pub fn init_db(path: &str) -> Result<Connection> {
         DROP TABLE IF EXISTS anchored_namespaces;
         DROP TABLE IF EXISTS registries;
 
+        -- Writes to the anchoring contract, keyed by registry: its events carry
+        -- the id in data, not a topic, so `eth_getLogs` cannot filter on it.
+        CREATE TABLE IF NOT EXISTS anchoring_events (
+            tx_hash BLOB NOT NULL,
+            block_number INTEGER NOT NULL,
+            log_index INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL DEFAULT 0,
+            event TEXT NOT NULL,
+            registry_id INTEGER NOT NULL,
+            record_id INTEGER NOT NULL DEFAULT 0,
+            caller BLOB NOT NULL,
+            UNIQUE (block_number, log_index)
+        );
+        -- The registry page reads one id newest first, in this order.
+        CREATE INDEX IF NOT EXISTS idx_anchoring_registry
+            ON anchoring_events(registry_id, block_number DESC, log_index DESC);
+
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
@@ -505,6 +524,9 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
         if insert_transfer(txn, transfer)? {
             inserted.push(transfer);
         }
+    }
+    for event in &bundle.anchoring {
+        insert_anchoring(txn, event)?;
     }
     // Metadata first, so a new token's holder count is seeded before the
     // transfers below move it.
@@ -1016,6 +1038,55 @@ pub fn search_tokens(db: &Db, q: &str, limit: u32) -> Vec<TokenMetadata> {
         ),
         params![exact, anywhere, prefix, limit as i64],
         row_to_token,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Anchoring events
+// ---------------------------------------------------------------------------
+
+/// Insert one anchoring write; `false` when (block_number, log_index) is
+/// already stored.
+fn insert_anchoring(conn: &Connection, event: &AnchoringEvent) -> Result<bool> {
+    let inserted = exec_cached(
+        conn,
+        "INSERT OR IGNORE INTO anchoring_events (tx_hash, block_number, log_index, timestamp, event, registry_id, record_id, caller)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            hex_blob(&event.tx_hash),
+            event.block_number,
+            event.log_index,
+            event.timestamp,
+            event.event,
+            event.registry_id,
+            event.record_id,
+            hex_blob(&event.caller),
+        ],
+    )?;
+    Ok(inserted != 0)
+}
+
+/// Every write to one registry, newest first: a handful at most, so no paging.
+pub fn get_anchoring_events(db: &Db, registry_id: i64) -> Vec<AnchoringEvent> {
+    query_rows(
+        &lock(db),
+        "get_anchoring_events",
+        "SELECT tx_hash, block_number, log_index, timestamp, event, registry_id, record_id, caller
+         FROM anchoring_events WHERE registry_id = ?1
+         ORDER BY block_number DESC, log_index DESC",
+        params![registry_id],
+        |row| {
+            Ok(AnchoringEvent {
+                tx_hash: blob_hex(&row.get::<_, Vec<u8>>(0)?),
+                block_number: row.get(1)?,
+                log_index: row.get(2)?,
+                timestamp: row.get(3)?,
+                event: row.get(4)?,
+                registry_id: row.get(5)?,
+                record_id: row.get(6)?,
+                caller: blob_addr(&row.get::<_, Vec<u8>>(7)?),
+            })
+        },
     )
 }
 

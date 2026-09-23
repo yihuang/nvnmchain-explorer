@@ -1718,6 +1718,8 @@ pub async fn anchoring_registry_page(
                     "total": total,
                     "page": page,
                     "total_pages": total_pages(total as i64, PER_PAGE),
+                    // Empty for everything the dump seeded, which arrived without a tx.
+                    "events": db::get_anchoring_events(&state.db, id as i64),
                 }),
             );
             html_or_json(&state, &headers, &query, "anchoring_registry.html", &ctx)

@@ -367,3 +367,48 @@ async fn web_api_serves_indexed_data() {
     );
     assert!(text.contains("data:"), "SSE should carry JSON data: {text}");
 }
+
+/// A registry written after the load can name the transaction that wrote it.
+/// The seeded ones cannot: they arrived in the dump, without an event.
+#[tokio::test]
+async fn anchoring_events_link_a_registry_to_its_tx() {
+    let rpc = ChainRpc::new(DEFAULT_RPC_URL).expect("rpc client");
+    let (_dir, db) = temp_db();
+    let Ok(head) = rpc.eth_block_number().await else {
+        eprintln!("skipping: node unreachable");
+        return;
+    };
+    // Walk back from the head, or from `NVNM_ANCHORING_BLOCK` when a run's
+    // writes are known to sit further back than the window below.
+    let from: u64 = std::env::var("NVNM_ANCHORING_BLOCK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(head);
+    let mut found = Vec::new();
+    for n in (from.saturating_sub(400)..=from).rev() {
+        index_block(&rpc, &db, n).await.expect("index");
+        let id: Option<i64> = db::lock(&db)
+            .query_row(
+                "SELECT registry_id FROM anchoring_events LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = id {
+            found = db::get_anchoring_events(&db, id);
+            break;
+        }
+    }
+    if found.is_empty() {
+        eprintln!("skipping: no anchoring write in the last 400 blocks");
+        return;
+    }
+    let event = &found[0];
+    println!(
+        "registry {} {} in tx {} block {}",
+        event.registry_id, event.event, event.tx_hash, event.block_number
+    );
+    assert!(event.tx_hash.starts_with("0x") && event.tx_hash.len() == 66);
+    assert!(event.caller.starts_with("0x"));
+    assert!(event.registry_id > 0);
+}

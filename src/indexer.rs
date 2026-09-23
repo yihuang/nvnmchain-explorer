@@ -22,8 +22,8 @@ use tracing::{info, warn};
 use crate::config::Settings;
 use crate::contracts::RESERVED_TOKENS;
 use crate::db::{self, Db};
-use crate::decoder::{checksum_address, decode_event};
-use crate::models::{BlockBundle, Transaction, TransferEvent};
+use crate::decoder::{checksum_address, decode_event, DecodedEvent};
+use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::tokens::{fetch_token_metadata, has_control_chars};
@@ -104,6 +104,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         .unwrap_or(&[]);
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
+    let mut anchoring = Vec::new();
     let mut next_log_index = 0u64;
 
     for tx_data in raw_txs {
@@ -122,7 +123,13 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
             tx.raw = Some(format!("0x{}", hex::encode(buf)));
         }
         if let Some(receipt) = receipt_by_hash.get(tx_hash) {
-            apply_receipt(&mut tx, receipt, &mut transfers, &mut next_log_index);
+            apply_receipt(
+                &mut tx,
+                receipt,
+                &mut transfers,
+                &mut anchoring,
+                &mut next_log_index,
+            );
         }
         txs.push(tx);
     }
@@ -131,6 +138,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         block,
         txs,
         transfers,
+        anchoring,
         tokens: Vec::new(),
     }
 }
@@ -387,18 +395,29 @@ fn derive_fee_from_transfer(tx: &mut Transaction, log: &Value, to: &str, amount:
     }
 }
 
-/// Index one receipt log: a transfer lands in `transfers`, and may also tell the
-/// transaction what it was charged.
+/// Index one receipt log: an anchoring write lands in `anchoring`, a transfer in
+/// `transfers`, and a transfer may also tell the transaction what it was charged.
 fn index_log(
     tx: &mut Transaction,
     log: &Value,
     log_index: i64,
     transfers: &mut Vec<TransferEvent>,
+    anchoring: &mut Vec<AnchoringEvent>,
 ) {
     let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
     let Some(decoded) = decode_event(log) else {
         return;
     };
+    // Only the contract's own logs: any contract may emit under the same signature.
+    if emitter.eq_ignore_ascii_case(crate::anchoring::ADDRESS) {
+        anchoring.extend(anchoring_event(
+            &decoded,
+            &tx.hash,
+            tx.block_number,
+            log_index,
+            tx.timestamp,
+        ));
+    }
     // Transfers, so the address and token transfer tabs have data.
     if !matches!(
         decoded.name.as_deref(),
@@ -429,10 +448,34 @@ fn index_log(
     });
 }
 
+/// One anchoring row; `None` for a log that names no registry, whatever its topic0.
+fn anchoring_event(
+    decoded: &DecodedEvent,
+    tx_hash: &str,
+    block_number: i64,
+    log_index: i64,
+    timestamp: i64,
+) -> Option<AnchoringEvent> {
+    Some(AnchoringEvent {
+        tx_hash: tx_hash.to_string(),
+        block_number,
+        log_index,
+        timestamp,
+        event: decoded.name.clone()?,
+        registry_id: decoded.param("registryId")?.parse().ok()?,
+        record_id: decoded
+            .param("recordId")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        caller: decoded.param("caller").unwrap_or_default().to_string(),
+    })
+}
+
 fn apply_receipt(
     tx: &mut Transaction,
     receipt: &Value,
     transfers: &mut Vec<TransferEvent>,
+    anchoring: &mut Vec<AnchoringEvent>,
     next_log_index: &mut u64,
 ) {
     apply_receipt_fields(tx, receipt);
@@ -452,7 +495,7 @@ fn apply_receipt(
             .filter(|n| *n >= 0)
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
-        index_log(tx, log, log_index, transfers);
+        index_log(tx, log, log_index, transfers, anchoring);
     }
 }
 
