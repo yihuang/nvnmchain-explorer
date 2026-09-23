@@ -606,6 +606,17 @@ pub fn get_min_block_number(db: &Db) -> Option<i64> {
     .flatten()
 }
 
+/// One block's timestamp; `None` when the block is not indexed.
+pub fn get_block_timestamp(conn: &Connection, number: i64) -> Option<i64> {
+    query_opt(
+        conn,
+        "get_block_timestamp",
+        "SELECT timestamp FROM blocks WHERE number = ?1",
+        params![number],
+        |r| r.get(0),
+    )
+}
+
 /// Blocks between two heights, newest first. Fewer than the range's width is
 /// normal: backfill descends, so the index has holes until it lands.
 pub fn get_blocks_in_range(db: &Db, from: i64, to: i64) -> Vec<Block> {
@@ -1047,7 +1058,7 @@ pub fn search_tokens(db: &Db, q: &str, limit: u32) -> Vec<TokenMetadata> {
 
 /// Insert one anchoring write; `false` when (block_number, log_index) is
 /// already stored.
-fn insert_anchoring(conn: &Connection, event: &AnchoringEvent) -> Result<bool> {
+pub(crate) fn insert_anchoring(conn: &Connection, event: &AnchoringEvent) -> Result<bool> {
     let inserted = exec_cached(
         conn,
         "INSERT OR IGNORE INTO anchoring_events (tx_hash, block_number, log_index, timestamp, event, registry_id, record_id, caller)

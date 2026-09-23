@@ -855,6 +855,13 @@ fn anchoring_events_read_back_by_registry() {
     assert_eq!(events[0].tx_hash, tx.hash);
     assert_eq!(events[0].caller, checksum_address(caller));
     assert!(db::get_anchoring_events(&db, 2191).is_empty());
+
+    let conn = db::lock(&db);
+    assert_eq!(
+        db::get_block_timestamp(&conn, block.number),
+        Some(block.timestamp)
+    );
+    assert_eq!(db::get_block_timestamp(&conn, block.number + 1), None);
 }
 
 /// A transfer written by the indexer must read back through every listing that

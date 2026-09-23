@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use anyhow::Result;
-use rusqlite::params;
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -508,6 +508,81 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
     Ok(())
 }
 
+/// The height the anchoring backfill has read the node's logs up to.
+const BACKFILL_KEY: &str = "anchoring_backfilled_to";
+
+/// Blocks per `eth_getLogs`; halved while the node refuses the range.
+const WINDOW: u64 = 50_000;
+
+/// Fill `anchoring_events` for blocks indexed before the table existed, from the
+/// node's logs rather than the blocks they sit in. Rows are keyed by (block, log
+/// index), so overlap with the block path is free, and the watermark lets a
+/// stopped run resume at its last window.
+async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
+    let done: u64 = db::get_kv(db, BACKFILL_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let head = rpc.eth_block_number().await.context("head for backfill")?;
+    if done >= head {
+        return Ok(());
+    }
+    info!("backfilling anchoring events from {done} to {head}");
+    let (mut from, mut wrote, mut window) = (done, 0usize, WINDOW);
+    while from <= head {
+        let to = (from + window - 1).min(head);
+        let logs = match rpc
+            .eth_get_logs(json!({
+                "address": crate::anchoring::ADDRESS,
+                "fromBlock": format!("0x{from:x}"),
+                "toBlock": format!("0x{to:x}"),
+            }))
+            .await
+        {
+            Ok(logs) => logs,
+            // Almost always the node's range cap: halve and retry the same start.
+            Err(e) if window > 1 => {
+                window /= 2;
+                warn!("anchoring logs {from}..{to} refused ({e}); window now {window}");
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("anchoring logs {from}..{to}")),
+        };
+        // One transaction per window, watermark included, holding the shared
+        // connection only to write.
+        {
+            let mut conn = db::lock(db);
+            let txn = conn.transaction()?;
+            for log in &logs {
+                if let Some(event) = anchoring_event_from_log(&txn, log) {
+                    wrote += usize::from(db::insert_anchoring(&txn, &event)?);
+                }
+            }
+            db::set_kv(&txn, BACKFILL_KEY, &to.to_string())?;
+            txn.commit()?;
+        }
+        from = to + 1;
+        // Leave the node to the indexer between windows.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    info!("backfilled {wrote} anchoring event(s) to block {head}");
+    Ok(())
+}
+
+/// One row from a raw log, stamped from the block the indexer already holds. A
+/// block not indexed yet brings its own rows when it is.
+fn anchoring_event_from_log(conn: &Connection, log: &Value) -> Option<AnchoringEvent> {
+    let block_number = crate::rpc::parse_int_any(log.get("blockNumber")?);
+    let timestamp = db::get_block_timestamp(conn, block_number)?;
+    let decoded = decode_event(log)?;
+    anchoring_event(
+        &decoded,
+        decoded.transaction_hash.as_deref()?,
+        block_number,
+        crate::rpc::parse_int_any(log.get("logIndex")?),
+        timestamp,
+    )
+}
+
 /// Re-fetch rows the database cannot be trusted for: a name or symbol carrying
 /// control characters, from the pre-fix ABI string decoder, and the reserved
 /// tokens, which an older build named from a table of its own. Run at startup
@@ -912,6 +987,14 @@ pub async fn run_forever(
     });
     let rebuild_db = db.clone();
     tokio::spawn(async move { repair_derived_tables(&rebuild_db) });
+    // Anchoring rows for blocks indexed before the table existed.
+    let anchoring_rpc = rpc.clone();
+    let anchoring_db = db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = backfill_anchoring(&anchoring_rpc, &anchoring_db).await {
+            warn!("anchoring backfill failed: {e:#}");
+        }
+    });
 
     let (bundle_tx, mut bundle_rx) = mpsc::channel::<BlockBundle>(1024);
     let writer_db = db.clone();
