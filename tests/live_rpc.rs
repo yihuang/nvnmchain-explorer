@@ -28,28 +28,49 @@ fn rpc() -> ChainRpc {
     ChainRpc::new(DEFAULT_RPC_URL).expect("rpc client")
 }
 
-/// A known block with a TIP-20 transfer on the nvnm chain.
-const TX_BLOCK: u64 = 527_321;
-const TX_HASH: &str = "0x70a29ffa8498bfea439958fd6c782bf64be6f0e526fc3afb1fef8d9bb81cbec7";
+/// A recent block that has transactions, and their hashes in block order.
+///
+/// Found rather than pinned: a constant block is a fixture on one chain, and
+/// this one has been reset out from under these tests once already.
+async fn block_with_txs(rpc: &ChainRpc) -> Option<(u64, Vec<String>)> {
+    let head = rpc.eth_block_number().await.ok()?;
+    for number in (head.saturating_sub(600)..=head).rev() {
+        let block = rpc.eth_get_block_by_number(number, false).await.ok()??;
+        let hashes: Vec<String> = block
+            .get("transactions")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|h| h.as_str().map(str::to_string))
+            .collect();
+        if !hashes.is_empty() {
+            return Some((number, hashes));
+        }
+    }
+    None
+}
 
 #[tokio::test]
 async fn block_receipts_in_one_call() {
     let rpc = rpc();
+    let Some((number, hashes)) = block_with_txs(&rpc).await else {
+        eprintln!("skipping: no block with transactions near the head");
+        return;
+    };
     let receipts = rpc
-        .eth_get_block_receipts(TX_BLOCK)
+        .eth_get_block_receipts(number)
         .await
         .expect("eth_getBlockReceipts")
         .expect("receipts");
-    assert_eq!(receipts.len(), 1);
+    // One per transaction, in the block's own order.
     assert_eq!(
-        receipts[0].get("transactionHash").and_then(Value::as_str),
-        Some(TX_HASH)
+        receipts
+            .iter()
+            .filter_map(|r| r.get("transactionHash").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        hashes.iter().map(String::as_str).collect::<Vec<_>>()
     );
     assert!(receipts[0].get("feeToken").is_some());
-    assert_eq!(
-        receipts[0].get("status").and_then(Value::as_str),
-        Some("0x1")
-    );
+    assert!(receipts[0].get("status").and_then(Value::as_str).is_some());
 }
 
 #[tokio::test]
@@ -76,16 +97,19 @@ async fn batched_calls_return_in_order() {
 #[tokio::test]
 async fn fetch_block_receipts_fallback() {
     let rpc = rpc();
-    let hashes = vec![TX_HASH.to_string()];
+    let Some((number, hashes)) = block_with_txs(&rpc).await else {
+        eprintln!("skipping: no block with transactions near the head");
+        return;
+    };
     let receipts = rpc
-        .fetch_block_receipts(TX_BLOCK, &hashes)
+        .fetch_block_receipts(number, &hashes)
         .await
         .expect("receipts")
         .expect("non-empty");
-    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts.len(), hashes.len());
     assert_eq!(
         receipts[0].get("transactionHash").and_then(Value::as_str),
-        Some(TX_HASH)
+        Some(hashes[0].as_str())
     );
 }
 
