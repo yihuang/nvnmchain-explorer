@@ -518,7 +518,7 @@ const WINDOW: u64 = 50_000;
 /// node's logs rather than the blocks they sit in. Rows are keyed by (block, log
 /// index), so overlap with the block path is free, and the watermark lets a
 /// stopped run resume at its last window.
-async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
+pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
     let done: u64 = db::get_kv(db, BACKFILL_KEY)
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -528,6 +528,7 @@ async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
     }
     info!("backfilling anchoring events from {done} to {head}");
     let (mut from, mut wrote, mut window) = (done, 0usize, WINDOW);
+    let mut backoff = Duration::from_secs(1);
     while from <= head {
         let to = (from + window - 1).min(head);
         let logs = match rpc
@@ -539,14 +540,24 @@ async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
             .await
         {
             Ok(logs) => logs,
-            // Almost always the node's range cap: halve and retry the same start.
-            Err(e) if window > 1 => {
+            // The node answered with an error: almost always its range cap.
+            Err(e) if e.downcast_ref::<crate::rpc::RpcError>().is_some() => {
+                if window == 1 {
+                    return Err(e).with_context(|| format!("anchoring logs {from}..{to}"));
+                }
                 window /= 2;
                 warn!("anchoring logs {from}..{to} refused ({e}); window now {window}");
                 continue;
             }
-            Err(e) => return Err(e).with_context(|| format!("anchoring logs {from}..{to}")),
+            // The node did not answer: wait and retry the same range.
+            Err(e) => {
+                warn!("anchoring logs {from}..{to} failed ({e:#}); retrying in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+                continue;
+            }
         };
+        backoff = Duration::from_secs(1);
         // One transaction per window, watermark included, holding the shared
         // connection only to write.
         {
