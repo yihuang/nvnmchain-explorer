@@ -1,7 +1,7 @@
 use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::decoder::{
     checksum_address, decode_abi_args, decode_event, decode_function_call, extract_balance_changes,
-    extract_calls, flatten_trace, TRANSFER_TOPIC,
+    extract_calls, flatten_trace, keccak_hex, TRANSFER_TOPIC,
 };
 use nvnmchain_explorer::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
@@ -1369,4 +1369,34 @@ fn a_truncated_static_array_decodes_nothing() {
         decode_abi_args(&["uint256[3]"], &bytes),
         Vec::<String>::new()
     );
+}
+
+/// A log short of the topics or data its event declares keeps its name, with no arguments.
+#[test]
+fn a_log_that_does_not_fit_its_event_decodes_no_arguments() {
+    let validator = format!("0x{}{}", "00".repeat(12), "11".repeat(20));
+    for (name, topics, data) in [
+        (
+            "Staked",
+            vec![keccak_hex(b"Staked(address,address,uint256)")],
+            format!("0x{:064x}", 1u64),
+        ),
+        (
+            "RouterCreated",
+            vec![
+                keccak_hex(b"RouterCreated(address,address,address,uint256)"),
+                validator,
+            ],
+            "0x".to_string(),
+        ),
+    ] {
+        let log =
+            json!({ "address": format!("0x{}", "cc".repeat(20)), "topics": topics, "data": data });
+        let event = decode_event(&log).expect("decoded event");
+        assert_eq!(event.name.as_deref(), Some(name));
+        assert!(
+            event.params.is_empty(),
+            "{name} decoded arguments it does not carry"
+        );
+    }
 }

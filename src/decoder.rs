@@ -29,17 +29,74 @@ use crate::models::Transaction;
 // The ABI registry
 // ---------------------------------------------------------------------------
 
-/// What no binding declares: the errors every Solidity `revert` produces.
+/// What no binding declares: Solidity's `revert` errors, and the staking and
+/// fee-routing events, whose ABIs are not in the contracts submodule.
 ///
 /// Written as signatures rather than hand-built ABIs. A signature is what the
 /// selector hashes, so there is one spelling to get right and it reads like
 /// Solidity; a mistyped type does not parse at all, which
-/// `every_local_declaration_parses` catches, and `local_selectors_are_pinned`
-/// pins what they hash to so a renamed argument cannot pass unnoticed.
-const LOCAL: &[(&str, &[&str])] = &[(
-    "solidity",
-    &["error Error(string message)", "error Panic(uint256 code)"],
-)];
+/// `every_local_declaration_parses` catches, and `local_selectors_are_pinned` and
+/// `local_event_topics_are_pinned` pin what they hash to.
+const LOCAL: &[(&str, &[&str])] = &[
+    (
+        "solidity",
+        &["error Error(string message)", "error Panic(uint256 code)"],
+    ),
+    (
+        "staking",
+        &[
+            "event Staked(address indexed validator, address indexed user, uint256 amount)",
+            "event Unstaked(address indexed validator, address indexed user, uint256 amount)",
+            "event UnstakeRequested(address indexed validator, address indexed user, uint256 amount, uint256 releaseAt)",
+            "event Withdrawn(address indexed validator, address indexed user, uint256 amount)",
+            "event RewardDeposited(address indexed validator, address indexed from, uint256 amount)",
+            "event RewardClaimed(address indexed validator, address indexed user, uint256 amount)",
+            "event RewardCompounded(address indexed validator, address indexed from, uint256 amount)",
+            "event BondUnbonding(address indexed validator, uint256 amount, uint256 releaseAt)",
+            "event BondWithdrawn(address indexed validator, uint256 amount)",
+            "event Slashed(address indexed validator, uint256 bps, uint256 seized)",
+            "event SlasherSet(address slasher)",
+            "event CandidateSet(address indexed validator, bool active)",
+            "event BondReceived(address indexed validator, uint256 amount, uint256 bond)",
+            "event BondGatewaySet(address gateway)",
+            "event CandidacyBondSet(uint256 bond)",
+            "event CommitteeConfigSet(uint256 maxSeats, uint256 acquiredWeight, uint256 maxDelegated)",
+            "event MinAcquiredSet(uint256 minAcquired)",
+            "event MinSeatsSet(uint256 minSeats)",
+            "event UnbondingPeriodSet(uint256 period)",
+            "event RewardDurationSet(uint256 duration)",
+            // The proxy's own: its upgrades and its owner's two-step handover.
+            "event Upgraded(address indexed implementation)",
+            "event OwnershipHandoverRequested(address indexed pendingOwner)",
+            "event OwnershipHandoverCanceled(address indexed pendingOwner)",
+        ],
+    ),
+    (
+        "fee-routing",
+        &[
+            "event Flushed(address indexed token, uint256 commission, uint256 devshare, uint256 buyback, uint256 boughtBack, uint256 deposited)",
+            "event Swept(address indexed token, address indexed to, uint256 amount)",
+            "event BuybackSwapFailed(address indexed swapper, uint256 amount)",
+            "event DelegatorShareUnrouted(address indexed token, uint256 amount)",
+            "event RouterCreated(address indexed validator, address router, address operator, uint256 commissionBps)",
+            "event MaxCommissionSet(uint256 bps)",
+            "event SwapperSet(address swapper, uint256 swapGas)",
+            "event GuardedSwap(uint256 amountIn, uint256 amountOut, uint256 price, uint256 emaPrice)",
+            "event GuardsSet(address inner, uint256 maxAmountIn, uint256 maxDeviationBps, uint256 emaAlphaBps)",
+            "event DriftBandSet(uint256 maxDriftBps)",
+            "event RouterFactorySet(address routerFactory)",
+            "event PriceSeeded(uint256 price)",
+            "event Deposited(address indexed token, address indexed operator, uint256 amount)",
+            "event Paid(address indexed token, address indexed operator, uint256 amount)",
+            "event Affiliated(address indexed validator, bool affiliated)",
+            "event Voted(address indexed validator, bool support)",
+            "event Commenced(uint256 active, uint256 affiliatedCount, uint256 votes)",
+            "event SplitProposed(uint256 indexed id, address indexed validator, uint256 devBps, uint256 buyBps)",
+            "event SplitVoted(uint256 indexed id, address indexed validator, bool support)",
+            "event SplitApplied(uint256 indexed id, uint256 devBps, uint256 buyBps)",
+        ],
+    ),
+];
 
 /// Every Tempo precompile, from the chain's own `tempo-contracts` bindings.
 ///
@@ -1146,6 +1203,69 @@ mod tests {
         ] {
             let found = format!("0x{}", hex::encode(selector(signature)));
             assert_eq!(found, expected, "for {signature}");
+        }
+    }
+
+    /// The events are pinned to the head of the topic nvnm-contracts' ABIs give them, so a
+    /// declaration here cannot be edited, or added, without being checked against the contract.
+    #[test]
+    fn local_event_topics_are_pinned() {
+        let pinned = HashMap::from([
+            ("Staked", "0x5dac0c1b"),
+            ("Unstaked", "0xd8654fcc"),
+            ("UnstakeRequested", "0xfe07ce9f"),
+            ("Withdrawn", "0xd1c19fbc"),
+            ("RewardDeposited", "0xecc7fa2c"),
+            ("RewardClaimed", "0x0aa4d283"),
+            ("RewardCompounded", "0xbd5e0a43"),
+            ("BondUnbonding", "0xddfe568e"),
+            ("BondWithdrawn", "0x0d41118e"),
+            ("Slashed", "0x45a371af"),
+            ("SlasherSet", "0x93984378"),
+            ("CandidateSet", "0x74d99078"),
+            ("BondReceived", "0x4ee05ae4"),
+            ("BondGatewaySet", "0x219297b7"),
+            ("CandidacyBondSet", "0x795412f3"),
+            ("CommitteeConfigSet", "0x768a2102"),
+            ("MinAcquiredSet", "0x7177ff04"),
+            ("MinSeatsSet", "0x9e34f1fd"),
+            ("UnbondingPeriodSet", "0xded42220"),
+            ("RewardDurationSet", "0x823b3ced"),
+            ("Upgraded", "0xbc7cd75a"),
+            ("OwnershipHandoverRequested", "0xdbf36a10"),
+            ("OwnershipHandoverCanceled", "0xfa7b8eab"),
+            ("Flushed", "0x21293324"),
+            ("Swept", "0x7b09c29f"),
+            ("BuybackSwapFailed", "0x3e667ff4"),
+            ("DelegatorShareUnrouted", "0x87329e39"),
+            ("RouterCreated", "0x2623a283"),
+            ("MaxCommissionSet", "0xac4251ee"),
+            ("SwapperSet", "0x08f7a5f7"),
+            ("GuardedSwap", "0xd856d317"),
+            ("GuardsSet", "0x61be3f9a"),
+            ("DriftBandSet", "0xe50b5f70"),
+            ("RouterFactorySet", "0xa68244d6"),
+            ("PriceSeeded", "0x1da43889"),
+            ("Deposited", "0x8752a472"),
+            ("Paid", "0x9def4e28"),
+            ("Affiliated", "0x52a6c8ac"),
+            ("Voted", "0x8eb81cb8"),
+            ("Commenced", "0x9165ad70"),
+            ("SplitProposed", "0xa992fd28"),
+            ("SplitVoted", "0x04f4e482"),
+            ("SplitApplied", "0x8b2f5b42"),
+        ]);
+        for (group, declarations) in LOCAL {
+            for event in local_contract(group, declarations).events() {
+                let topic = keccak256(event_signature(event).as_bytes());
+                let found = format!("0x{}", hex::encode(&topic[..4]));
+                assert_eq!(
+                    pinned.get(event.name.as_str()),
+                    Some(&found.as_str()),
+                    "for {}",
+                    event.name
+                );
+            }
         }
     }
 
