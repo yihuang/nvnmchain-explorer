@@ -3,7 +3,9 @@ use nvnmchain_explorer::decoder::{
     checksum_address, decode_abi_args, decode_event, decode_function_call, extract_balance_changes,
     extract_calls, flatten_trace, keccak_hex, TRANSFER_TOPIC,
 };
-use nvnmchain_explorer::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
+use nvnmchain_explorer::models::{
+    AnchoringEvent, BlockBundle, RouterCreated, Transaction, TransferEvent,
+};
 use nvnmchain_explorer::parse::{parse_block, parse_transaction};
 use nvnmchain_explorer::tokens::{
     decode_string_result, format_token_amount, has_control_chars, sanitize_metadata_text, TokenMeta,
@@ -608,6 +610,7 @@ fn blob_hex_round_trip() {
         transfers: vec![],
         anchoring: Vec::new(),
         tokens: vec![],
+        routers: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");
 
@@ -681,6 +684,7 @@ fn counters_are_seeded_from_the_tables_of_an_older_database() {
             txs: vec![tx],
             transfers: vec![],
             anchoring: Vec::new(),
+            routers: vec![],
             tokens: vec![],
         },
     )
@@ -729,6 +733,7 @@ fn holder_count_follows_the_balances() {
             txs: vec![tx.clone()],
             transfers: vec![transfer],
             anchoring: Vec::new(),
+            routers: vec![],
             tokens: vec![meta.clone()],
         };
         db::save_block_bundle(&db, &bundle).expect("save");
@@ -768,6 +773,7 @@ fn duplicate_bundle_is_idempotent() {
         transfers: vec![transfer],
         anchoring: Vec::new(),
         tokens: vec![],
+        routers: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("first save");
     db::save_block_bundle(&db, &bundle).expect("duplicate save");
@@ -840,6 +846,7 @@ fn anchoring_events_read_back_by_registry() {
         transfers: vec![],
         anchoring: vec![event(0, "AddRegistry", 0), event(1, "AddRecord", 7)],
         tokens: vec![],
+        routers: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("save");
     db::save_block_bundle(&db, &bundle).expect("re-save");
@@ -893,6 +900,7 @@ fn indexed_transfer_reads_back_through_every_listing() {
         transfers: vec![transfer],
         anchoring: Vec::new(),
         tokens: vec![meta],
+        routers: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");
 
@@ -1010,6 +1018,7 @@ fn blob_storage_queries_match_text_params() {
         transfers: vec![transfer],
         anchoring: Vec::new(),
         tokens: vec![meta],
+        routers: vec![],
     };
     db::save_block_bundle(&db, &bundle).expect("save bundle");
 
@@ -1399,4 +1408,35 @@ fn a_log_that_does_not_fit_its_event_decodes_no_arguments() {
             "{name} decoded arguments it does not carry"
         );
     }
+}
+
+#[test]
+fn a_router_is_named_only_by_the_factory_asked() {
+    let (_dir, db) = temp_db("routers.db");
+    let [factory, impostor, router, validator, stolen] =
+        ["fa", "bb", "c0", "11", "99"].map(|b| checksum_address(&format!("0x{}", b.repeat(20))));
+    let row = |factory: &str, validator: &str| RouterCreated {
+        factory: factory.into(),
+        router: router.clone(),
+        validator: validator.into(),
+        block_number: 1,
+    };
+    let bundle = BlockBundle {
+        block: parse_block(&sample_raw_block()),
+        txs: vec![],
+        transfers: vec![],
+        anchoring: vec![],
+        tokens: vec![],
+        routers: vec![row(&factory, &validator), row(&impostor, &stolen)],
+    };
+    db::save_block_bundle(&db, &bundle).expect("save bundle");
+
+    assert_eq!(
+        db::get_router_validator(&db, &router, &factory),
+        Some(validator)
+    );
+    assert_eq!(
+        db::get_router_validator(&db, &router, &impostor),
+        Some(stolen)
+    );
 }

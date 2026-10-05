@@ -302,6 +302,16 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_anchoring_registry
             ON anchoring_events(registry_id, block_number DESC, log_index DESC);
 
+        -- Any contract can emit RouterCreated, so a row keeps its emitter and a
+        -- read asks for the configured factory's.
+        CREATE TABLE IF NOT EXISTS routers (
+            address BLOB NOT NULL,
+            factory BLOB NOT NULL,
+            validator BLOB NOT NULL,
+            block_number INTEGER NOT NULL,
+            PRIMARY KEY (address, factory)
+        );
+
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL DEFAULT '',
@@ -543,6 +553,19 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<()> {
         upsert_token_meta(txn, meta)?;
     }
     apply_transfer_balances(txn, &inserted)?;
+    for event in &bundle.routers {
+        exec_cached(
+            txn,
+            "INSERT OR REPLACE INTO routers (address, factory, validator, block_number)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                hex_blob(&event.router),
+                hex_blob(&event.factory),
+                hex_blob(&event.validator),
+                event.block_number,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -1628,6 +1651,18 @@ pub fn sync_holder_counts(conn: &Connection) -> Result<()> {
     }
     txn.commit()?;
     Ok(())
+}
+
+/// The validator `factory` announced router `addr` for.
+pub fn get_router_validator(db: &Db, addr: &str, factory: &str) -> Option<String> {
+    query_opt(
+        &lock(db),
+        "get_router_validator",
+        "SELECT validator FROM routers WHERE address=?1 AND factory=?2",
+        params![hex_blob(addr), hex_blob(factory)],
+        |r| r.get::<_, Vec<u8>>(0),
+    )
+    .map(|v| blob_addr(&v))
 }
 
 /// What `address` holds. A balance goes negative only while the outbound transfers

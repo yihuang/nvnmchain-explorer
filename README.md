@@ -142,6 +142,8 @@ The indexer is built for a sub-second chain:
 | `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
 | `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
+| `CONTRACT_LABELS` | unset | `addr=Name` pairs naming deployed contracts ([Labels](#labels)) |
+| `ROUTER_FACTORY` | unset | Factory whose `RouterCreated` logs name fee routers ([Labels](#labels)) |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
 
 ## Routes
@@ -204,6 +206,16 @@ A selector nothing declares is looked up once in a public signature directory
 when it hashes to the selector it was offered for, and is badged as the
 stranger's name it is. Set `SIGNATURE_LOOKUP_URL=` (empty) and the explorer
 talks to no third party.
+
+## Labels
+
+```
+CONTRACT_LABELS=0xAbC...=NVNM Staking,0xdEf...=Fee Lockbox
+```
+
+A fee router's page links to its validator. Routers are recorded as their block
+is indexed, from any factory: changing `ROUTER_FACTORY` needs no re-sync, a
+router created before this version indexed its block does.
 
 ## Indexer
 
