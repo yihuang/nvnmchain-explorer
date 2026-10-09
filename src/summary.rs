@@ -934,6 +934,25 @@ static PHRASES: &[Phrase] = &[
         "Set Slasher",
         &[Slot::Account("slasher")],
     ),
+    // Evidence that the validator's key signed conflicting votes; the `Slashed` beside it says
+    // what that cost.
+    phrase(
+        "Equivocated(address,uint64,uint64)",
+        "double sign",
+        "Convict of Double Signing",
+        &[Slot::Account("validator")],
+    )
+    .notes(&[
+        ("Epoch", Slot::Value("epoch")),
+        ("View", Slot::Value("viewNumber")),
+    ]),
+    phrase(
+        "EquivocationSet(uint256,uint256)",
+        "double-sign penalty set",
+        "Set Double-Sign Penalty",
+        &[Slot::Value("bps"), Slot::Word("bps")],
+    )
+    .notes(&[("Evidence counts for (epochs)", Slot::Value("evidenceEpochs"))]),
     // Who may credit bonds.
     phrase(
         "BondGatewaySet(address)",
@@ -1935,6 +1954,18 @@ mod tests {
                 vec![who.clone()],
                 word(0),
                 "Remove Candidate 0x1111…1111",
+            ),
+            (
+                "Equivocated(address,uint64,uint64)",
+                vec![who.clone()],
+                format!("0x{:064x}{:064x}", 7, 3),
+                "Convict of Double Signing 0x1111…1111",
+            ),
+            (
+                "EquivocationSet(uint256,uint256)",
+                vec![],
+                format!("0x{:064x}{:064x}", 1_000, 100),
+                "Set Double-Sign Penalty 1000 bps",
             ),
             (
                 "BondReceived(address,uint256,uint256)",
