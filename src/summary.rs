@@ -853,6 +853,374 @@ static PHRASES: &[Phrase] = &[
         ("Registry", Slot::Value("registryId")),
         ("Record", Slot::Value("checksum")),
     ]),
+    // ---- Staking --------------------------------------------------------
+    // Amounts are not in the emitter's own token, so they are plain values.
+    phrase(
+        "Staked(address,address,uint256)",
+        "staked",
+        "Stake",
+        &[Slot::Value("amount"), Slot::Word("toward"), Slot::Account("validator")],
+    )
+    .notes(&[("Staker", Slot::Account("user"))]),
+    phrase(
+        "Unstaked(address,address,uint256)",
+        "unstaked",
+        "Unstake",
+        &[Slot::Value("amount"), Slot::Word("from"), Slot::Account("validator")],
+    )
+    .notes(&[("Staker", Slot::Account("user"))]),
+    phrase(
+        "UnstakeRequested(address,address,uint256,uint256)",
+        "unstake requested",
+        "Request Unstake",
+        &[Slot::Value("amount"), Slot::Word("from"), Slot::Account("validator")],
+    )
+    .notes(&[
+        ("Staker", Slot::Account("user")),
+        ("Withdrawable at", Slot::Value("releaseAt")),
+    ]),
+    phrase(
+        "Withdrawn(address,address,uint256)",
+        "withdrew",
+        "Withdraw",
+        &[Slot::Value("amount"), Slot::Word("from"), Slot::Account("validator")],
+    )
+    .notes(&[("Staker", Slot::Account("user"))]),
+    phrase(
+        "RewardDeposited(address,address,uint256)",
+        "rewards deposited",
+        "Deposit Rewards",
+        &[Slot::Value("amount"), Slot::Word("for"), Slot::Account("validator")],
+    )
+    .notes(&[("From", Slot::Account("from"))]),
+    phrase(
+        "RewardClaimed(address,address,uint256)",
+        "rewards claimed",
+        "Claim Rewards",
+        &[Slot::Value("amount"), Slot::Word("from"), Slot::Account("validator")],
+    )
+    .notes(&[("Staker", Slot::Account("user"))]),
+    phrase(
+        "RewardCompounded(address,address,uint256)",
+        "rewards compounded",
+        "Compound Rewards",
+        &[Slot::Value("amount"), Slot::Word("into"), Slot::Account("validator")],
+    )
+    .notes(&[("From", Slot::Account("from"))]),
+    phrase(
+        "BondUnbonding(address,uint256,uint256)",
+        "bond unbonding",
+        "Unbond",
+        &[Slot::Value("amount"), Slot::Word("from"), Slot::Account("validator")],
+    )
+    .notes(&[("Withdrawable at", Slot::Value("releaseAt"))]),
+    phrase(
+        "BondWithdrawn(address,uint256)",
+        "bond withdrawn",
+        "Withdraw Bond",
+        &[Slot::Value("amount"), Slot::Word("from"), Slot::Account("validator")],
+    ),
+    phrase(
+        "Slashed(address,uint256,uint256)",
+        "slashed",
+        "Slash",
+        &[Slot::Value("seized"), Slot::Word("from"), Slot::Account("validator")],
+    )
+    .notes(&[("Rate (bps)", Slot::Value("bps"))]),
+    // Who may slash bonds, without the owner's timelock.
+    phrase(
+        "SlasherSet(address)",
+        "slasher set",
+        "Set Slasher",
+        &[Slot::Account("slasher")],
+    ),
+    // Who may credit bonds.
+    phrase(
+        "BondGatewaySet(address)",
+        "bond gateway set",
+        "Set Bond Gateway",
+        &[Slot::Account("gateway")],
+    ),
+    phrase(
+        "BondReceived(address,uint256,uint256)",
+        "bond received",
+        "Receive Bond",
+        &[Slot::Value("amount"), Slot::Word("for"), Slot::Account("validator")],
+    )
+    .notes(&[("Total bond", Slot::Value("bond"))]),
+    phrase(
+        "CandidateSet(address,bool)",
+        "candidate set",
+        "Add Candidate",
+        &[Slot::Account("validator")],
+    ),
+    phrase(
+        "CandidacyBondSet(uint256)",
+        "candidacy bond set",
+        "Set Candidacy Bond",
+        &[Slot::Value("bond")],
+    ),
+    phrase(
+        "CommitteeConfigSet(uint256,uint256,uint256)",
+        "committee config set",
+        "Set Committee Config",
+        &[],
+    )
+    .notes(&[
+        ("Max seats", Slot::Value("maxSeats")),
+        ("Acquired weight", Slot::Value("acquiredWeight")),
+        ("Max delegated", Slot::Value("maxDelegated")),
+    ]),
+    phrase(
+        "MinAcquiredSet(uint256)",
+        "min acquired set",
+        "Set Min Acquired Stake",
+        &[Slot::Value("minAcquired")],
+    ),
+    phrase(
+        "MinSeatsSet(uint256)",
+        "min seats set",
+        "Set Min Seats",
+        &[Slot::Value("minSeats")],
+    ),
+    phrase(
+        "UnbondingPeriodSet(uint256)",
+        "unbonding period set",
+        "Set Unbonding Period",
+        &[Slot::Value("period"), Slot::Word("seconds")],
+    ),
+    phrase(
+        "RewardDurationSet(uint256)",
+        "reward duration set",
+        "Set Reward Duration",
+        &[Slot::Value("duration"), Slot::Word("seconds")],
+    ),
+    phrase(
+        "Upgraded(address)",
+        "upgraded",
+        "Upgrade",
+        &[Slot::Word("to"), Slot::Account("implementation")],
+    ),
+    phrase(
+        "OwnershipHandoverRequested(address)",
+        "ownership handover requested",
+        "Request Ownership",
+        &[Slot::Word("for"), Slot::Account("pendingOwner")],
+    ),
+    phrase(
+        "OwnershipHandoverCanceled(address)",
+        "ownership handover canceled",
+        "Cancel Ownership Request",
+        &[Slot::Word("for"), Slot::Account("pendingOwner")],
+    ),
+    // ---- Fee routing ----------------------------------------------------
+    phrase(
+        "Flushed(address,uint256,uint256,uint256,uint256,uint256)",
+        "fees flushed",
+        "Flush Fees",
+        &[Slot::Word("of"), Slot::Token("token")],
+    )
+    // What was bought back is in the staking token, which the log does not name.
+    .notes(&[
+        (
+            "Commission",
+            Slot::AmountOf {
+                value: "commission",
+                token: "token",
+            },
+        ),
+        (
+            "Devshare",
+            Slot::AmountOf {
+                value: "devshare",
+                token: "token",
+            },
+        ),
+        (
+            "Buyback",
+            Slot::AmountOf {
+                value: "buyback",
+                token: "token",
+            },
+        ),
+        ("Bought back", Slot::Value("boughtBack")),
+        (
+            "Deposited",
+            Slot::AmountOf {
+                value: "deposited",
+                token: "token",
+            },
+        ),
+    ]),
+    phrase(
+        "Swept(address,address,uint256)",
+        "swept",
+        "Sweep",
+        &[
+            Slot::AmountOf {
+                value: "amount",
+                token: "token",
+            },
+            Slot::Word("to"),
+            Slot::Account("to"),
+        ],
+    ),
+    phrase(
+        "BuybackSwapFailed(address,uint256)",
+        "buyback swap failed",
+        "Buyback Swap Failed",
+        &[Slot::Value("amount"), Slot::Word("via"), Slot::Account("swapper")],
+    ),
+    phrase(
+        "DelegatorShareUnrouted(address,uint256)",
+        "delegator share held",
+        "Hold Delegator Share",
+        &[Slot::AmountOf {
+            value: "amount",
+            token: "token",
+        }],
+    ),
+    phrase(
+        "RouterCreated(address,address,address,uint256)",
+        "fee router created",
+        "Create Fee Router",
+        &[Slot::Account("router"), Slot::Word("for"), Slot::Account("validator")],
+    )
+    .notes(&[
+        ("Operator", Slot::Account("operator")),
+        ("Commission (bps)", Slot::Value("commissionBps")),
+    ]),
+    phrase(
+        "GuardedSwap(uint256,uint256,uint256,uint256)",
+        "buyback swapped",
+        "Buyback Swap",
+        &[Slot::Value("amountIn"), Slot::Word("for"), Slot::Value("amountOut")],
+    )
+    .notes(&[
+        ("Price", Slot::Value("price")),
+        ("EMA price", Slot::Value("emaPrice")),
+    ]),
+    phrase(
+        "MaxCommissionSet(uint256)",
+        "max commission set",
+        "Set Max Commission",
+        &[Slot::Value("bps"), Slot::Word("bps")],
+    ),
+    phrase(
+        "SwapperSet(address,uint256)",
+        "swapper set",
+        "Set Swapper",
+        &[Slot::Account("swapper")],
+    )
+    .notes(&[("Swap gas", Slot::Value("swapGas"))]),
+    phrase(
+        "GuardsSet(address,uint256,uint256,uint256)",
+        "swap guards set",
+        "Set Swap Guards",
+        &[Slot::Word("over"), Slot::Account("inner")],
+    )
+    .notes(&[
+        ("Max amount in", Slot::Value("maxAmountIn")),
+        ("Max deviation (bps)", Slot::Value("maxDeviationBps")),
+        ("EMA alpha (bps)", Slot::Value("emaAlphaBps")),
+    ]),
+    phrase(
+        "DriftBandSet(uint256)",
+        "drift band set",
+        "Set Drift Band",
+        &[Slot::Value("maxDriftBps"), Slot::Word("bps")],
+    ),
+    phrase(
+        "RouterFactorySet(address)",
+        "router factory set",
+        "Set Router Factory",
+        &[Slot::Account("routerFactory")],
+    ),
+    phrase(
+        "PriceSeeded(uint256)",
+        "price seeded",
+        "Seed Price",
+        &[Slot::Value("price")],
+    ),
+    // ---- Fee lockbox: an operator's fees wait here until distribution commences.
+    phrase(
+        "Deposited(address,address,uint256)",
+        "fees held",
+        "Hold Fees",
+        &[
+            Slot::AmountOf {
+                value: "amount",
+                token: "token",
+            },
+            Slot::Word("for"),
+            Slot::Account("operator"),
+        ],
+    ),
+    phrase(
+        "Paid(address,address,uint256)",
+        "held fees paid",
+        "Pay Held Fees",
+        &[
+            Slot::AmountOf {
+                value: "amount",
+                token: "token",
+            },
+            Slot::Word("to"),
+            Slot::Account("operator"),
+        ],
+    ),
+    phrase(
+        "Affiliated(address,bool)",
+        "affiliation",
+        "Declare Affiliated",
+        &[Slot::Account("validator")],
+    ),
+    phrase(
+        "Voted(address,bool)",
+        "commencement vote",
+        "Vote to Commence",
+        &[Slot::Word("by"), Slot::Account("validator")],
+    ),
+    phrase(
+        "Commenced(uint256,uint256,uint256)",
+        "distribution commenced",
+        "Commence Distribution",
+        &[
+            Slot::Word("on"),
+            Slot::Value("votes"),
+            Slot::Word("of"),
+            Slot::Value("active"),
+            Slot::Word("votes"),
+        ],
+    )
+    .notes(&[("Affiliated validators", Slot::Value("affiliatedCount"))]),
+    // The fee split, voted proposal by proposal in the lockbox.
+    phrase(
+        "SplitProposed(uint256,address,uint256,uint256)",
+        "split proposed",
+        "Propose Fee Split",
+        &[Slot::Value("id"), Slot::Word("by"), Slot::Account("validator")],
+    )
+    .notes(&[
+        ("Devshare (bps)", Slot::Value("devBps")),
+        ("Buyback (bps)", Slot::Value("buyBps")),
+    ]),
+    phrase(
+        "SplitVoted(uint256,address,bool)",
+        "split vote",
+        "Back Fee Split",
+        &[Slot::Value("id"), Slot::Word("by"), Slot::Account("validator")],
+    ),
+    phrase(
+        "SplitApplied(uint256,uint256,uint256)",
+        "split applied",
+        "Apply Fee Split",
+        &[Slot::Value("id")],
+    )
+    .notes(&[
+        ("Devshare (bps)", Slot::Value("devBps")),
+        ("Buyback (bps)", Slot::Value("buyBps")),
+    ]),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1065,6 +1433,26 @@ fn refine(known: &mut KnownEvent, event: &DecodedEvent, sender: Option<&str>) {
         "whitelist updated" => {
             if !flag("allowed") {
                 known.action = "Remove From Whitelist".into();
+            }
+        }
+        "split vote" => {
+            if !flag("support") {
+                known.action = "Withdraw Fee Split Vote".into();
+            }
+        }
+        "affiliation" => {
+            if !flag("affiliated") {
+                known.action = "Declare Not Affiliated".into();
+            }
+        }
+        "commencement vote" => {
+            if !flag("support") {
+                known.action = "Withdraw Commencement Vote".into();
+            }
+        }
+        "candidate set" => {
+            if !flag("active") {
+                known.action = "Remove Candidate".into();
             }
         }
         "order placed" => {
@@ -1479,6 +1867,103 @@ mod tests {
         let revoked = say(&membership(false), None);
         assert_eq!(revoked.headline, "Revoke Role ISSUER_ROLE to 0x1111…1111");
         assert_eq!(revoked.kind, "revoke role");
+    }
+
+    /// Staking and lockbox events read as phrased; a false flag turns a vote or a declaration around.
+    #[test]
+    fn staking_events_read_as_phrased() {
+        let who = topic("0x1111111111111111111111111111111111111111");
+        let path_usd = topic("0x20c0000000000000000000000000000000000000");
+        let word = |n: u64| format!("0x{n:064x}");
+        for (signature, indexed, data, headline) in [
+            (
+                "Deposited(address,address,uint256)",
+                vec![path_usd.clone(), who.clone()],
+                word(2_500_000),
+                "Hold Fees 2.5 pathUSD for 0x1111…1111",
+            ),
+            (
+                "Paid(address,address,uint256)",
+                vec![path_usd.clone(), who.clone()],
+                word(2_500_000),
+                "Pay Held Fees 2.5 pathUSD to 0x1111…1111",
+            ),
+            (
+                "Voted(address,bool)",
+                vec![who.clone()],
+                word(1),
+                "Vote to Commence by 0x1111…1111",
+            ),
+            (
+                "Voted(address,bool)",
+                vec![who.clone()],
+                word(0),
+                "Withdraw Commencement Vote by 0x1111…1111",
+            ),
+            (
+                "Affiliated(address,bool)",
+                vec![who.clone()],
+                word(1),
+                "Declare Affiliated 0x1111…1111",
+            ),
+            (
+                "Affiliated(address,bool)",
+                vec![who.clone()],
+                word(0),
+                "Declare Not Affiliated 0x1111…1111",
+            ),
+            (
+                "SplitVoted(uint256,address,bool)",
+                vec![word(3), who.clone()],
+                word(0),
+                "Withdraw Fee Split Vote 3 by 0x1111…1111",
+            ),
+            (
+                "Swept(address,address,uint256)",
+                vec![path_usd.clone(), who.clone()],
+                word(2_500_000),
+                "Sweep 2.5 pathUSD to 0x1111…1111",
+            ),
+            (
+                "DelegatorShareUnrouted(address,uint256)",
+                vec![path_usd.clone()],
+                word(2_500_000),
+                "Hold Delegator Share 2.5 pathUSD",
+            ),
+            (
+                "CandidateSet(address,bool)",
+                vec![who.clone()],
+                word(0),
+                "Remove Candidate 0x1111…1111",
+            ),
+            (
+                "BondReceived(address,uint256,uint256)",
+                vec![who.clone()],
+                format!("0x{:064x}{:064x}", 500, 1_500),
+                "Receive Bond 500 for 0x1111…1111",
+            ),
+            (
+                "Slashed(address,uint256,uint256)",
+                vec![who.clone()],
+                format!("0x{:064x}{:064x}", 5_000, 250_000_000),
+                "Slash 250000000 from 0x1111…1111",
+            ),
+            (
+                "SlasherSet(address)",
+                vec![],
+                who.clone(),
+                "Set Slasher 0x1111…1111",
+            ),
+        ] {
+            let mut topics = vec![crate::decoder::keccak_hex(signature.as_bytes())];
+            topics.extend(indexed);
+            let log = json!({
+                "address": "0x3333333333333333333333333333333333333333",
+                "topics": topics,
+                "data": data,
+            });
+            assert_eq!(say(&log, None).headline, headline, "{signature}");
+        }
     }
 
     /// A memo rides along as a note, and a binary payload does not.

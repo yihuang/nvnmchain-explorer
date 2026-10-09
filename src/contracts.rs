@@ -71,6 +71,32 @@ fn precompile_labels() -> &'static HashMap<String, String> {
     })
 }
 
+/// `CONTRACT_LABELS=0xabc=Name,0xdef=Other`: contracts with no fixed address.
+pub fn configured_labels() -> &'static HashMap<String, String> {
+    static MAP: OnceLock<HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| parse_labels(&std::env::var("CONTRACT_LABELS").unwrap_or_default()))
+}
+
+/// A malformed entry is warned about and skipped, keeping the rest.
+fn parse_labels(raw: &str) -> HashMap<String, String> {
+    raw.split(',')
+        .filter(|entry| !entry.trim().is_empty())
+        .filter_map(|entry| {
+            let parsed = entry
+                .split_once('=')
+                .map(|(addr, label)| (addr.trim(), label.trim()))
+                .filter(|(addr, label)| {
+                    crate::decoder::is_valid_address(addr) && !label.is_empty()
+                });
+            if parsed.is_none() {
+                tracing::warn!("CONTRACT_LABELS entry {entry:?} is not address=label; ignored");
+            }
+            let (addr, label) = parsed?;
+            Some((checksum_address(addr), label.to_string()))
+        })
+        .collect()
+}
+
 /// Ordinary contracts at fixed addresses: canonical deployments, and the two this chain places
 /// in genesis, the anchoring contract and its module admin. Kept apart from the precompiles,
 /// which they are not.
@@ -117,6 +143,7 @@ pub fn is_contract(addr: &str) -> bool {
     let checksummed = checksum_address(addr);
     precompile_labels().contains_key(&checksummed)
         || deployed_contracts().contains_key(&checksummed)
+        || configured_labels().contains_key(&checksummed)
         || is_tip20_token(addr)
 }
 
@@ -125,6 +152,7 @@ pub fn get_contract_name(addr: &str) -> Option<String> {
     precompile_labels()
         .get(&checksummed)
         .or_else(|| deployed_contracts().get(&checksummed))
+        .or_else(|| configured_labels().get(&checksummed))
         .cloned()
 }
 
@@ -157,16 +185,18 @@ pub fn identify_address(addr: &str) -> AddressInfo {
             symbol: None,
         };
     }
-    if is_tip20_token(&checksummed) {
-        return AddressInfo {
-            kind: "token".into(),
-            label: None,
-            symbol: None,
-        };
-    }
+    // A configured label is also the only sign that such an address is a contract.
+    let label = configured_labels().get(&checksummed).cloned();
+    let kind = if is_tip20_token(&checksummed) {
+        "token"
+    } else if label.is_some() {
+        "contract"
+    } else {
+        "eoa"
+    };
     AddressInfo {
-        kind: "eoa".into(),
-        label: None,
+        kind: kind.into(),
+        label,
         symbol: None,
     }
 }
@@ -346,5 +376,30 @@ mod tests {
         for address in RESERVED_TOKENS {
             assert_eq!(checksum_address(address), address);
         }
+    }
+
+    #[test]
+    fn a_configured_label_names_a_deployed_contract() {
+        let staking = "0x1111111111111111111111111111111111111111";
+        let labels = parse_labels(&format!(" {staking} = NVNM Staking ,0x2222222222222222222222222222222222222222=Fee Router Factory"));
+        assert_eq!(labels.len(), 2);
+        assert_eq!(
+            labels.get(&checksum_address(staking)).map(String::as_str),
+            Some("NVNM Staking"),
+            "the address is checksummed and the label trimmed"
+        );
+    }
+
+    #[test]
+    fn malformed_entries_are_dropped_one_by_one() {
+        let good = "0x3333333333333333333333333333333333333333";
+        let unnamed = "0x5555555555555555555555555555555555555555";
+        let labels = parse_labels(&format!(
+            "no-equals-sign,0xnothex=Bogus,0x4444=Short,{good}=Router,{unnamed}=,"
+        ));
+        assert_eq!(
+            labels.keys().collect::<Vec<_>>(),
+            vec![&checksum_address(good)]
+        );
     }
 }
