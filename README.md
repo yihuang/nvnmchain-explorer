@@ -164,9 +164,8 @@ All data endpoints accept `?format=json` or `Accept: application/json`.
 
 The home page subscribes to `/api/events` with `EventSource` and updates the
 latest-blocks panel, the latest-block stat, and the block-time stat in real
-time as blocks land — no client polling. The feed is in-process: run a single
-instance (as the deploy configs do) so the indexer and the web server share
-the same broadcast channel.
+time as blocks land — no client polling. The feed is polled from the
+database, so the web server need not share a process with the indexer.
 
 ### Decoding
 
