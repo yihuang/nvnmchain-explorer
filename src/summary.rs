@@ -698,6 +698,14 @@ static PHRASES: &[Phrase] = &[
         "Update Fee Recipient",
         &[Slot::Word("to"), Slot::Account("feeRecipient")],
     ),
+    // The BLS key a validator signs its consensus votes with, registered once.
+    phrase(
+        "VoteKeySet(uint64,bytes32,bytes)",
+        "vote key set",
+        "Set Vote Key",
+        &[Slot::Word("of validator"), Slot::Value("index")],
+    )
+    .notes(&[("Validator key", Slot::Hex("publicKey"))]),
     phrase(
         "IpAddressesUpdated(uint64,string,string,address)",
         "ip addresses updated",
@@ -1984,6 +1992,12 @@ mod tests {
                 vec![],
                 who.clone(),
                 "Set Slasher 0x1111…1111",
+            ),
+            (
+                "VoteKeySet(uint64,bytes32,bytes)",
+                vec![word(3), word(0xabcd)],
+                format!("0x{:064x}{:064x}{}", 0x20, 96, "11".repeat(96)),
+                "Set Vote Key of validator 3",
             ),
         ] {
             let mut topics = vec![crate::decoder::keccak_hex(signature.as_bytes())];

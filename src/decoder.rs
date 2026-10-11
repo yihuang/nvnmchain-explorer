@@ -29,8 +29,9 @@ use crate::models::Transaction;
 // The ABI registry
 // ---------------------------------------------------------------------------
 
-/// What no binding declares: Solidity's `revert` errors, and the staking and
-/// fee-routing events, whose ABIs are not in the contracts submodule.
+/// What no binding declares: Solidity's `revert` errors, the staking and
+/// fee-routing events, whose ABIs are not in the contracts submodule, and the
+/// validator registry's vote keys, which the pinned `tempo-contracts` predates.
 ///
 /// Written as signatures rather than hand-built ABIs. A signature is what the
 /// selector hashes, so there is one spelling to get right and it reads like
@@ -71,6 +72,13 @@ const LOCAL: &[(&str, &[&str])] = &[
             "event Upgraded(address indexed implementation)",
             "event OwnershipHandoverRequested(address indexed pendingOwner)",
             "event OwnershipHandoverCanceled(address indexed pendingOwner)",
+        ],
+    ),
+    (
+        "vote-keys",
+        &[
+            "event VoteKeySet(uint64 indexed index, bytes32 indexed publicKey, bytes key)",
+            "function setVoteKey(uint64 idx, bytes key, bytes proof)",
         ],
     ),
     (
@@ -1196,20 +1204,22 @@ mod tests {
 
     /// Parsing proves the declarations are well formed, not that they are the
     /// right ones, so pin what they hash to: `Error`/`Panic` are the language's
-    /// own constants.
+    /// own constants, and `setVoteKey` is the node's.
     #[test]
     fn local_selectors_are_pinned() {
         for (signature, expected) in [
             ("Error(string)", "0x08c379a0"),
             ("Panic(uint256)", "0x4e487b71"),
+            ("setVoteKey(uint64,bytes,bytes)", "0x3cd722d6"),
         ] {
             let found = format!("0x{}", hex::encode(selector(signature)));
             assert_eq!(found, expected, "for {signature}");
         }
     }
 
-    /// The events are pinned to the head of the topic nvnm-contracts' ABIs give them, so a
-    /// declaration here cannot be edited, or added, without being checked against the contract.
+    /// The events are pinned to the head of the topic nvnm-contracts' ABIs, or the node's
+    /// bindings, give them, so a declaration here cannot be edited, or added, without being
+    /// checked against the contract.
     #[test]
     fn local_event_topics_are_pinned() {
         let pinned = HashMap::from([
@@ -1226,6 +1236,7 @@ mod tests {
             ("SlasherSet", "0x93984378"),
             ("Equivocated", "0xd4e00bc0"),
             ("EquivocationSet", "0xedc76a9a"),
+            ("VoteKeySet", "0xe38c8a75"),
             ("CandidateSet", "0x74d99078"),
             ("BondReceived", "0x4ee05ae4"),
             ("BondGatewaySet", "0x219297b7"),

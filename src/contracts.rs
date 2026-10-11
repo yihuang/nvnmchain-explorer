@@ -240,7 +240,7 @@ pub fn abis_for_address(addr: &str) -> &'static [&'static str] {
         ),
         (
             "0xcccccccc00000000000000000000000000000001",
-            &["validator_config_v2"],
+            &["validator_config_v2", "vote-keys"],
         ),
         (
             "0xaaaaaaaa00000000000000000000000000000000",
