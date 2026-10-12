@@ -7,6 +7,7 @@ use tokio::sync::{broadcast, watch};
 use tracing::{info, warn};
 
 use nvnmchain_explorer::config::Settings;
+use nvnmchain_explorer::contracts;
 use nvnmchain_explorer::db::{self, Db};
 use nvnmchain_explorer::indexer::{self, IndexerConfig};
 use nvnmchain_explorer::rpc::ChainRpc;
@@ -22,9 +23,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Settings::from_env();
+    // Read here, so a malformed `CONTRACT_LABELS` entry is warned about at startup.
     info!(
-        "starting nvnmchain Explorer (rpc={}, db={})",
-        cfg.rpc_url, cfg.db_path
+        "starting nvnmchain Explorer (rpc={}, db={}, labels={})",
+        cfg.rpc_url,
+        cfg.db_path,
+        contracts::configured_labels().len()
     );
 
     let conn = db::init_db(&cfg.db_path).context("initialize database")?;

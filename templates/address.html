@@ -39,6 +39,14 @@
                 <span class="text-faint">Type</span>
                 <div class="mt-1 font-semibold">{{ type | capitalize }}</div>
             </div>
+            {% if router_validator %}
+            <div>
+                <span class="text-faint">Routes For</span>
+                <div class="mt-1 font-semibold mono truncate">
+                    <a href="/address/{{ router_validator }}">{{ router_validator }}</a>
+                </div>
+            </div>
+            {% endif %}
             <div>
                 <span class="text-faint">Transactions</span>
                 <div class="mt-1 font-semibold">{{ tx_count }}</div>

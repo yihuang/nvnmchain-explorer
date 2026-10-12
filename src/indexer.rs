@@ -23,7 +23,7 @@ use crate::config::Settings;
 use crate::contracts::RESERVED_TOKENS;
 use crate::db::{self, Db};
 use crate::decoder::{checksum_address, decode_event, DecodedEvent};
-use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
+use crate::models::{AnchoringEvent, BlockBundle, RouterCreated, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::ChainRpc;
 use crate::summary::ZERO_ADDRESS;
@@ -106,6 +106,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
     let mut txs = Vec::with_capacity(raw_txs.len());
     let mut transfers = Vec::new();
     let mut anchoring = Vec::new();
+    let mut routers = Vec::new();
     let mut next_log_index = 0u64;
 
     for tx_data in raw_txs {
@@ -129,6 +130,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
                 receipt,
                 &mut transfers,
                 &mut anchoring,
+                &mut routers,
                 &mut next_log_index,
             );
         }
@@ -141,6 +143,7 @@ fn assemble_bundle(raw_block: &Value, receipts: Option<&Value>) -> BlockBundle {
         transfers,
         anchoring,
         tokens: Vec::new(),
+        routers,
     }
 }
 
@@ -409,14 +412,16 @@ fn derive_fee_from_transfer(tx: &mut Transaction, log: &Value, to: &str, amount:
     }
 }
 
-/// Index one receipt log: an anchoring write lands in `anchoring`, a transfer in
-/// `transfers`, and a transfer may also tell the transaction what it was charged.
+/// Index one receipt log: an anchoring write lands in `anchoring`, a router in
+/// `routers`, a transfer in `transfers`, and a transfer may also tell the
+/// transaction what it was charged.
 fn index_log(
     tx: &mut Transaction,
     log: &Value,
     log_index: i64,
     transfers: &mut Vec<TransferEvent>,
     anchoring: &mut Vec<AnchoringEvent>,
+    routers: &mut Vec<RouterCreated>,
 ) {
     let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
     let Some(decoded) = decode_event(log) else {
@@ -431,6 +436,9 @@ fn index_log(
             log_index,
             tx.timestamp,
         ));
+    }
+    if decoded.name.as_deref() == Some("RouterCreated") {
+        routers.extend(router_created(&decoded, tx.block_number));
     }
     // Transfers, so the address and token transfer tabs have data.
     if !matches!(
@@ -485,11 +493,22 @@ fn anchoring_event(
     })
 }
 
+/// One router row; `None` for a log missing either address.
+fn router_created(decoded: &DecodedEvent, block_number: i64) -> Option<RouterCreated> {
+    Some(RouterCreated {
+        factory: checksum_address(&decoded.contract),
+        router: decoded.param("router")?.to_string(),
+        validator: decoded.param("validator")?.to_string(),
+        block_number,
+    })
+}
+
 fn apply_receipt(
     tx: &mut Transaction,
     receipt: &Value,
     transfers: &mut Vec<TransferEvent>,
     anchoring: &mut Vec<AnchoringEvent>,
+    routers: &mut Vec<RouterCreated>,
     next_log_index: &mut u64,
 ) {
     apply_receipt_fields(tx, receipt);
@@ -509,7 +528,7 @@ fn apply_receipt(
             .filter(|n| *n >= 0)
             .unwrap_or(*next_log_index as i64);
         *next_log_index = (*next_log_index).max(log_index as u64 + 1);
-        index_log(tx, log, log_index, transfers, anchoring);
+        index_log(tx, log, log_index, transfers, anchoring, routers);
     }
 }
 
@@ -1256,7 +1275,7 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::TRANSFER_TOPIC;
+    use crate::decoder::{keccak_hex, TRANSFER_TOPIC};
 
     fn chunks(from: u64, to: u64, batch: u64) -> Vec<RangeInclusive<u64>> {
         block_chunks(from, to, batch).collect()
@@ -1426,5 +1445,52 @@ mod tests {
         assert_eq!(bundle.transfers[0].to_addr, checksum_address(&to));
         assert_eq!(bundle.transfers[0].amount, "100");
         assert_eq!(bundle.transfers[0].token_addr, checksum_address(&token));
+    }
+
+    #[test]
+    fn a_router_created_log_is_indexed_with_its_emitter() {
+        let factory = format!("0x{}", "fa".repeat(20));
+        let validator = "11".repeat(20);
+        let router = "c0".repeat(20);
+        let operator = "22".repeat(20);
+        let tx_hash = format!("0x{}", "ff".repeat(32));
+        let raw = json!({
+            "number": "0x10",
+            "hash": format!("0x{}", "ab".repeat(32)),
+            "parentHash": format!("0x{}", "cd".repeat(32)),
+            "timestamp": "0x64",
+            "transactions": [{
+                "hash": tx_hash,
+                "blockNumber": "0x10",
+                "transactionIndex": "0x0",
+                "from": format!("0x{}", "33".repeat(20)),
+                "to": factory,
+                "input": "0x",
+            }],
+        });
+        let receipts = json!([{
+            "transactionHash": tx_hash,
+            "status": "0x1",
+            "gasUsed": "0x5208",
+            "logs": [{
+                "address": factory,
+                "logIndex": "0x0",
+                "topics": [
+                    keccak_hex(b"RouterCreated(address,address,address,uint256)"),
+                    format!("0x{}{validator}", "00".repeat(12)),
+                ],
+                "data": format!(
+                    "0x{}{router}{}{operator}{:064x}",
+                    "00".repeat(12),
+                    "00".repeat(12),
+                    500
+                ),
+            }],
+        }]);
+        let bundle = assemble_bundle(&raw, Some(&receipts));
+        assert_eq!(bundle.routers.len(), 1);
+        assert_eq!(bundle.routers[0].factory, checksum_address(&factory));
+        assert_eq!(bundle.routers[0].router, checksum_address(&router));
+        assert_eq!(bundle.routers[0].validator, checksum_address(&validator));
     }
 }

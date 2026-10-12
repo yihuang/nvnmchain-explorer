@@ -94,6 +94,15 @@ pub struct Transaction {
     pub created_at: i64,
 }
 
+/// A `RouterCreated` log: `factory` deployed `router` to pay out for `validator`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RouterCreated {
+    pub factory: String,
+    pub router: String,
+    pub validator: String,
+    pub block_number: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenMetadata {
     pub address: String,
@@ -145,4 +154,5 @@ pub struct BlockBundle {
     pub transfers: Vec<TransferEvent>,
     pub anchoring: Vec<AnchoringEvent>,
     pub tokens: Vec<crate::tokens::TokenMeta>,
+    pub routers: Vec<RouterCreated>,
 }

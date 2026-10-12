@@ -1496,12 +1496,22 @@ pub async fn address_page(
     let addr_info = identify_address(&checksummed);
     let is_token_addr = db::get_token_metadata(&state.db, &checksummed).is_some()
         || crate::contracts::is_tip20_token(&checksummed);
-    let kind = if addr_info.kind == "eoa" && (is_contract(&checksummed) || is_token_addr) {
+    let router_validator = state
+        .cfg
+        .router_factory
+        .as_deref()
+        .and_then(|factory| db::get_router_validator(&state.db, &checksummed, factory));
+    let kind = if addr_info.kind == "eoa"
+        && (is_contract(&checksummed) || is_token_addr || router_validator.is_some())
+    {
         "contract"
     } else {
         addr_info.kind.as_str()
     };
-    let label = addr_info.label.clone();
+    let label = addr_info
+        .label
+        .clone()
+        .or_else(|| router_validator.is_some().then(|| "Fee Router".to_string()));
 
     let token_meta = db::get_token_metadata(&state.db, &checksummed);
     let code = if tab == "contract" {
@@ -1523,6 +1533,7 @@ pub async fn address_page(
             "token_meta": token_meta,
             "code": code,
             "virtual_address": virtual_address,
+            "router_validator": router_validator,
             "transactions": transactions,
             "html_transactions": html_transactions,
             "holdings": db::get_address_holdings(&state.db, &checksummed),

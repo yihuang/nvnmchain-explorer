@@ -56,6 +56,7 @@ fn bundle(number: u64) -> BlockBundle {
         transfers: vec![],
         anchoring: Vec::new(),
         tokens: vec![],
+        routers: vec![],
     }
 }
 

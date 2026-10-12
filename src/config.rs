@@ -27,6 +27,8 @@ pub struct Settings {
     pub batch_size: u64,
     /// Max blocks fetched in parallel by the indexer.
     pub index_concurrency: usize,
+    /// The factory whose `RouterCreated` logs name fee routers.
+    pub router_factory: Option<String>,
     /// Symbol shown for the native gas/currency token.
     pub native_symbol: String,
     /// Seconds between background recomputes of the home-page stats blob.
@@ -79,6 +81,20 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// `ROUTER_FACTORY`; a value that is not an address is warned about, not matched against nothing.
+fn router_factory() -> Option<String> {
+    let raw = env::var("ROUTER_FACTORY").ok()?;
+    let addr = raw.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    if !crate::decoder::is_valid_address(addr) {
+        tracing::warn!("ROUTER_FACTORY {addr:?} is not an address; fee routers stay unlabelled");
+        return None;
+    }
+    Some(addr.to_string())
+}
+
 impl Settings {
     /// Every number is clamped to a usable range here, where it is read, so the
     /// rest of the explorer can build a `Duration` or a window from one as it is.
@@ -103,6 +119,7 @@ impl Settings {
             // A window is fetched whole before it is written, so this bounds memory too.
             batch_size: env_u64("INDEX_BATCH", 32).clamp(1, 1024),
             index_concurrency: env_usize("INDEX_CONCURRENCY", 32).clamp(1, 256),
+            router_factory: router_factory(),
             native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0).clamp(1.0, 3600.0),
             signature_lookup_url: signature_lookup_url(),
