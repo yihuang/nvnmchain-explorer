@@ -784,11 +784,13 @@ pub async fn feed(state: AppState) {
     let (mut sent, mut stats) = (tip(), String::new());
     while !*state.shutdown.borrow() {
         let head = tip();
-        for event in block_events_in_range(&state.db, sent + 1, head) {
-            // No viewer connected is not an error.
-            let _ = state.block_events.send(event);
+        if head > sent {
+            for event in block_events_in_range(&state.db, sent + 1, head) {
+                // No viewer connected is not an error.
+                let _ = state.block_events.send(event);
+            }
+            sent = head;
         }
-        sent = sent.max(head);
         if let Some(stored) = db::get_kv(&state.db, "stats").filter(|s| *s != stats) {
             match serde_json::from_str::<Value>(&stored) {
                 Ok(value) => {

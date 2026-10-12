@@ -600,7 +600,7 @@ pub fn set_chain_head(db: &Db, head: i64) {
     let _ = set_kv(&conn, "chain_head", &head.to_string());
 }
 
-/// Lowest stored block height; `None` when the table is empty.
+/// Highest stored block height; `None` when the table is empty.
 pub fn get_max_block_number(db: &Db) -> Option<i64> {
     query_opt(
         &lock(db),
@@ -612,6 +612,7 @@ pub fn get_max_block_number(db: &Db) -> Option<i64> {
     .flatten()
 }
 
+/// Lowest stored block height; `None` when the table is empty.
 pub fn get_min_block_number(db: &Db) -> Option<i64> {
     query_opt(
         &lock(db),
