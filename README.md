@@ -113,8 +113,9 @@ The indexer is built for a sub-second chain:
   most networks), the indexer warns a few times, then retries silently on a
   long backoff while polling continues uninterrupted.
 - **One RPC call per block** — receipts via `eth_getBlockReceipts` (with a
-  per-transaction batch fallback), traces via `debug_traceBlockByNumber`, and
-  blocks fetched concurrently (`INDEX_CONCURRENCY` in flight).
+  per-transaction batch fallback), and blocks fetched concurrently
+  (`INDEX_CONCURRENCY` in flight). Call traces are not indexed: a transaction's
+  page asks the node for its trace once and keeps it in memory.
 - **Serialized SQLite writes** — every block (block row + txs + transfers +
   balances + token metadata) is persisted in one transaction by a single
   writer task, measured at ~200 blocks/s while backfilling.

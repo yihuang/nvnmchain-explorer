@@ -424,6 +424,51 @@ async fn a_token_page_for_an_unknown_address_stores_nothing() {
     assert!(address["token_meta"].is_null());
 }
 
+/// A node that traces any transaction, and how many times it was asked to.
+async fn stub_tracing_node() -> (String, Arc<AtomicUsize>) {
+    use axum::{routing::post, Json, Router};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let handler = {
+        let hits = hits.clone();
+        move |Json(call): Json<Value>| {
+            let traced = call["method"] == "debug_traceTransaction";
+            if traced {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }
+            let inner = json!({"type": "CALL", "from": TOKEN, "to": RECIPIENT, "input": "0x"});
+            let trace = json!({"type": "CALL", "from": SENDER, "to": TOKEN, "input": "0x", "calls": [inner]});
+            let result = if traced { trace } else { Value::Null };
+            async move { Json(json!({"jsonrpc": "2.0", "id": call["id"], "result": result})) }
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, Router::new().route("/", post(handler))).await;
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A transaction stored without a trace is traced once, not on every view.
+#[tokio::test]
+async fn a_missing_trace_is_fetched_once() {
+    let (node, hits) = stub_tracing_node().await;
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, &node).await;
+    let hash = format!("0x{}", "d1".repeat(32));
+    let mut untraced = transaction(&hash, 1, successful_receipt());
+    untraced.trace_data = None;
+    db::save_transaction(&indexer, &untraced).expect("tx");
+
+    for _ in 0..2 {
+        let page = get_json(&base, &format!("/tx/{hash}?")).await;
+        assert_eq!(page["calls"].as_array().map(Vec::len), Some(2), "{page}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
 /// A node that answers a token's views, which arrive as one batch.
 async fn stub_token_node() -> String {
     use axum::{routing::post, Json, Router};

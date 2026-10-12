@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -1094,14 +1094,25 @@ fn is_method_unsupported(err: &anyhow::Error) -> bool {
         || message.contains("not available")
 }
 
-/// The call trace for a transaction indexed without one, asked of the node on
-/// each view.
+/// Traces already fetched, by transaction hash: nothing stores them, so this
+/// is what keeps every view from tracing the transaction again.
+static TRACES: LazyLock<Mutex<HashMap<String, Vec<Value>>>> = LazyLock::new(Default::default);
+
+/// Traces held before the cache starts over.
+const MAX_TRACES: usize = 256;
+
+/// The call trace for a transaction stored without one, asked of the node once.
 async fn fetch_missing_trace(
     state: &AppState,
     tx: &crate::models::Transaction,
 ) -> Option<Vec<Value>> {
-    if TRACING_UNAVAILABLE.load(Ordering::Relaxed) {
-        return None;
+    let cached = TRACES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&tx.hash)
+        .cloned();
+    if cached.is_some() || TRACING_UNAVAILABLE.load(Ordering::Relaxed) {
+        return cached;
     }
     let fetched = tokio::time::timeout(
         TRACE_FETCH_TIMEOUT,
@@ -1124,7 +1135,15 @@ async fn fetch_missing_trace(
         }
     };
     let flat = flatten_trace(&raw);
-    (!flat.is_empty()).then_some(flat)
+    if flat.is_empty() {
+        return None;
+    }
+    let mut held = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+    if held.len() >= MAX_TRACES {
+        held.clear();
+    }
+    held.insert(tx.hash.clone(), flat.clone());
+    Some(flat)
 }
 
 /// The one call a transaction made, built from the transaction itself. Stands
