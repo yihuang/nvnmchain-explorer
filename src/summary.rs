@@ -721,6 +721,12 @@ static PHRASES: &[Phrase] = &[
         &[Slot::Word("to"), Slot::Account("newOwner")],
     ),
     phrase(
+        "Upgraded(address)",
+        "upgraded",
+        "Upgrade",
+        &[Slot::Word("to"), Slot::Account("implementation")],
+    ),
+    phrase(
         "Initialized(uint64)",
         "initialized",
         "Initialize",

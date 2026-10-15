@@ -1349,3 +1349,24 @@ async fn the_zone_contracts_are_named_with_their_interfaces() {
     let page = get_json(&base, &format!("/address/{portal}?tab=contract")).await;
     assert_eq!(page["interface"]["abis"], json!(["zone_portal"]));
 }
+
+/// The anchoring contract's interface has an owner.
+#[tokio::test]
+async fn the_anchoring_interface_has_an_owner() {
+    let (_dir, base) = serve(Value::Null).await;
+    let page = get_json(
+        &base,
+        "/address/0x0000000000000000000000000000000000000a00?tab=contract",
+    )
+    .await;
+    let named = |kind: &str, name: &str| {
+        page["interface"][kind]
+            .as_array()
+            .expect(kind)
+            .iter()
+            .any(|f| f["name"] == json!(name))
+    };
+    assert!(named("reads", "owner"));
+    assert!(named("writes", "transferOwnership"));
+    assert!(named("events", "OwnershipTransferred"));
+}
