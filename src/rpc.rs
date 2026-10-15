@@ -32,26 +32,28 @@ impl Clone for ChainRpc {
     }
 }
 
-/// Spaces batch requests `gap` apart across every client given it, for a
+/// Spaces batch requests `gap` apart across a client and its clones, for a
 /// gateway that rate-limits them.
-pub struct BatchPace {
+struct BatchPace {
     gap: Duration,
     next: tokio::sync::Mutex<Instant>,
 }
 
 impl BatchPace {
-    pub fn new(gap: Duration) -> Self {
-        Self {
-            gap,
-            next: tokio::sync::Mutex::new(Instant::now()),
-        }
-    }
-
     async fn wait(&self) {
         let mut next = self.next.lock().await;
         tokio::time::sleep_until(*next).await;
         *next = Instant::now() + self.gap;
     }
+}
+
+/// What a 429 asks us to wait, a minute when it does not say.
+fn retry_after(resp: &reqwest::Response) -> Duration {
+    let secs = resp
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok()?.parse().ok());
+    Duration::from_secs(secs.unwrap_or(60))
 }
 
 #[derive(Debug)]
@@ -85,6 +87,17 @@ impl RpcError {
     }
 }
 
+#[cfg(test)]
+impl ChainRpc {
+    /// A client to `app`, served on a port of its own for one test.
+    pub(crate) async fn test_node(app: axum::Router) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Self::new(url).unwrap()
+    }
+}
+
 impl ChainRpc {
     pub fn new(url: impl Into<String>) -> Result<Self> {
         let client = Client::builder()
@@ -99,9 +112,13 @@ impl ChainRpc {
         })
     }
 
-    /// Pace batch requests, and wait out a 429 rather than fail on it.
-    pub fn paced(mut self, pace: Arc<BatchPace>) -> Self {
-        self.pace = Some(pace);
+    /// Space batch requests `gap` apart, clones included, and wait out a 429
+    /// rather than fail on it.
+    pub fn paced(mut self, gap: Duration) -> Self {
+        self.pace = Some(Arc::new(BatchPace {
+            gap,
+            next: tokio::sync::Mutex::new(Instant::now()),
+        }));
         self
     }
 
@@ -145,11 +162,19 @@ impl ChainRpc {
     }
 
     /// Send several JSON-RPC calls in a single HTTP request. Results come back
-    /// in request order, each either `Ok(result)` or the per-call error.
+    /// in request order, each either `Ok(result)` or the per-call error. One
+    /// call goes alone: no batch for a gateway that rate-limits them.
     pub async fn batch_call(
         &self,
         calls: Vec<(String, Value)>,
     ) -> Result<Vec<Result<Value, RpcError>>> {
+        if calls.len() == 1 {
+            let (method, params) = calls.into_iter().next().unwrap();
+            return match self.call(&method, params).await {
+                Ok(value) => Ok(vec![Ok(value)]),
+                Err(e) => Ok(vec![Err(e.downcast::<RpcError>()?)]),
+            };
+        }
         let payload: Vec<Value> = calls
             .iter()
             .enumerate()
@@ -177,11 +202,7 @@ impl ChainRpc {
                 break resp;
             }
             // Asking again before the gateway says only prolongs its block.
-            let secs = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|v| v.to_str().ok()?.parse().ok());
-            tokio::time::sleep(Duration::from_secs(secs.unwrap_or(60))).await;
+            tokio::time::sleep(retry_after(&resp)).await;
         };
         let body: Value = resp
             .json()
@@ -561,9 +582,9 @@ mod tests {
         use std::sync::atomic::AtomicBool;
 
         // Turns the first batch away for a second, then answers.
-        let refused = Arc::new(AtomicBool::new(false));
+        let turned_away = Arc::new(AtomicBool::new(false));
         let handler = move |Json(body): Json<Value>| async move {
-            if !refused.swap(true, Ordering::SeqCst) {
+            if !turned_away.swap(true, Ordering::SeqCst) {
                 return (StatusCode::TOO_MANY_REQUESTS, [(RETRY_AFTER, "1")]).into_response();
             }
             let answers = body
@@ -573,19 +594,18 @@ mod tests {
                 .map(|c| json!({"jsonrpc": "2.0", "id": c["id"], "result": c["method"]}));
             Json(Value::Array(answers.collect())).into_response()
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let app = Router::new().route("/", post(handler));
-        tokio::spawn(async move { axum::serve(listener, app).await });
-
-        let pace = Arc::new(BatchPace::new(Duration::from_millis(300)));
-        let rpc = ChainRpc::new(url).unwrap().paced(pace);
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler)))
+            .await
+            .paced(Duration::from_millis(300));
         let started = Instant::now();
         for _ in 0..2 {
             let results = rpc
-                .batch_call(vec![("eth_chainId".into(), json!([]))])
+                .batch_call(vec![
+                    ("eth_chainId".into(), json!([])),
+                    ("eth_blockNumber".into(), json!([])),
+                ])
                 .await;
-            assert_eq!(results.unwrap()[0].as_ref().unwrap(), "eth_chainId");
+            assert_eq!(results.unwrap()[1].as_ref().unwrap(), "eth_blockNumber");
         }
         // A second for the 429, then one gap.
         assert!(started.elapsed() >= Duration::from_millis(1300));

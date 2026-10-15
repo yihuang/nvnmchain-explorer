@@ -1290,33 +1290,27 @@ mod tests {
         assert_eq!(stats["gas_per_minute"][59], 70);
     }
 
-    /// A JSON-RPC node for one test: `app` answers on a port of its own.
-    async fn node(app: axum::Router) -> ChainRpc {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await });
-        ChainRpc::new(url).unwrap()
-    }
-
     #[tokio::test]
     async fn a_refused_range_is_fetched_in_halves() {
         use axum::{routing::post, Json, Router};
 
         // Like reth past its response size cap: one error, not an array.
         let handler = |Json(body): Json<Value>| async move {
-            let calls = body.as_array().cloned().unwrap_or_default();
-            if calls.len() > 2 {
-                return Json(json!({"jsonrpc": "2.0", "id": null, "error": {
-                    "code": -32011, "message": "The batch response was too large",
-                }}));
-            }
-            let answers = calls.iter().map(|c| {
+            let answer = |c: &Value| {
                 let block = json!({"number": c["params"][0], "transactions": []});
                 json!({"jsonrpc": "2.0", "id": c["id"], "result": block})
-            });
-            Json(Value::Array(answers.collect()))
+            };
+            Json(match &body {
+                Value::Array(calls) if calls.len() > 2 => {
+                    json!({"jsonrpc": "2.0", "id": null, "error": {
+                        "code": -32011, "message": "The batch response was too large",
+                    }})
+                }
+                Value::Array(calls) => Value::Array(calls.iter().map(answer).collect()),
+                call => answer(call),
+            })
         };
-        let rpc = node(Router::new().route("/", post(handler))).await;
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler))).await;
 
         let blocks = fetch_raw_blocks(&rpc, 1..=7).await.unwrap();
         let numbers: Vec<_> = blocks
@@ -1341,7 +1335,7 @@ mod tests {
                 StatusCode::BAD_GATEWAY
             }
         };
-        let rpc = node(Router::new().route("/", post(handler))).await;
+        let rpc = ChainRpc::test_node(Router::new().route("/", post(handler))).await;
 
         assert!(fetch_raw_blocks(&rpc, 1..=7).await.is_err());
         assert_eq!(hits.load(Ordering::SeqCst), 1);

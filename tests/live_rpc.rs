@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use nvnmchain_explorer::config::{Role, Settings};
 use nvnmchain_explorer::db::{self, Db, TxColumns};
 use nvnmchain_explorer::indexer::{fetch_block_bundles, index_block};
-use nvnmchain_explorer::rpc::{parse_int_any, BatchPace, ChainRpc};
+use nvnmchain_explorer::rpc::{parse_int_any, ChainRpc};
 use nvnmchain_explorer::web::{self, AppState};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -39,24 +39,32 @@ static CHAIN: LazyLock<Settings> = LazyLock::new(|| {
     chain
 });
 
-/// One pace for every test's client, since they share the testnet's limit.
-static PACE: LazyLock<Arc<BatchPace>> =
-    LazyLock::new(|| Arc::new(BatchPace::new(Duration::from_secs(12))));
-
-fn rpc() -> ChainRpc {
+/// One client, cloned per test, so every test shares the testnet's pace.
+static RPC: LazyLock<ChainRpc> = LazyLock::new(|| {
     let rpc = ChainRpc::new(&CHAIN.rpc_url).expect("rpc client");
     if CHAIN.rpc_url == TESTNET_RPC {
-        rpc.paced(PACE.clone())
+        rpc.paced(Duration::from_secs(12))
     } else {
         rpc
     }
+});
+
+fn rpc() -> ChainRpc {
+    RPC.clone()
 }
 
 /// A recent block that has transactions, and their hashes in block order.
 ///
 /// Found rather than pinned: a constant block is a fixture on one chain, and
-/// this one has been reset out from under these tests once already.
+/// this one has been reset out from under these tests once already. Found
+/// once: three tests ask, and the search is a paced batch per 64 blocks.
 async fn block_with_txs(rpc: &ChainRpc) -> Option<(u64, Vec<String>)> {
+    static FOUND: tokio::sync::OnceCell<Option<(u64, Vec<String>)>> =
+        tokio::sync::OnceCell::const_new();
+    FOUND.get_or_init(|| find_block_with_txs(rpc)).await.clone()
+}
+
+async fn find_block_with_txs(rpc: &ChainRpc) -> Option<(u64, Vec<String>)> {
     let head = rpc.eth_block_number().await.ok()?;
     // In batches: most blocks on a quiet chain are empty, and 600 of them one
     // round trip at a time is a minute per test.
