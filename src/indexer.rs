@@ -22,7 +22,9 @@ use tracing::{info, warn};
 use crate::config::Settings;
 use crate::contracts::RESERVED_TOKENS;
 use crate::db::{self, Db};
-use crate::decoder::{checksum_address, decode_event, DecodedEvent};
+use crate::decoder::{
+    checksum_address, decode_event, DecodedEvent, TRANSFER_TOPIC, TRANSFER_WITH_MEMO_TOPIC,
+};
 use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::{ChainRpc, RpcError};
@@ -431,11 +433,21 @@ fn index_log(
     anchoring: &mut Vec<AnchoringEvent>,
 ) {
     let emitter = log.get("address").and_then(Value::as_str).unwrap_or("");
+    let topic0 = log
+        .pointer("/topics/0")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let is_transfer = topic0.eq_ignore_ascii_case(TRANSFER_TOPIC.as_str())
+        || topic0.eq_ignore_ascii_case(TRANSFER_WITH_MEMO_TOPIC.as_str());
+    // Only the contract's own logs: any contract may emit under the same signature.
+    let is_anchoring = emitter.eq_ignore_ascii_case(crate::anchoring::ADDRESS);
+    if !is_transfer && !is_anchoring {
+        return;
+    }
     let Some(decoded) = decode_event(log) else {
         return;
     };
-    // Only the contract's own logs: any contract may emit under the same signature.
-    if emitter.eq_ignore_ascii_case(crate::anchoring::ADDRESS) {
+    if is_anchoring {
         anchoring.extend(anchoring_event(
             &decoded,
             &tx.hash,
@@ -445,10 +457,7 @@ fn index_log(
         ));
     }
     // Transfers, so the address and token transfer tabs have data.
-    if !matches!(
-        decoded.name.as_deref(),
-        Some("Transfer") | Some("TransferWithMemo")
-    ) {
+    if !is_transfer {
         return;
     }
     let from = decoded.param("from").unwrap_or_default();
