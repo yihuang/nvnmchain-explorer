@@ -181,14 +181,14 @@ impl ChainRpc {
             .send()
             .await
             .with_context(|| format!("RPC request {method} failed"))?;
-        let body: Value = resp
+        let mut body: Value = resp
             .json()
             .await
             .with_context(|| format!("RPC response for {method} was not JSON"))?;
         if let Some(err) = RpcError::of(&body) {
             return Err(err.into());
         }
-        Ok(body.get("result").cloned().unwrap_or(Value::Null))
+        Ok(body.get_mut("result").map_or(Value::Null, Value::take))
     }
 
     /// Send several JSON-RPC calls in a single HTTP request. Results come back
@@ -237,14 +237,16 @@ impl ChainRpc {
             .json()
             .await
             .context("batch RPC response was not JSON")?;
-        let Value::Array(items) = &body else {
+        let items = match body {
+            Value::Array(items) => items,
             // One error for the whole batch, as reth answers past its response size cap.
-            if let Some(err) = RpcError::of(&body) {
-                return Err(err.into());
-            }
-            bail!("batch RPC response is not an array: {body}");
+            other => match RpcError::of(&other) {
+                Some(err) => return Err(err.into()),
+                None => bail!("batch RPC response is not an array: {other}"),
+            },
         };
-        let mut by_id: HashMap<u64, &Value> = HashMap::with_capacity(items.len());
+        // Results are moved out, not copied: a batch of full blocks is large.
+        let mut by_id: HashMap<u64, Value> = HashMap::with_capacity(items.len());
         for item in items {
             if let Some(id) = item.get("id").and_then(Value::as_u64) {
                 by_id.insert(id, item);
@@ -253,10 +255,10 @@ impl ChainRpc {
         let mut out = Vec::with_capacity(calls.len());
         for i in 0..calls.len() {
             let id = i as u64 + 1;
-            match by_id.get(&id) {
-                Some(item) => match RpcError::of(item) {
+            match by_id.remove(&id) {
+                Some(mut item) => match RpcError::of(&item) {
                     Some(err) => out.push(Err(err)),
-                    None => out.push(Ok(item.get("result").cloned().unwrap_or(Value::Null))),
+                    None => out.push(Ok(item.get_mut("result").map_or(Value::Null, Value::take))),
                 },
                 None => out.push(Err(RpcError {
                     code: -32603,
