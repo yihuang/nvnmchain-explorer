@@ -838,22 +838,17 @@ fn duplicate_bundle_is_idempotent() {
     );
 
     // Balance deltas are applied once per transfer, not once per write.
-    let recipient: String = conn
-        .query_row(
+    let bytes = |a: &str| hex::decode(&a[2..]).unwrap();
+    let balance = |holder: &str| -> String {
+        conn.query_row(
             "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
-            rusqlite::params![token, to],
+            rusqlite::params![bytes(&token), bytes(holder)],
             |r| r.get(0),
         )
-        .expect("recipient balance");
-    assert_eq!(recipient, "100", "balance must not be double-applied");
-    let sender: String = conn
-        .query_row(
-            "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
-            rusqlite::params![token, from],
-            |r| r.get(0),
-        )
-        .expect("sender balance");
-    assert_eq!(sender, "-100", "sender delta applied exactly once");
+        .expect("balance")
+    };
+    assert_eq!(balance(&to), "100", "balance must not be double-applied");
+    assert_eq!(balance(&from), "-100", "sender delta applied exactly once");
 }
 
 /// An anchoring write reads back on its registry, newest first and the caller
