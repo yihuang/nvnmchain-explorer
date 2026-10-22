@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
@@ -39,6 +38,11 @@ fn blob_hex(bytes: &[u8]) -> String {
 /// binary storage has dropped the case by the time it comes back.
 fn blob_addr(bytes: &[u8]) -> String {
     crate::decoder::checksum_address(&blob_hex(bytes))
+}
+
+/// Column `i` of `row`, an address stored as bytes, in its checksummed spelling.
+fn addr_col(row: &rusqlite::Row, i: usize) -> rusqlite::Result<String> {
+    Ok(blob_addr(&row.get::<_, Vec<u8>>(i)?))
 }
 
 /// Degrade a failed query to "no data", after saying so.
@@ -327,8 +331,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
 
         -- Each seen holder's balance at genesis, zero included: no event carries it.
         CREATE TABLE IF NOT EXISTS genesis_balances (
-            token_addr TEXT NOT NULL,
-            holder_addr TEXT NOT NULL,
+            token_addr BLOB NOT NULL,
+            holder_addr BLOB NOT NULL,
             balance TEXT NOT NULL,
             PRIMARY KEY (token_addr, holder_addr)
         );
@@ -351,7 +355,37 @@ pub fn init_db(path: &str) -> Result<Connection> {
          WHERE {HOLDING};"
     ))?;
     seed_counters(&conn)?;
+    blob_balance_keys(&conn)?;
     Ok(conn)
+}
+
+const BALANCE_KEYS_BLOB: &str = "balance_keys_blob";
+
+/// Convert the balance tables' keys from the checksummed text older builds
+/// wrote to address bytes, once; the kv row marks it done.
+fn blob_balance_keys(conn: &Connection) -> Result<()> {
+    let done: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv WHERE key=?1)",
+        [BALANCE_KEYS_BLOB],
+        |r| r.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
+    let txn = conn.unchecked_transaction()?;
+    for table in ["token_balances", "genesis_balances"] {
+        txn.execute(
+            &format!(
+                "UPDATE {table} SET token_addr = unhex(substr(token_addr, 3)),
+                                    holder_addr = unhex(substr(holder_addr, 3))
+                 WHERE typeof(token_addr) = 'text'"
+            ),
+            [],
+        )?;
+    }
+    set_kv(&txn, BALANCE_KEYS_BLOB, "1")?;
+    txn.commit()?;
+    Ok(())
 }
 
 /// Count the rows once on a database that predates the counters, so the writer
@@ -914,7 +948,7 @@ fn upsert_token_meta(conn: &Connection, meta: &crate::tokens::TokenMeta) -> Resu
         &format!(
             "INSERT INTO token_metadata (address, name, symbol, decimals, currency, total_supply, logo_uri, holder_count, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, '',
-                     (SELECT COUNT(*) FROM token_balances WHERE token_addr=?8 AND {HOLDING}),
+                     (SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}),
                      ?7, ?7)
              ON CONFLICT(address) DO UPDATE SET
                  name=excluded.name, symbol=excluded.symbol, decimals=excluded.decimals,
@@ -928,7 +962,6 @@ fn upsert_token_meta(conn: &Connection, meta: &crate::tokens::TokenMeta) -> Resu
             meta.currency,
             meta.total_supply,
             ts,
-            meta.address,
         ],
     )?;
     Ok(())
@@ -1177,6 +1210,7 @@ fn adjust_balance(
     if delta.sign() == num_bigint::Sign::NoSign {
         return Ok(0);
     }
+    let (token, holder) = (hex_blob(token), hex_blob(holder));
     let current: Option<String> = conn
         .prepare_cached(
             "SELECT balance FROM token_balances WHERE token_addr=?1 AND holder_addr=?2",
@@ -1249,11 +1283,12 @@ pub fn holders_without_genesis_balance(db: &Db, limit: i64) -> Result<Option<(i6
         .unwrap_or(0);
     let conn = lock(db);
     let mut transfers = conn.prepare_cached(
-        "SELECT id, token_addr, from_addr, to_addr FROM transfer_events
-         WHERE id > ?1 ORDER BY id LIMIT ?2",
-    )?;
-    let mut stored = conn.prepare_cached(
-        "SELECT EXISTS(SELECT 1 FROM genesis_balances WHERE token_addr=?1 AND holder_addr=?2)",
+        "SELECT t.id, t.token_addr, t.from_addr, t.to_addr,
+                EXISTS(SELECT 1 FROM genesis_balances g
+                       WHERE g.token_addr = t.token_addr AND g.holder_addr = t.from_addr),
+                EXISTS(SELECT 1 FROM genesis_balances g
+                       WHERE g.token_addr = t.token_addr AND g.holder_addr = t.to_addr)
+         FROM transfer_events t WHERE t.id > ?1 ORDER BY t.id LIMIT ?2",
     )?;
     let mut last = cursor;
     let mut holders = Vec::new();
@@ -1261,13 +1296,13 @@ pub fn holders_without_genesis_balance(db: &Db, limit: i64) -> Result<Option<(i6
     let mut rows = transfers.query(params![cursor, limit])?;
     while let Some(r) = rows.next()? {
         last = r.get(0)?;
-        let token = addr_from_value(r.get_ref(1)?);
-        for holder in [2, 3].map(|i| r.get_ref(i).map(addr_from_value)) {
-            let holder = (token.clone(), holder?);
-            if holder.1 != ZERO_ADDRESS
-                && seen.insert(holder.clone())
-                && !stored.query_row(params![holder.0, holder.1], |r| r.get::<_, bool>(0))?
-            {
+        let token = addr_col(r, 1)?;
+        for (side, known) in [(2, 4), (3, 5)] {
+            if r.get::<_, bool>(known)? {
+                continue;
+            }
+            let holder = (token.clone(), addr_col(r, side)?);
+            if holder.1 != ZERO_ADDRESS && seen.insert(holder.clone()) {
                 holders.push(holder);
             }
         }
@@ -1284,7 +1319,7 @@ pub fn save_genesis_balances(db: &Db, balances: &[(Holder, String)], cursor: i64
         let inserted = exec_cached(
             &txn,
             "INSERT OR IGNORE INTO genesis_balances (token_addr, holder_addr, balance) VALUES (?1, ?2, ?3)",
-            params![token, holder, balance],
+            params![hex_blob(token), hex_blob(holder), balance],
         )?;
         if inserted != 0 {
             *moved.entry(token).or_default() +=
@@ -1303,7 +1338,7 @@ fn count_holders(conn: &Connection, token: &str) -> rusqlite::Result<i64> {
     conn.prepare_cached(&format!(
         "SELECT COUNT(*) FROM token_balances WHERE token_addr=?1 AND {HOLDING}"
     ))?
-    .query_row(params![token], |r| r.get(0))
+    .query_row(params![hex_blob(token)], |r| r.get(0))
 }
 
 /// Recount one token's holders and write the total onto its metadata row.
@@ -1321,12 +1356,8 @@ fn update_holder_count(conn: &Connection, token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rebuild `token_balances` + holder counts from the transfer history.
-/// Run once after upgrading a pre-existing database (or after the
-/// transfer_events dedup migration) so incremental updates start from a
-/// correct state. Address columns may be stored as BLOBs (current format) or
-/// TEXT (pre-upgrade format), so both are decoded and normalized to EIP-55
-/// checksummed hex, matching the keys the incremental balance path stores.
+/// Rebuild `token_balances` and the holder counts from the transfers and the
+/// genesis balances, for a database written before the writer kept them.
 pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
     // One transaction: the next start rebuilds only when there are no balances,
     // so a crash halfway would leave partial ones it takes for complete.
@@ -1340,9 +1371,9 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
-                addr_from_value(r.get_ref(0)?),
-                addr_from_value(r.get_ref(1)?),
-                addr_from_value(r.get_ref(2)?),
+                addr_col(r, 0)?,
+                addr_col(r, 1)?,
+                addr_col(r, 2)?,
                 r.get::<_, String>(3)?,
             ))
         })?;
@@ -1358,13 +1389,8 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
             txn.prepare("SELECT token_addr, holder_addr, balance FROM genesis_balances")?;
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
-            let token: String = r.get(0)?;
-            adjust_balance(
-                &txn,
-                &token,
-                &r.get::<_, String>(1)?,
-                &bigint(&r.get::<_, String>(2)?),
-            )?;
+            let (token, holder) = (addr_col(r, 0)?, addr_col(r, 1)?);
+            adjust_balance(&txn, &token, &holder, &bigint(&r.get::<_, String>(2)?))?;
             touched.insert(token);
         }
     }
@@ -1374,19 +1400,6 @@ pub fn rebuild_token_balances(conn: &Connection) -> Result<()> {
     txn.commit()?;
     tracing::info!("rebuilt token balances from {n} transfer events");
     Ok(())
-}
-
-/// Decode one address column of `transfer_events` into EIP-55 checksummed
-/// hex. The column is a BLOB (raw bytes, current storage) or TEXT (legacy
-/// storage); either way we end with the canonical form so `token_balances`
-/// keys stay comparable to the incremental path's writes.
-fn addr_from_value(v: ValueRef<'_>) -> String {
-    let hex = match v {
-        ValueRef::Blob(b) => blob_hex(b),
-        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
-        _ => String::new(),
-    };
-    crate::decoder::checksum_address(&hex)
 }
 
 const TRANSFER_COLS: &str = "e.id, e.tx_hash, e.block_number, e.log_index, e.token_addr, \
@@ -1530,8 +1543,12 @@ pub fn get_token_holders(
              WHERE token_addr=?1 AND {HOLDING}
              ORDER BY LENGTH(balance) DESC, balance DESC LIMIT ?2 OFFSET ?3"
         ),
-        params![token_addr, per_page as i64, page_offset(page, per_page)],
-        |r| Ok((addr_from_value(r.get_ref(0)?), r.get(1)?)),
+        params![
+            hex_blob(token_addr),
+            per_page as i64,
+            page_offset(page, per_page)
+        ],
+        |r| Ok((addr_col(r, 0)?, r.get(1)?)),
     )
 }
 
@@ -1582,7 +1599,7 @@ pub fn sync_holder_counts(conn: &Connection) -> Result<()> {
     let txn = conn.unchecked_transaction()?;
     let tokens: Vec<String> = {
         let mut stmt = txn.prepare("SELECT DISTINCT token_addr FROM token_balances")?;
-        stmt.query_map([], |r| Ok(addr_from_value(r.get_ref(0)?)))
+        stmt.query_map([], |r| addr_col(r, 0))
             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())?
     };
     for token in tokens {
@@ -1596,30 +1613,25 @@ pub fn sync_holder_counts(conn: &Connection) -> Result<()> {
 /// are indexed and the inbound ones are not — on chain it is a `U256` — so the
 /// negative rows are left out here as they already are on the holders page.
 pub fn get_address_holdings(db: &Db, address: &str) -> Vec<Value> {
-    let balances: Vec<(String, String)> = query_rows(
+    query_rows(
         &lock(db),
         "get_address_holdings",
         &format!(
-            "SELECT token_addr, balance FROM token_balances WHERE holder_addr=?1 AND {HOLDING}"
+            "SELECT m.address, m.name, m.symbol, m.decimals, b.balance
+             FROM token_balances b JOIN token_metadata m ON m.address = b.token_addr
+             WHERE b.holder_addr=?1 AND {HOLDING}"
         ),
-        params![address],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    );
-    let mut holdings = Vec::new();
-    let token_addrs: Vec<String> = balances.iter().map(|(a, _)| a.clone()).collect();
-    let metas = get_tokens_metadata(db, &token_addrs);
-    for (token_addr, balance) in &balances {
-        if let Some(meta) = metas.get(token_addr) {
-            let formatted = crate::tokens::format_token_amount(balance, meta.decimals);
-            holdings.push(json!({
-                "token": meta.address,
-                "name": meta.name,
-                "symbol": meta.symbol,
-                "decimals": meta.decimals,
+        params![hex_blob(address)],
+        |r| {
+            let (decimals, balance): (i64, String) = (r.get(3)?, r.get(4)?);
+            Ok(json!({
+                "token": addr_col(r, 0)?,
+                "name": r.get::<_, String>(1)?,
+                "symbol": r.get::<_, String>(2)?,
+                "decimals": decimals,
+                "formatted": crate::tokens::format_token_amount(&balance, decimals),
                 "balance": balance,
-                "formatted": formatted,
-            }));
-        }
-    }
-    holdings
+            }))
+        },
+    )
 }
