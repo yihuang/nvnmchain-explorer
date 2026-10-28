@@ -513,12 +513,21 @@ async fn a_token_the_index_has_not_met_is_shown_and_not_stored() {
     assert_eq!(get_json(&base, "/tokens?").await["total"], before);
 }
 
-/// A node whose `eth_getCode` answers from `codes`, and `0x` for any other address.
-async fn stub_code_node(codes: Vec<(&'static str, String)>) -> String {
+/// A node whose `eth_getCode` answers from `codes` and `eth_getStorageAt` from `slots`, by
+/// address, and `0x` for any other.
+async fn stub_code_node(
+    codes: Vec<(&'static str, String)>,
+    slots: Vec<(&'static str, String)>,
+) -> String {
     use axum::{routing::post, Json, Router};
 
     let handler = move |Json(call): Json<Value>| {
-        let code = codes
+        let answers = if call["method"] == "eth_getStorageAt" {
+            &slots
+        } else {
+            &codes
+        };
+        let code = answers
             .iter()
             .find(|(address, _)| call["params"][0] == *address)
             .map_or("0x".to_string(), |(_, code)| code.clone());
@@ -540,11 +549,14 @@ async fn an_unlisted_address_is_what_its_code_says() {
     let contract = "0x7777777777777777777777777777777777777777";
     let precompile = "0x8888888888888888888888888888888888888888";
     let delegating = "0x9999999999999999999999999999999999999999";
-    let node = stub_code_node(vec![
-        (contract, "0x6080604052".into()),
-        (precompile, "0xef".into()),
-        (delegating, format!("0xef0100{}", "ab".repeat(20))),
-    ])
+    let node = stub_code_node(
+        vec![
+            (contract, "0x6080604052".into()),
+            (precompile, "0xef".into()),
+            (delegating, format!("0xef0100{}", "ab".repeat(20))),
+        ],
+        vec![],
+    )
     .await;
     let (_dir, base, _indexer) = serve_beside_indexer(Value::Null, &node).await;
 
@@ -561,6 +573,41 @@ async fn an_unlisted_address_is_what_its_code_says() {
     }
     let tab = get_json(&base, &format!("/address/{contract}?tab=contract")).await;
     assert_eq!(tab["code"]["bytes"], json!(5));
+}
+
+/// A proxy's Contract tab names what it delegates to; other code names nothing.
+#[tokio::test]
+async fn a_proxy_names_its_implementation() {
+    let proxy = "0x0000000000000000000000000000000000000A00";
+    let implementation = "0xF873bbD8B4ed0580425592a37b218BC46A628C70";
+    let plain = "0x7777777777777777777777777777777777777777";
+    let node = stub_code_node(
+        vec![
+            (proxy, "0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3".into()),
+            (plain, "0x6080604052".into()),
+        ],
+        vec![(proxy, format!("0x{:0>64}", implementation[2..].to_lowercase()))],
+    )
+    .await;
+    let (_dir, base, _indexer) = serve_beside_indexer(Value::Null, &node).await;
+
+    let tab = get_json(&base, &format!("/address/{proxy}?tab=contract")).await;
+    assert_eq!(tab["code"]["proxy"], json!("ERC-1967"));
+    assert_eq!(tab["code"]["implementation"], json!(implementation));
+    let tab = get_json(&base, &format!("/address/{plain}?tab=contract")).await;
+    assert_eq!(tab["code"]["implementation"], Value::Null);
+
+    let html = reqwest::get(format!("{base}/address/{proxy}?tab=contract"))
+        .await
+        .expect("contract tab")
+        .text()
+        .await
+        .expect("body");
+    assert!(html.contains("ERC-1967 proxy: calls run the code at"));
+    assert!(
+        html.contains(">Anchoring Implementation<"),
+        "linked by name"
+    );
 }
 
 /// The activity charts draw the stats' series, and are left out until the

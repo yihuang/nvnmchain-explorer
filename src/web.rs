@@ -26,7 +26,8 @@ use tower_http::cors::CorsLayer;
 use crate::anchoring;
 use crate::config::Settings;
 use crate::contracts::{
-    abis_for_address, get_contract_name, identify_address, is_tip20_token, search_named,
+    abis_for_address, get_contract_name, identify_address, is_tip20_token, proxy, search_named,
+    ProxyTarget,
 };
 use crate::db::{self, Db, TxColumns};
 use crate::decoder::{
@@ -332,6 +333,28 @@ async fn contract_code(state: &AppState, address: &str) -> Value {
         // The marker a Tempo precompile reports in place of real bytecode.
         "is_precompile_marker": hex.len() <= 2,
     })
+}
+
+/// What `code` delegates to, if it is a proxy [`proxy`] knows, and which kind. Best-effort, as
+/// [`contract_code`] is.
+async fn proxy_implementation(
+    state: &AppState,
+    address: &str,
+    code: &Value,
+) -> Option<(&'static str, String)> {
+    let (kind, target) = proxy(code["hex"].as_str()?)?;
+    let slot = match target {
+        ProxyTarget::Code(implementation) => return Some((kind, implementation)),
+        ProxyTarget::Slot(slot) => slot,
+    };
+    let read = state.rpc.eth_get_storage_at(address, slot, "latest");
+    let word = tokio::time::timeout(CODE_FETCH_TIMEOUT, read)
+        .await
+        .ok()?
+        .ok()?;
+    let implementation = word.get(word.len().checked_sub(40)?..)?;
+    (implementation.bytes().any(|b| b != b'0'))
+        .then(|| (kind, checksum_address(&format!("0x{implementation}"))))
 }
 
 /// The type `code` gives an unlisted address, if any: an EIP-7702 delegation (`0xef0100` and an
@@ -1545,7 +1568,11 @@ pub async fn address_page(
     } else {
         kind
     };
-    let code = if tab == "contract" { code } else { Value::Null };
+    let mut code = if tab == "contract" { code } else { Value::Null };
+    if let Some((proxy, implementation)) = proxy_implementation(&state, &checksummed, &code).await {
+        code["proxy"] = json!(proxy);
+        code["implementation"] = json!(implementation);
+    }
     let virtual_address = parse_virtual(&checksummed);
 
     let ctx = page_ctx(
