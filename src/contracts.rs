@@ -140,6 +140,12 @@ const KNOWN: &[Known] = &[
         "Anchoring",
         &["anchoring"],
     ),
+    // What 0x…0a00 delegates to since T12, at the same CREATE2 address on every chain.
+    contract(
+        "0xF873bbD8B4ed0580425592a37b218BC46A628C70",
+        "Anchoring Implementation",
+        &["anchoring"],
+    ),
     contract(
         "0x5AD1000000000000000000000000000000000000",
         "Zone Portal Implementation",
@@ -251,9 +257,66 @@ pub fn search_named(query: &str, limit: usize) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Where a proxy keeps the address it delegates to.
+#[derive(Debug, PartialEq)]
+pub enum ProxyTarget {
+    /// In its own bytecode.
+    Code(String),
+    /// In this storage slot.
+    Slot(&'static str),
+}
+
+/// The ERC-1967 implementation slot.
+const IMPLEMENTATION_SLOT: &str =
+    "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+/// The word a Safe proxy matches calldata against to answer `masterCopy()` from slot 0.
+const SAFE_MASTER_COPY: &str = "a619486e00000000000000000000000000000000000000000000000000000000";
+/// What an EIP-1167 clone's bytecode holds around the implementation's address.
+const EIP1167_HEAD: &str = "363d3d373d3d3d363d73";
+const EIP1167_TAIL: &str = "5af43d82803e903d91602b57fd5bf3";
+
+/// The kind of proxy `code` is, if any, and where it keeps its implementation.
+pub fn proxy(code: &str) -> Option<(&'static str, ProxyTarget)> {
+    let hex = code.trim_start_matches("0x");
+    if let Some(address) = hex
+        .strip_prefix(EIP1167_HEAD)
+        .and_then(|rest| rest.strip_suffix(EIP1167_TAIL))
+        .filter(|address| address.len() == 40)
+    {
+        let implementation = checksum_address(&format!("0x{address}"));
+        Some(("EIP-1167", ProxyTarget::Code(implementation)))
+    } else if hex.contains(&IMPLEMENTATION_SLOT[2..]) {
+        Some(("ERC-1967", ProxyTarget::Slot(IMPLEMENTATION_SLOT)))
+    } else if hex.contains(SAFE_MASTER_COPY) {
+        Some(("Safe", ProxyTarget::Slot("0x0")))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_proxy_is_told_by_its_code() {
+        let portal = checksum_address("0x5ad1000000000000000000000000000000000000");
+        let clone = format!(
+            "0x{EIP1167_HEAD}{}{EIP1167_TAIL}",
+            portal[2..].to_lowercase()
+        );
+        assert_eq!(proxy(&clone), Some(("EIP-1167", ProxyTarget::Code(portal))));
+        // 0x…0a00 since T12.
+        let erc1967 = "0x363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3";
+        assert_eq!(
+            proxy(erc1967),
+            Some(("ERC-1967", ProxyTarget::Slot(IMPLEMENTATION_SLOT)))
+        );
+        // What canary's Safe proxy factory deploys, from its `proxyRuntimeCode()`.
+        let safe = "0x608060405273ffffffffffffffffffffffffffffffffffffffff600054167fa619486e0000000000000000000000000000000000000000000000000000000060003514156050578060005260206000f35b3660008037600080366000845af43d6000803e60008114156070573d6000fd5b3d6000f3fea2646970667358221220d1429297349653a4918076d650332de1a1068c5f3e07c5c82360c277770b955264736f6c63430007060033";
+        assert_eq!(proxy(safe), Some(("Safe", ProxyTarget::Slot("0x0"))));
+        assert_eq!(proxy("0x6080604052"), None);
+    }
 
     /// Every ABI the table names must be one the registry actually loads.
     #[test]
@@ -268,6 +331,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The label follows the deployment the vendored contracts describe.
+    #[test]
+    fn the_anchoring_implementation_is_where_the_contracts_deploy_it() {
+        let deployment: serde_json::Value =
+            serde_json::from_str(include_str!("../contracts/layout/deployment.json")).unwrap();
+        let implementation = deployment["implementation"].as_str().unwrap();
+        assert_eq!(
+            get_contract_name(implementation).as_deref(),
+            Some("Anchoring Implementation")
+        );
+        assert_eq!(abis_for_address(implementation), ["anchoring"]);
     }
 
     /// The lookup must not care how an address is spelled.
