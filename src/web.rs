@@ -2156,7 +2156,7 @@ pub async fn anchoring_suggest(
         let id = q.parse().unwrap_or(0);
         let asked = anchoring::find_registry(&state.rpc, id);
         match tokio::time::timeout(name_search::TIMEOUT, asked).await {
-            Ok(Ok(Some(registry))) => vec![Hit::registry(&registry)],
+            Ok(Ok(Some((registry, _)))) => vec![Hit::registry(&registry)],
             _ => Vec::new(),
         }
     } else {
