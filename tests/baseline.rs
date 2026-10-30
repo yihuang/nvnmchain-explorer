@@ -46,9 +46,9 @@
 //! Not covered:
 //!
 //! - `transactions.trace_data` and `selector_names`: see `UNEXERCISED`.
-//! - The `kv` keys the live loops write (`stats`, `chain_head`,
-//!   `anchoring_backfilled_to`). Their values depend on the clock or on the
-//!   chain's current head, so they change on every run.
+//! - The `kv` keys the live loops write (`stats`, `anchoring_backfilled_to`).
+//!   Their values depend on the clock or on the chain's current head, so they
+//!   change on every run.
 //!
 //! # Recording
 //!

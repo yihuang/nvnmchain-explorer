@@ -1,6 +1,6 @@
 //! Async JSON-RPC client, mirroring `app/rpc.py`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -221,12 +221,11 @@ impl ChainRpc {
             if let Some(pace) = &self.pace {
                 pace.wait().await;
             }
-            let resp = self
-                .post()
-                .json(&payload)
-                .send()
-                .await
-                .context("batch RPC request failed")?;
+            let resp = self.post().json(&payload).send().await.with_context(|| {
+                let methods: BTreeSet<&str> = calls.iter().map(|(m, _)| m.as_str()).collect();
+                let methods: Vec<&str> = methods.into_iter().collect();
+                format!("batch RPC request ({}) failed", methods.join(", "))
+            })?;
             if self.pace.is_none() || resp.status() != StatusCode::TOO_MANY_REQUESTS {
                 break resp;
             }

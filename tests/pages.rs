@@ -211,14 +211,14 @@ async fn serve_beside_indexer(stats: Value, rpc_url: &str) -> (tempfile::TempDir
     .expect("unknown-log tx");
     db::save_token_metadata(
         &db,
-        &TokenMeta {
+        &[TokenMeta {
             address: checksum_address(TOKEN),
             name: "pathUSD".into(),
             symbol: "pathUSD".into(),
             decimals: 6,
             currency: "USD".into(),
             total_supply: "1000000000".into(),
-        },
+        }],
     )
     .expect("token");
     // More transfers than fit on a page, so the counts and the pager have

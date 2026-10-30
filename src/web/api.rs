@@ -278,7 +278,7 @@ async fn registry(
     State(state): State<AppState>,
     Path(registry_id): Path<u64>,
 ) -> Result<Json<Registry>, ApiError> {
-    let registry = anchoring::find_registry(&state.rpc, registry_id)
+    let (registry, _) = anchoring::find_registry(&state.rpc, registry_id)
         .await?
         .ok_or_else(|| not_found("Registry"))?;
     Ok(Json(registry))
@@ -290,11 +290,10 @@ async fn records(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<List<Record>>, ApiError> {
     let page = page_param(&query);
-    if !anchoring::has_registry(&state.rpc, registry_id).await? {
-        return Err(not_found("Registry"));
-    }
-    let (items, total) =
-        anchoring::records(&state.rpc, registry_id, page.into(), PER_PAGE.into()).await?;
+    let (_, items, total) =
+        anchoring::registry(&state.rpc, registry_id, page.into(), PER_PAGE.into())
+            .await?
+            .ok_or_else(|| not_found("Registry"))?;
     Ok(Json(List {
         items,
         next_page: next_of(page, total),

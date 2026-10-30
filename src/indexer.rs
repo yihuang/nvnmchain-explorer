@@ -322,26 +322,15 @@ async fn attach_token_metadata(
         return;
     }
 
-    let mut set = tokio::task::JoinSet::new();
-    for addr in wanted {
-        let rpc = rpc.clone();
-        set.spawn(async move {
-            let meta = fetch_token_metadata(&rpc, &addr).await;
-            (addr, meta)
-        });
-    }
-    let mut metas = HashMap::new();
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok((_, Ok(meta))) => {
-                metas.insert(meta.address.clone(), meta);
-            }
-            // Nothing stored and nothing remembered, so the next block that
-            // mentions the token asks again.
-            Ok((addr, Err(e))) => warn!("token metadata for {addr} unavailable: {e:#}"),
-            Err(e) => warn!("token metadata task failed: {e:#}"),
+    let metas: HashMap<_, _> = match fetch_token_metadata(rpc, wanted).await {
+        Ok(metas) => metas.into_iter().map(|m| (m.address.clone(), m)).collect(),
+        // Nothing stored and nothing remembered, so the next block that
+        // mentions a token asks again.
+        Err(e) => {
+            warn!("token metadata unavailable: {e:#}");
+            return;
         }
-    }
+    };
     known_tokens
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -647,34 +636,16 @@ async fn repair_token_metadata(rpc: &ChainRpc, db: &Db) -> Result<()> {
         return Ok(());
     }
     info!("repairing {} token metadata row(s)", stale.len());
-    // Fetched together, the way a block's new tokens are: every row here is one
-    // round trip, and a database that needs repairing tends to need a lot of it.
-    let mut set = tokio::task::JoinSet::new();
-    for addr in stale {
-        let rpc = rpc.clone();
-        set.spawn(async move { fetch_token_metadata(&rpc, &addr).await });
+    let (empty, repaired): (Vec<_>, Vec<_>) = fetch_token_metadata(rpc, &stale)
+        .await?
+        .into_iter()
+        .partition(|meta| meta.name.is_empty() && meta.symbol.is_empty());
+    // A token that answers to neither view has nothing to repair the row with;
+    // leave it for the next start rather than blanking it.
+    for meta in empty {
+        warn!("nothing to repair {} with; leaving the row", meta.address)
     }
-    while let Some(res) = set.join_next().await {
-        match res {
-            // A token that answers to neither view has nothing to repair the
-            // row with; leave it for the next start rather than blanking it.
-            Ok(Ok(meta)) if meta.name.is_empty() && meta.symbol.is_empty() => {
-                warn!("nothing to repair {} with; leaving the row", meta.address)
-            }
-            // Written as they arrive: the writes take the lock, so they queue anyway.
-            Ok(Ok(meta)) => {
-                if let Err(e) = db::save_token_metadata(db, &meta) {
-                    warn!(
-                        "failed to repair token metadata for {}: {e:#}",
-                        meta.address
-                    );
-                }
-            }
-            Ok(Err(e)) => warn!("token metadata repair skipped: {e:#}"),
-            Err(e) => warn!("token metadata repair task failed: {e:#}"),
-        }
-    }
-    Ok(())
+    db::save_token_metadata(db, &repaired)
 }
 
 /// Bring a database written by an older build back in line with what the read
@@ -728,6 +699,8 @@ struct Indexer {
     bundle_tx: mpsc::Sender<BlockBundle>,
     shutdown: watch::Receiver<bool>,
     tip_lag: Arc<AtomicU64>,
+    /// The newest head the node announced; the stats recompute stores it.
+    chain_head: Arc<AtomicU64>,
 }
 
 impl Indexer {
@@ -864,7 +837,7 @@ async fn forward_loop(mut ix: Indexer) {
         // A fast head feed delivers every block; fold queued heads into one
         // range so we fetch a batch instead of one HTTP request per block.
         let mut head = drain_heads(&mut head_rx, head);
-        db::set_chain_head(&ix.db, head as i64);
+        ix.chain_head.store(head, Ordering::Relaxed);
 
         if sent == 0 && head > 0 {
             sent = wait_for_seed(&ix.db).await;
@@ -882,7 +855,7 @@ async fn forward_loop(mut ix: Indexer) {
                 return;
             }
             head = drain_heads(&mut head_rx, head);
-            db::set_chain_head(&ix.db, head as i64);
+            ix.chain_head.store(head, Ordering::Relaxed);
             let end = sent.saturating_add(ix.cfg.batch).min(head);
             ix.set_tip_lag(head.saturating_sub(sent));
             // Cut at the first hole: this loop never comes back for one.
@@ -980,7 +953,13 @@ pub async fn run_forever(
     shutdown: watch::Receiver<bool>,
 ) {
     let stats_interval = cfg.stats_interval;
-    tokio::spawn(stats_loop(db.clone(), stats_interval, shutdown.clone()));
+    let chain_head = Arc::new(AtomicU64::new(0));
+    tokio::spawn(stats_loop(
+        db.clone(),
+        stats_interval,
+        chain_head.clone(),
+        shutdown.clone(),
+    ));
 
     tokio::spawn(genesis_loop(
         rpc.clone(),
@@ -1067,6 +1046,7 @@ pub async fn run_forever(
         bundle_tx: bundle_tx.clone(),
         shutdown,
         tip_lag: Arc::new(AtomicU64::new(0)),
+        chain_head,
     };
     let forward = tokio::spawn(forward_loop(ix.clone()));
     let backfill = tokio::spawn(backfill_loop(ix));
@@ -1113,12 +1093,17 @@ async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
 
 /// Recompute the home-page stats blob into the `kv` table every interval so
 /// the web layer never has to scan history at request time.
-async fn stats_loop(db: Db, interval: Duration, mut shutdown: watch::Receiver<bool>) {
+async fn stats_loop(
+    db: Db,
+    interval: Duration,
+    chain_head: Arc<AtomicU64>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
         if *shutdown.borrow() {
             break;
         }
-        if let Err(e) = compute_and_store_stats(&db) {
+        if let Err(e) = compute_and_store_stats(&db, chain_head.load(Ordering::Relaxed)) {
             warn!("stats recompute failed: {e:#}");
         }
         if sleep_or_shutdown(&mut shutdown, interval).await {
@@ -1130,7 +1115,7 @@ async fn stats_loop(db: Db, interval: Duration, mut shutdown: watch::Receiver<bo
 /// Minutes of activity the home page charts and averages.
 const CHART_MINUTES: usize = 60;
 
-fn compute_and_store_stats(db: &Db) -> Result<Value> {
+fn compute_and_store_stats(db: &Db, head: u64) -> Result<Value> {
     let conn = db::lock(db);
     let now = db::now_ts();
 
@@ -1156,15 +1141,8 @@ fn compute_and_store_stats(db: &Db) -> Result<Value> {
     })?;
 
     // Index progress, so the home page and the stream never recount blocks.
-    // Read through `conn`: a helper taking `&Db` would deadlock on the
-    // connection lock this function already holds.
-    let chain_head: i64 = conn
-        .query_row("SELECT value FROM kv WHERE key='chain_head'", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // Until the first head arrives, the newest indexed block stands in.
+    let chain_head = (head as i64).max(latest_block.unwrap_or(0));
     let index_pct = if chain_head > 0 {
         (total_blocks as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
     } else {
@@ -1253,7 +1231,7 @@ mod tests {
                 .unwrap();
         }
 
-        let stats = compute_and_store_stats(&db).unwrap();
+        let stats = compute_and_store_stats(&db, 0).unwrap();
         let txs: Vec<i64> = serde_json::from_value(stats["tx_per_minute"].clone()).unwrap();
         assert_eq!(txs.len(), CHART_MINUTES);
         // The block an hour before the newest is outside the hour.

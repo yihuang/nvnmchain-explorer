@@ -757,15 +757,7 @@ pub async fn home(
         .get("total_blocks")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    // A blob written before the head rode along in it (an upgrade, seeded from
-    // kv) has no chain_head; the kv row it came from does, so the bar shows
-    // real progress rather than 0% until the first recompute.
-    let chain_head = stats
-        .get("chain_head")
-        .and_then(Value::as_i64)
-        .filter(|head| *head > 0)
-        .or_else(|| db::get_kv(&state.db, "chain_head").and_then(|v| v.parse().ok()))
-        .unwrap_or(0);
+    let chain_head = stats.get("chain_head").and_then(Value::as_i64).unwrap_or(0);
     let index_pct = if chain_head > 0 {
         (indexed_count as f64 / chain_head as f64 * 100.0).clamp(0.0, 100.0)
     } else {
@@ -1643,8 +1635,8 @@ pub async fn token_page(
     let meta = match stored {
         Some(m) => m,
         None => {
-            let fetched = match fetch_token_metadata(&state.rpc, &checksummed).await {
-                Ok(fetched) => fetched,
+            let fetched = match fetch_token_metadata(&state.rpc, [&checksummed]).await {
+                Ok(mut fetched) => fetched.remove(0),
                 Err(e) => return node_failed(&state, &headers, &query, e),
             };
             // An address that answers to neither name() nor symbol() is not a
@@ -2164,7 +2156,7 @@ pub async fn anchoring_suggest(
         let id = q.parse().unwrap_or(0);
         let asked = anchoring::find_registry(&state.rpc, id);
         match tokio::time::timeout(name_search::TIMEOUT, asked).await {
-            Ok(Ok(Some(registry))) => vec![Hit::registry(&registry)],
+            Ok(Ok(Some((registry, _)))) => vec![Hit::registry(&registry)],
             _ => Vec::new(),
         }
     } else {
