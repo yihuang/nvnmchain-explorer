@@ -192,6 +192,11 @@ database, so the web server need not share a process with the indexer.
 | `/api/v1/tokens/{addr}` | A token's metadata; 404 until the index has met it |
 | `/api/v1/tokens/{addr}/holders` | Its holders, largest balance first |
 | `/api/v1/tokens/{addr}/transfers` | Its transfers, newest first |
+| `/api/v1/anchoring/registries` | Anchoring registries, newest first |
+| `/api/v1/anchoring/registries/{id}` | A registry |
+| `/api/v1/anchoring/registries/{id}/records` | The latest version of each of its records |
+| `/api/v1/anchoring/registries/{id}/records/{record}` | A record's latest version |
+| `/api/v1/anchoring/registries/{id}/records/{record}/versions` | Its versions, newest first |
 
 ### Decoding
 

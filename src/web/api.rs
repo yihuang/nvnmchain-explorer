@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use super::{
     address_type, enrich_transfers, find_block, page_param, token_holders, AppState, PER_PAGE,
 };
+use crate::anchoring::{self, Record, Registry};
 use crate::contracts::identify_address;
 use crate::db::{self, TxColumns};
 use crate::decoder::{checksum_address, decode_event, function_name, is_valid_address};
@@ -32,6 +33,14 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/tokens/{address}", get(token))
         .route("/tokens/{address}/holders", get(holders))
         .route("/tokens/{address}/transfers", get(token_transfers))
+        .route("/anchoring/registries", get(registries))
+        .route("/anchoring/registries/{id}", get(registry))
+        .route("/anchoring/registries/{id}/records", get(records))
+        .route("/anchoring/registries/{id}/records/{record}", get(record))
+        .route(
+            "/anchoring/registries/{id}/records/{record}/versions",
+            get(versions),
+        )
 }
 
 #[derive(Serialize)]
@@ -52,6 +61,14 @@ struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(json!({"error": self.1}))).into_response()
+    }
+}
+
+/// A read the node did not answer.
+impl From<anyhow::Error> for ApiError {
+    fn from(err: anyhow::Error) -> Self {
+        tracing::warn!("node read failed: {err:#}");
+        ApiError(StatusCode::BAD_GATEWAY, format!("{err:#}"))
     }
 }
 
@@ -238,4 +255,79 @@ async fn token_transfers(
     let page = page_param(&query);
     let transfers = db::get_token_transfers(&state.db, &meta.address, page, PER_PAGE);
     Ok(listing(transfers, page))
+}
+
+/// The page after `page` while `total` rows run past it.
+fn next_of(page: u32, total: u64) -> Option<u32> {
+    (u64::from(page) * u64::from(PER_PAGE) < total).then(|| page + 1)
+}
+
+async fn registries(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<List<Registry>>, ApiError> {
+    let page = page_param(&query);
+    let (items, total) = anchoring::registries(&state.rpc, page.into(), PER_PAGE.into()).await?;
+    Ok(Json(List {
+        items,
+        next_page: next_of(page, total),
+    }))
+}
+
+async fn registry(
+    State(state): State<AppState>,
+    Path(registry_id): Path<u64>,
+) -> Result<Json<Registry>, ApiError> {
+    let registry = anchoring::find_registry(&state.rpc, registry_id)
+        .await?
+        .ok_or_else(|| not_found("Registry"))?;
+    Ok(Json(registry))
+}
+
+async fn records(
+    State(state): State<AppState>,
+    Path(registry_id): Path<u64>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<List<Record>>, ApiError> {
+    let page = page_param(&query);
+    if !anchoring::has_registry(&state.rpc, registry_id).await? {
+        return Err(not_found("Registry"));
+    }
+    let (items, total) =
+        anchoring::records(&state.rpc, registry_id, page.into(), PER_PAGE.into()).await?;
+    Ok(Json(List {
+        items,
+        next_page: next_of(page, total),
+    }))
+}
+
+async fn record(
+    State(state): State<AppState>,
+    Path((registry_id, record_id)): Path<(u64, u64)>,
+) -> Result<Json<Record>, ApiError> {
+    let latest = anchoring::latest(&state.rpc, registry_id, record_id)
+        .await?
+        .ok_or_else(|| not_found("Record"))?;
+    Ok(Json(latest))
+}
+
+async fn versions(
+    State(state): State<AppState>,
+    Path((registry_id, record_id)): Path<(u64, u64)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<List<Record>>, ApiError> {
+    let page = page_param(&query);
+    let (latest, items) = anchoring::record(
+        &state.rpc,
+        registry_id,
+        record_id,
+        page.into(),
+        PER_PAGE.into(),
+    )
+    .await?
+    .ok_or_else(|| not_found("Record"))?;
+    Ok(Json(List {
+        items,
+        next_page: next_of(page, latest.index),
+    }))
 }
