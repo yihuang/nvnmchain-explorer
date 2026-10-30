@@ -133,9 +133,14 @@ pub async fn registries(rpc: &ChainRpc, page: u64, per_page: u64) -> Result<(Vec
     Ok((view(rpc, call).await?.registriesOut, total))
 }
 
+/// Whether a registry has this id.
+pub async fn has_registry(rpc: &ChainRpc, registry_id: u64) -> Result<bool> {
+    Ok((1..=registry_count(rpc).await?).contains(&registry_id))
+}
+
 /// A registry by id; `None` if there is no such registry.
 pub async fn find_registry(rpc: &ChainRpc, registry_id: u64) -> Result<Option<Registry>> {
-    if !(1..=registry_count(rpc).await?).contains(&registry_id) {
+    if !has_registry(rpc, registry_id).await? {
         return Ok(None);
     }
     let call = registriesCall {
@@ -157,9 +162,20 @@ pub async fn registry(
     let Some(registry) = find_registry(rpc, registry_id).await? else {
         return Ok(None);
     };
+    let (records, total) = records(rpc, registry_id, page, per_page).await?;
+    Ok(Some((registry, records, total)))
+}
+
+/// The latest version of each of a registry's records newest first, and how many there are.
+pub async fn records(
+    rpc: &ChainRpc,
+    registry_id: u64,
+    page: u64,
+    per_page: u64,
+) -> Result<(Vec<Record>, u64)> {
     let total = record_count(rpc, registry_id).await?;
     let Some(ids) = newest_first(total, page, per_page) else {
-        return Ok(Some((registry, Vec::new(), total)));
+        return Ok((Vec::new(), total));
     };
     let pagination = PageRequest {
         offset: ids.start() - 1,
@@ -172,18 +188,12 @@ pub async fn registry(
     };
     let mut records = view(rpc, call).await?.recordsOut;
     records.reverse();
-    Ok(Some((registry, records, total)))
+    Ok((records, total))
 }
 
-/// A record's latest version, and its versions newest first; `None` if there is no such
-/// record. The latest's `index` is how many versions there are.
-pub async fn record(
-    rpc: &ChainRpc,
-    registry_id: u64,
-    record_id: u64,
-    page: u64,
-    per_page: u64,
-) -> Result<Option<(Record, Vec<Record>)>> {
+/// A record's latest version, whose `index` is how many versions there are; `None` if there is
+/// no such record.
+pub async fn latest(rpc: &ChainRpc, registry_id: u64, record_id: u64) -> Result<Option<Record>> {
     if !(1..=record_count(rpc, registry_id).await?).contains(&record_id) {
         return Ok(None);
     }
@@ -193,6 +203,21 @@ pub async fn record(
         .recordsOut
         .pop()
         .context("no record")?;
+    Ok(Some(latest))
+}
+
+/// A record's latest version, and its versions newest first; `None` if there is no such
+/// record.
+pub async fn record(
+    rpc: &ChainRpc,
+    registry_id: u64,
+    record_id: u64,
+    page: u64,
+    per_page: u64,
+) -> Result<Option<(Record, Vec<Record>)>> {
+    let Some(latest) = latest(rpc, registry_id, record_id).await? else {
+        return Ok(None);
+    };
     let Some(indexes) = newest_first(latest.index, page, per_page) else {
         return Ok(Some((latest, Vec::new())));
     };

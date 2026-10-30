@@ -1,4 +1,4 @@
-//! The anchoring pages, over a stub node that answers like the contract: 30 registries,
+//! The anchoring pages and API, over a stub node that answers like the contract: 30 registries,
 //! registry 1 with 27 records and its record 1 with 30 versions, so every listing pages.
 
 use std::sync::{Arc, Mutex};
@@ -587,4 +587,53 @@ async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
     );
     // One dropped, six refused on the way down to 781 blocks, then three windows.
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 10);
+}
+
+async fn api(base: &str, path: &str) -> (u16, Value) {
+    let response = reqwest::get(format!("{base}/api/v1/anchoring{path}"))
+        .await
+        .unwrap();
+    (response.status().as_u16(), response.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn the_api_serves_registries_records_and_versions() {
+    let (_dir, base) = serve(stub_node(30).await).await;
+    let (_, first) = api(&base, "/registries").await;
+    assert_eq!(
+        ids(&first["items"], "id"),
+        (6..=30).rev().collect::<Vec<_>>()
+    );
+    assert_eq!(first["next_page"], 2);
+    let (_, last) = api(&base, "/registries?page=2").await;
+    assert_eq!(ids(&last["items"], "id"), [5, 4, 3, 2, 1]);
+    assert_eq!(last["next_page"], Value::Null);
+
+    assert_eq!(api(&base, "/registries/1").await.1["name"], "reg-1");
+    let (_, records) = api(&base, "/registries/1/records?page=2").await;
+    assert_eq!(ids(&records["items"], "recordId"), [2, 1]);
+    assert_eq!(records["next_page"], Value::Null);
+
+    assert_eq!(api(&base, "/registries/1/records/1").await.1["index"], 30);
+    let (_, versions) = api(&base, "/registries/1/records/1/versions").await;
+    assert_eq!(
+        ids(&versions["items"], "index"),
+        (6..=30).rev().collect::<Vec<_>>()
+    );
+    assert_eq!(versions["next_page"], 2);
+
+    for path in [
+        "/registries/31",
+        "/registries/31/records",
+        "/registries/1/records/28",
+        "/registries/1/records/28/versions",
+    ] {
+        assert_eq!(api(&base, path).await.0, 404, "{path}");
+    }
+    let malformed = reqwest::get(format!("{base}/api/v1/anchoring/registries/x"))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), 400);
+    let (_dir, unreachable) = serve("http://127.0.0.1:1".into()).await;
+    assert_eq!(api(&unreachable, "/registries").await.0, 502);
 }

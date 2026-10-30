@@ -44,6 +44,8 @@ use crate::tokens::{
     fetch_token_metadata, format_token_amount, format_token_amount_with_symbol, has_control_chars,
 };
 
+mod api;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
@@ -355,6 +357,35 @@ async fn proxy_implementation(
     let implementation = word.get(word.len().checked_sub(40)?..)?;
     (implementation.bytes().any(|b| b != b'0'))
         .then(|| (kind, checksum_address(&format!("0x{implementation}"))))
+}
+
+/// The type an address shows as, and its code when `code_wanted` or the type needed it; `listed`
+/// is what `identify_address` said.
+async fn address_type<'a>(
+    state: &AppState,
+    address: &str,
+    listed: &'a str,
+    token: bool,
+    code_wanted: bool,
+) -> (&'a str, Value) {
+    // An indexed token that identify_address does not know is a contract too.
+    let kind = if listed == "eoa" && token {
+        "contract"
+    } else {
+        listed
+    };
+    // Only the node knows an unlisted contract: a factory's deployment has no receipt naming it.
+    let code = if code_wanted || kind == "eoa" {
+        contract_code(state, address).await
+    } else {
+        Value::Null
+    };
+    let kind = if kind == "eoa" {
+        kind_from_code(&code).unwrap_or(kind)
+    } else {
+        kind
+    };
+    (kind, code)
 }
 
 /// The type `code` gives an unlisted address, if any: an EIP-7702 delegation (`0xef0100` and an
@@ -924,26 +955,29 @@ async fn sse_step(
         }
     }
 }
+
+/// A block by height, decimal or `0x` hex, or by hash.
+fn find_block(db: &Db, id: &str) -> Option<crate::models::Block> {
+    if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
+        id.parse::<i64>()
+            .ok()
+            .and_then(|n| db::get_block_by_number(db, n))
+    } else {
+        db::get_block_by_hash(db, id).or_else(|| {
+            id.strip_prefix("0x")
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .and_then(|n| db::get_block_by_number(db, n as i64))
+        })
+    }
+}
+
 pub async fn block_page(
     State(state): State<AppState>,
     Path(block_id): Path<String>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let block = if block_id.chars().all(|c| c.is_ascii_digit()) && !block_id.is_empty() {
-        block_id
-            .parse::<i64>()
-            .ok()
-            .and_then(|n| db::get_block_by_number(&state.db, n))
-    } else {
-        db::get_block_by_hash(&state.db, &block_id).or_else(|| {
-            block_id
-                .strip_prefix("0x")
-                .and_then(|h| u64::from_str_radix(h, 16).ok())
-                .and_then(|n| db::get_block_by_number(&state.db, n as i64))
-        })
-    };
-    let Some(block) = block else {
+    let Some(block) = find_block(&state.db, &block_id) else {
         return not_found(&state, &headers, &query, "Block", &block_id);
     };
     let transactions =
@@ -1549,25 +1583,15 @@ pub async fn address_page(
 
     let addr_info = identify_address(&checksummed);
     let token_meta = db::get_token_metadata(&state.db, &checksummed);
-    // An indexed token that identify_address does not know is a contract too.
-    let kind = if addr_info.kind == "eoa" && token_meta.is_some() {
-        "contract"
-    } else {
-        addr_info.kind.as_str()
-    };
     let label = addr_info.label.clone();
-
-    // Only the node knows an unlisted contract: a factory's deployment has no receipt naming it.
-    let code = if tab == "contract" || kind == "eoa" {
-        contract_code(&state, &checksummed).await
-    } else {
-        Value::Null
-    };
-    let kind = if kind == "eoa" {
-        kind_from_code(&code).unwrap_or(kind)
-    } else {
-        kind
-    };
+    let (kind, code) = address_type(
+        &state,
+        &checksummed,
+        &addr_info.kind,
+        token_meta.is_some(),
+        tab == "contract",
+    )
+    .await;
     let mut code = if tab == "contract" { code } else { Value::Null };
     if let Some((proxy, implementation)) = proxy_implementation(&state, &checksummed, &code).await {
         code["proxy"] = json!(proxy);
@@ -2454,6 +2478,7 @@ pub fn app(state: AppState) -> Router {
         .route("/search", get(search_page))
         .route("/api/search", get(search_suggest))
         .route("/api/anchoring/search", get(anchoring_suggest))
+        .nest("/api/v1", api::routes())
         // Public explorer: allow cross-origin reads from any site (the wallet
         // is hosted on a different origin and needs `?format=json`).
         .layer(CorsLayer::permissive())

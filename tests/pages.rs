@@ -1,4 +1,4 @@
-//! The pages, end to end.
+//! The pages and the JSON API, end to end.
 //!
 //! These render the real templates against a real database, so a context key a
 //! handler stops sending fails a test rather than a page view. Nothing reaches
@@ -1514,4 +1514,137 @@ async fn the_anchoring_interface_has_an_owner() {
     assert!(named("reads", "owner"));
     assert!(named("writes", "transferOwnership"));
     assert!(named("events", "OwnershipTransferred"));
+}
+
+// ---------------------------------------------------------------------------
+// JSON API
+// ---------------------------------------------------------------------------
+
+async fn api(base: &str, path: &str) -> (u16, Value) {
+    let response = reqwest::get(format!("{base}/api/v1{path}"))
+        .await
+        .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+    let status = response.status().as_u16();
+    let body = response
+        .json()
+        .await
+        .unwrap_or_else(|e| panic!("GET {path} json: {e}"));
+    (status, body)
+}
+
+fn numbers(items: &Value) -> Vec<i64> {
+    items
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|b| b["number"].as_i64().expect("number"))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_api_serves_blocks_and_transactions() {
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, "http://127.0.0.1:1").await;
+    let (_, blocks) = api(&base, "/blocks").await;
+    assert_eq!(numbers(&blocks["items"]), [101, 100]);
+    assert_eq!(blocks["next_page"], Value::Null, "nothing below 100");
+
+    let (_, hundred) = api(&base, "/blocks/100").await;
+    let txs = hundred["transactions"].as_array().expect("transactions");
+    assert_eq!(txs.len(), 3);
+    assert!(txs.iter().all(|t| t.get("receipt_data").is_none()));
+    let by_hash = format!("/blocks/{}", hundred["hash"].as_str().expect("hash"));
+    assert_eq!(api(&base, &by_hash).await.1["number"], json!(100));
+
+    let (_, listed) = api(&base, "/txs").await;
+    assert_eq!(listed["items"].as_array().expect("items").len(), 3);
+    assert_eq!(listed["next_page"], Value::Null);
+
+    let (_, tx) = api(&base, &format!("/txs/{TX_HASH}")).await;
+    assert_eq!(tx["method"], json!("transfer"));
+    assert_eq!(tx["receipt"]["status"], json!("0x1"));
+    let events: Vec<&Value> = tx["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|e| &e["name"])
+        .collect();
+    assert_eq!(events, [&json!("Transfer"), &json!("TransferWithMemo")]);
+
+    for missing in ["/blocks/99", &format!("/txs/0x{}", "00".repeat(32))] {
+        let (status, body) = api(&base, missing).await;
+        assert_eq!(status, 404, "{missing}");
+        assert!(body["error"].is_string(), "{missing}");
+    }
+
+    // Page 2 covers 52..=76, none of them indexed; page 3 holds 50.
+    let mut low = block();
+    low.number = 50;
+    low.hash = format!("0x{}", "50".repeat(32));
+    db::save_block(&indexer, &low).expect("block 50");
+    let (_, blocks) = api(&base, "/blocks?page=2").await;
+    assert!(numbers(&blocks["items"]).is_empty());
+    assert_eq!(blocks["next_page"], json!(3));
+    let (_, blocks) = api(&base, "/blocks?page=3").await;
+    assert_eq!(numbers(&blocks["items"]), [50]);
+    assert_eq!(blocks["next_page"], Value::Null);
+}
+
+#[tokio::test]
+async fn the_api_serves_an_address() {
+    let (_dir, base) = serve(Value::Null).await;
+    let (_, sender) = api(&base, &format!("/addresses/{SENDER}")).await;
+    assert_eq!(sender["address"], json!(checksum_address(SENDER)));
+    assert_eq!(sender["type"], json!("eoa"));
+    let (_, token) = api(&base, &format!("/addresses/{TOKEN}")).await;
+    assert_eq!(token["token"]["symbol"], json!("pathUSD"));
+
+    let (_, txs) = api(&base, &format!("/addresses/{SENDER}/txs")).await;
+    assert_eq!(txs["items"].as_array().expect("items").len(), 3);
+
+    let (_, first) = api(&base, &format!("/addresses/{SENDER}/transfers")).await;
+    assert_eq!(first["items"].as_array().expect("items").len(), 25);
+    assert_eq!(first["items"][0]["token_symbol"], json!("pathUSD"));
+    assert_eq!(first["next_page"], json!(2));
+    let (_, last) = api(&base, &format!("/addresses/{SENDER}/transfers?page=2")).await;
+    assert_eq!(
+        last["items"].as_array().expect("items").len() as i64,
+        TRANSFER_COUNT - 25
+    );
+    assert_eq!(last["next_page"], Value::Null);
+
+    let holder = format!("0x{:040x}", 1);
+    let (_, holdings) = api(&base, &format!("/addresses/{holder}/holdings")).await;
+    assert_eq!(holdings["items"][0]["balance"], json!("1000000"));
+    assert_eq!(holdings["next_page"], Value::Null);
+
+    let (status, body) = api(&base, "/addresses/0x12/txs").await;
+    assert_eq!(status, 400);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn the_api_serves_tokens() {
+    let (_dir, base) = serve(Value::Null).await;
+    let (_, tokens) = api(&base, "/tokens").await;
+    assert_eq!(tokens["items"][0]["symbol"], json!("pathUSD"));
+    assert_eq!(tokens["next_page"], Value::Null);
+    let (_, token) = api(&base, &format!("/tokens/{TOKEN}")).await;
+    assert_eq!(token["decimals"], json!(6));
+
+    for list in ["holders", "transfers"] {
+        let (_, first) = api(&base, &format!("/tokens/{TOKEN}/{list}")).await;
+        assert_eq!(first["items"].as_array().expect(list).len(), 25, "{list}");
+        assert_eq!(first["next_page"], json!(2), "{list}");
+        let (_, last) = api(&base, &format!("/tokens/{TOKEN}/{list}?page=2")).await;
+        assert_eq!(last["next_page"], Value::Null, "{list}");
+    }
+    let (_, holders) = api(&base, &format!("/tokens/{TOKEN}/holders")).await;
+    // 10⁶ units of a 10⁹ supply, in percent.
+    assert_eq!(holders["items"][0]["share"], json!("0.1000"));
+
+    let unknown = format!("0x{}", "99".repeat(20));
+    for path in ["", "/holders", "/transfers"] {
+        let (status, _) = api(&base, &format!("/tokens/{unknown}{path}")).await;
+        assert_eq!(status, 404, "{path}");
+    }
 }
