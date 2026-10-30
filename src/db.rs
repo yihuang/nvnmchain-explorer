@@ -646,12 +646,6 @@ pub fn get_latest_block(db: &Db) -> Option<Block> {
     )
 }
 
-/// Record the chain head observed by the indexer (for index-progress display).
-pub fn set_chain_head(db: &Db, head: i64) {
-    let conn = lock(db);
-    let _ = set_kv(&conn, "chain_head", &head.to_string());
-}
-
 /// Highest stored block height; `None` when the table is empty.
 pub fn get_max_block_number(db: &Db) -> Option<i64> {
     query_opt(
@@ -967,9 +961,15 @@ fn upsert_token_meta(conn: &Connection, meta: &crate::tokens::TokenMeta) -> Resu
     Ok(())
 }
 
-pub fn save_token_metadata(db: &Db, meta: &crate::tokens::TokenMeta) -> Result<()> {
-    let conn = lock(db);
-    upsert_token_meta(&conn, meta)
+/// Upsert `metas` in one transaction.
+pub fn save_token_metadata(db: &Db, metas: &[crate::tokens::TokenMeta]) -> Result<()> {
+    let mut conn = lock(db);
+    let txn = conn.transaction()?;
+    for meta in metas {
+        upsert_token_meta(&txn, meta)?;
+    }
+    txn.commit()?;
+    Ok(())
 }
 
 const TOKEN_COLS: &str = "address, name, symbol, decimals, currency, total_supply, logo_uri, \
