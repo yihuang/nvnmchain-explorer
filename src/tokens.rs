@@ -12,6 +12,7 @@ const NAME_CALL: &str = "0x06fdde03";
 const SYMBOL_CALL: &str = "0x95d89b41";
 const DECIMALS_CALL: &str = "0x313ce567";
 const TOTAL_SUPPLY_CALL: &str = "0x18160ddd";
+const CURRENCY_CALL: &str = "0xe5a6b10f";
 const BALANCE_OF_CALL: &str = "0x70a08231";
 const GENESIS: &str = "0x0";
 /// The JSON-RPC error code of a call that ran and reverted.
@@ -100,7 +101,13 @@ pub fn has_control_chars(s: &str) -> bool {
 }
 
 /// The views read for each token.
-const TOKEN_VIEWS: [&str; 4] = [NAME_CALL, SYMBOL_CALL, DECIMALS_CALL, TOTAL_SUPPLY_CALL];
+const TOKEN_VIEWS: [&str; 5] = [
+    NAME_CALL,
+    SYMBOL_CALL,
+    DECIMALS_CALL,
+    TOTAL_SUPPLY_CALL,
+    CURRENCY_CALL,
+];
 
 /// Fetch TIP-20 token metadata from the chain, all of `addresses` in one request,
 /// in their order. An address answering to no view has an empty name and symbol;
@@ -140,7 +147,7 @@ pub async fn fetch_token_metadata(
         .map(|(address, views)| {
             // A view the token lacks comes back as `"0x"`, which the decoders read
             // as "no answer".
-            let [name, symbol, decimals, supply] = std::array::from_fn(|i| {
+            let [name, symbol, decimals, supply, currency] = std::array::from_fn(|i| {
                 views
                     .get(i)
                     .and_then(|result| result.as_ref().ok())
@@ -149,14 +156,13 @@ pub async fn fetch_token_metadata(
                     .unwrap_or("0x")
             });
             // Guard against stale/bad decodes: a mis-decoded ABI word must not be
-            // stored or rendered as a name/symbol.
-            let name = sanitize_metadata_text(&decode_string_result(name));
-            let symbol = sanitize_metadata_text(&decode_string_result(symbol));
+            // stored or rendered as text.
+            let text = |raw: &str| sanitize_metadata_text(&decode_string_result(raw));
             TokenMeta {
                 address,
-                name,
-                currency: infer_currency(&symbol),
-                symbol,
+                name: text(name),
+                symbol: text(symbol),
+                currency: text(currency),
                 decimals: decode_uint_result(decimals, 18),
                 total_supply: decode_uint256_result(supply),
             }
@@ -196,17 +202,6 @@ pub async fn balances_at_genesis(
         })
         .collect::<Result<_>>()
         .context("reading balances at genesis")
-}
-
-fn infer_currency(symbol: &str) -> String {
-    let upper = symbol.to_uppercase();
-    if upper.ends_with("USD") || matches!(upper.as_str(), "USDC" | "USDT" | "DAI" | "FRAX") {
-        "USD".into()
-    } else if upper.ends_with("EUR") {
-        "EUR".into()
-    } else {
-        symbol.to_string()
-    }
 }
 
 /// Format a token amount with up to six significant decimal places.
@@ -377,7 +372,7 @@ mod tests {
     }
 
     /// The indexer fetches metadata for every token a block range introduces, so
-    /// the tokens cost one round trip, not four each.
+    /// the tokens cost one round trip, not one per view.
     #[tokio::test]
     async fn tokens_are_read_in_one_request() {
         let node = stub_node(vec![
@@ -385,6 +380,7 @@ mod tests {
             (SYMBOL_CALL, abi_string("TUSD")),
             (DECIMALS_CALL, abi_uint(6)),
             (TOTAL_SUPPLY_CALL, abi_uint(1_000_000)),
+            (CURRENCY_CALL, abi_string("EUR")),
         ])
         .await;
         let rpc = ChainRpc::new(&node.url).expect("rpc");
@@ -401,9 +397,9 @@ mod tests {
         assert_eq!(meta.symbol, "TUSD");
         assert_eq!(meta.decimals, 6);
         assert_eq!(meta.total_supply, "1000000");
-        assert_eq!(meta.currency, "USD", "inferred from the symbol");
-        assert_eq!(node.requests(), 1, "eight views, one round trip");
-        assert_eq!(node.asked().len(), 8);
+        assert_eq!(meta.currency, "EUR", "read from the token");
+        assert_eq!(node.requests(), 1, "ten views, one round trip");
+        assert_eq!(node.asked().len(), 10);
     }
 
     /// A token at a reserved address is named by the chain, not by the
@@ -426,7 +422,7 @@ mod tests {
         assert_eq!(meta.symbol, "nUSD");
         assert_eq!(meta.decimals, 6);
         assert_eq!(meta.total_supply, "42");
-        assert_eq!(node.requests(), 1, "four views, one round trip");
+        assert_eq!(node.requests(), 1, "every view, one round trip");
     }
 
     /// A token missing a view is still a token: whatever it does answer lands,
@@ -444,6 +440,7 @@ mod tests {
         assert_eq!(meta.name, "");
         assert_eq!(meta.decimals, 18, "the ERC-20 default");
         assert_eq!(meta.total_supply, "0");
+        assert_eq!(meta.currency, "");
     }
 
     /// Under one whole token the quotient is zero, which carries no sign, so an
