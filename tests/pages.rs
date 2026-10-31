@@ -288,6 +288,26 @@ async fn a_block_links_only_to_neighbours_that_are_indexed() {
     assert!(html.contains("step-off"), "and a dead end back");
 }
 
+/// A wrong scale is worse than none: this fee at 18 decimals would read as zero.
+#[tokio::test]
+async fn a_fee_in_a_token_with_no_metadata_stays_raw() {
+    let (_dir, base, indexer) = serve_beside_indexer(Value::Null, "http://127.0.0.1:1").await;
+    let mut tx = transaction(&format!("0x{}", "99".repeat(32)), 1, successful_receipt());
+    tx.fee_token = Some(checksum_address(
+        "0x20c0000000000000000000000000000000000abc",
+    ));
+    tx.fee_amount = "6146".into();
+    db::save_transaction(&indexer, &tx).expect("tx");
+
+    let html = reqwest::get(format!("{base}/block/100"))
+        .await
+        .expect("GET /block/100")
+        .text()
+        .await
+        .expect("block html");
+    assert!(html.contains("6146"), "{html}");
+}
+
 /// Gas is priced in USD whichever token pays, so a block's fees are stated in USD.
 #[tokio::test]
 async fn a_block_states_its_fees_in_usd() {
