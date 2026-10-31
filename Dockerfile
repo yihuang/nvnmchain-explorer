@@ -29,7 +29,6 @@ COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENV DB_PATH=/data/explorer.db \
-    RUST_LOG=nvnmchain_explorer=info \
-    NATIVE_SYMBOL=OM
+    RUST_LOG=nvnmchain_explorer=info
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

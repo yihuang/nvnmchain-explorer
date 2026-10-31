@@ -114,22 +114,17 @@ fn html_or_json(
 /// `base.html`, so every one of these must be present or the render fails —
 /// build page contexts through here rather than by hand.
 fn page_ctx(state: &AppState, extra: Value) -> Value {
-    page_ctx_for(state, db::get_latest_block(&state.db), extra)
+    page_ctx_for(db::get_latest_block(&state.db), extra)
 }
 
 /// [`page_ctx`] for handlers that have already read the tip, so the page does
 /// not query for it twice.
-fn page_ctx_for(
-    state: &AppState,
-    latest_block: Option<crate::models::Block>,
-    extra: Value,
-) -> Value {
+fn page_ctx_for(latest_block: Option<crate::models::Block>, extra: Value) -> Value {
     let mut map = serde_json::Map::new();
     map.insert(
         "latest_block".into(),
         serde_json::to_value(latest_block).unwrap_or(Value::Null),
     );
-    map.insert("native_symbol".into(), json!(state.cfg.native_symbol));
     // The search box echoes it; only the search page has one to echo.
     map.insert("query".into(), json!(""));
     merge_into(&mut map, extra);
@@ -764,7 +759,6 @@ pub async fn home(
         0.0
     };
     let ctx = page_ctx_for(
-        &state,
         latest_block,
         json!({
             "stats": stats,
@@ -1006,7 +1000,6 @@ pub async fn block_page(
             "block": block,
             "transactions": transactions,
             "gas_pct": gas_pct,
-            "base_fee_gwei": format_token_amount(&block.base_fee, 9),
             "burnt_fees": burnt,
             "previous_block": neighbour(block.number - 1),
             "next_block": neighbour(block.number + 1),
@@ -1040,7 +1033,6 @@ pub async fn blocks_page(
         .collect();
 
     let ctx = page_ctx_for(
-        &state,
         latest,
         json!({
             "blocks": blocks,
@@ -1079,7 +1071,6 @@ pub async fn txs_page(
         .collect();
 
     let ctx = page_ctx_for(
-        &state,
         db::get_latest_block(&state.db),
         json!({
             "transactions": txs,

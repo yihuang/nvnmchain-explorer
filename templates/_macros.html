@@ -1,5 +1,9 @@
 {# Shared markup. Import where used: Tera does not inherit imports from base.html. #}
 
+{# Wei as USD, 10^18 to one; a per-gas price per million gas, or it is mostly zeros. #}
+{% macro usd(wei) %}{{ format_token_amount(amount=wei | as_str, decimals=18) }} USD{% endmacro %}
+{% macro gas_price(wei) %}{{ format_token_amount(amount=wei | as_str, decimals=12) }} USD / 1M gas{% endmacro %}
+
 {# Previous/next links for a listing, hidden when everything fits on one page.
    Links are relative, so the page keeps whatever path it is on; `query` carries
    any other parameter the page needs to preserve, e.g. "tab=transfers&". #}
