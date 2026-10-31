@@ -186,9 +186,7 @@
                     <a href="{{ get_address_url(address=bc.address) }}" class="text-dim hover:text-blue-300">{{ bc.address }}</a>
                 </div>
                 <div class="w-40 px-3 py-3 truncate">
-                    {% if bc.native %}
-                    <span class="badge badge-info">{{ bc.symbol }}</span>
-                    {% elif bc.token %}
+                    {% if bc.token %}
                     <a href="{{ get_token_url(address=bc.token) }}" class="text-blue-400 hover:text-blue-300">{{ bc.symbol | fallback(value=truncate_hash(h=bc.token, prefix=8, suffix=4)) }}</a>
                     {% else %}
                     <span class="text-faint">—</span>
