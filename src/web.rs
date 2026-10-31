@@ -575,25 +575,21 @@ fn failure_of(calls: &[Value], reason: Option<&str>) -> Failure {
     failure
 }
 
-/// Where the fee went: what the gas cost, how much was burnt, what the
-/// validator kept, and the TIP-20 amount charged. Big integers throughout —
-/// wei products overflow an i64.
+/// What the gas cost, as base fee and priority fee, and the TIP-20 amount
+/// charged. Big integers throughout — wei products overflow an i64.
 fn fee_breakdown(
     tx: &crate::models::Transaction,
+    base_fee: &str,
     gas_used: i64,
     gas_price: i64,
     fee_token_meta: Option<&crate::models::TokenMetadata>,
 ) -> Value {
-    let gas_used_big = BigInt::from(gas_used.max(0));
-    let base_fee = BigInt::parse_bytes(tx.base_fee.trim_start_matches("0x").as_bytes(), 16)
-        .or_else(|| BigInt::parse_bytes(tx.base_fee.as_bytes(), 10))
-        .unwrap_or_else(|| BigInt::from(0));
-    let total = BigInt::from(gas_price.max(0)) * &gas_used_big;
-    let burnt = &base_fee * &gas_used_big;
+    let total = BigInt::from(gas_price.max(0)) * BigInt::from(gas_used.max(0));
+    let base = base_fees_wei(base_fee, gas_used);
     // A gas price below the base fee cannot happen on chain, but a receipt
-    // that reports one must not produce a negative tip.
-    let tip = if total > burnt {
-        &total - &burnt
+    // that reports one must not produce a negative priority fee.
+    let priority = if total > base {
+        &total - &base
     } else {
         BigInt::from(0)
     };
@@ -603,10 +599,9 @@ fn fee_breakdown(
     json!({
         "gas_used": gas_used,
         "gas_price": gas_price,
-        "base_fee": base_fee.to_string(),
         "total_wei": total.to_string(),
-        "burnt_wei": burnt.to_string(),
-        "tip_wei": tip.to_string(),
+        "base_wei": base.to_string(),
+        "priority_wei": priority.to_string(),
         "charged": charged,
         "has_charge": tx.fee_amount != "0" && tx.fee_token.is_some(),
     })
@@ -703,10 +698,10 @@ fn token_holders(
         .collect()
 }
 
-/// Burnt fees for a block: base fee × gas used, as a wei decimal string.
-fn burnt_fees_wei(base_fee: &str, gas_used: i64) -> String {
+/// Base fee × gas used. Tempo pays it to the validator rather than burning it.
+fn base_fees_wei(base_fee: &str, gas_used: i64) -> BigInt {
     let base = BigInt::parse_bytes(base_fee.as_bytes(), 10).unwrap_or_else(|| BigInt::from(0));
-    (base * BigInt::from(gas_used.max(0))).to_string()
+    base * BigInt::from(gas_used.max(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +986,7 @@ pub async fn block_page(
             v
         })
         .collect();
-    let burnt = burnt_fees_wei(&block.base_fee, block.gas_used);
+    let base_fees = base_fees_wei(&block.base_fee, block.gas_used).to_string();
     let present = db::blocks_present(&state.db, &[block.number - 1, block.number + 1]);
     let neighbour = |n: i64| present.contains(&n).then_some(n);
     let ctx = page_ctx(
@@ -1000,7 +995,7 @@ pub async fn block_page(
             "block": block,
             "transactions": transactions,
             "gas_pct": gas_pct,
-            "burnt_fees": burnt,
+            "base_fees": base_fees,
             "previous_block": neighbour(block.number - 1),
             "next_block": neighbour(block.number + 1),
         }),
@@ -1306,6 +1301,7 @@ async fn resolve_call_statuses(
 /// The gas, fee and identity fields of a transaction, as context keys.
 fn gas_and_fee_ctx(
     tx: &crate::models::Transaction,
+    base_fee: &str,
     parsed: &ParsedTx,
     fee_token_meta: Option<&crate::models::TokenMetadata>,
     receipt: Option<&Value>,
@@ -1330,7 +1326,7 @@ fn gas_and_fee_ctx(
     } else {
         String::new()
     };
-    let fee_breakdown = fee_breakdown(tx, gas_used, gas_price, fee_token_meta);
+    let fee_breakdown = fee_breakdown(tx, base_fee, gas_used, gas_price, fee_token_meta);
     json!({
         "gas_price": gas_price,
         "gas_used": gas_used,
@@ -1338,7 +1334,7 @@ fn gas_and_fee_ctx(
         "gas_pct": gas_pct,
         "max_fee": parsed.max_fee_per_gas.unwrap_or(0),
         "max_priority": parsed.max_priority_fee_per_gas.unwrap_or(0),
-        "base_fee": parse_hex_i64(&tx.base_fee),
+        "base_fee": base_fee,
         "tx_type": tx_type,
         "tx_type_hex": format!("{tx_type:02x}"),
         "nonce": parsed.nonce.unwrap_or(0),
@@ -1474,7 +1470,13 @@ pub async fn tx_page(
     let mut extra = serde_json::Map::new();
     merge_into(
         &mut extra,
-        gas_and_fee_ctx(&tx, &parsed, fee_token_meta, receipt.as_ref()),
+        gas_and_fee_ctx(
+            &tx,
+            block.as_ref().map_or("0", |b| b.base_fee.as_str()),
+            &parsed,
+            fee_token_meta,
+            receipt.as_ref(),
+        ),
     );
     merge_into(
         &mut extra,

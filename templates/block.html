@@ -91,8 +91,8 @@
                 <div class="kv-value mono">{{ ui::gas_price(wei=block.base_fee) }}</div>
             </div>
             <div class="kv-row">
-                <div class="kv-label">Burnt Fees</div>
-                <div class="kv-value mono">{% if burnt_fees != '0' %}{{ ui::usd(wei=burnt_fees) }}{% else %}—{% endif %}</div>
+                <div class="kv-label">Base Fees</div>
+                <div class="kv-value mono">{% if base_fees != '0' %}{{ ui::usd(wei=base_fees) }}{% else %}—{% endif %}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Size</div>

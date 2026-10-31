@@ -75,7 +75,7 @@ fn transaction(hash: &str, status: i64, receipt: Value) -> Transaction {
         to_addr: Some(checksum_address(TOKEN)),
         status,
         gas_used: 21_000,
-        base_fee: "0x3b9aca00".into(),
+        base_fee: "0x4a817c800".into(),
         contract_address: None,
         fee_token: Some(checksum_address(TOKEN)),
         fee_amount: "2500".into(),
@@ -794,10 +794,11 @@ async fn the_fee_breakdown_splits_the_gas_cost() {
     let page = get_json(&base, &format!("/tx/{TX_HASH}?")).await;
     let fee = &page["fee_breakdown"];
 
-    // 21,000 gas at 20 gwei, of which 1 gwei per gas was burnt as base fee.
+    // 21,000 gas at 20 gwei, of which the block's base fee is 1 gwei.
+    assert_eq!(page["base_fee"], json!("1000000000"));
     assert_eq!(fee["total_wei"], json!("420000000000000"));
-    assert_eq!(fee["burnt_wei"], json!("21000000000000"));
-    assert_eq!(fee["tip_wei"], json!("399000000000000"));
+    assert_eq!(fee["base_wei"], json!("21000000000000"));
+    assert_eq!(fee["priority_wei"], json!("399000000000000"));
     // What was actually charged is a TIP-20 amount, not wei.
     assert_eq!(fee["charged"], json!("0.0025 pathUSD"));
 }

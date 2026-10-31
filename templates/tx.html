@@ -225,12 +225,12 @@
             <div class="text-faint mt-0.5">{{ fee_breakdown.gas_used | comma }} gas × {{ ui::gas_price(wei=fee_breakdown.gas_price) }}</div>
         </div>
         <div>
-            <span class="text-faint">Burnt (base fee)</span>
-            <div class="mt-1 font-semibold mono">{{ ui::usd(wei=fee_breakdown.burnt_wei) }}</div>
+            <span class="text-faint">Base fee</span>
+            <div class="mt-1 font-semibold mono">{{ ui::usd(wei=fee_breakdown.base_wei) }}</div>
         </div>
         <div>
-            <span class="text-faint">Validator tip</span>
-            <div class="mt-1 font-semibold mono">{{ ui::usd(wei=fee_breakdown.tip_wei) }}</div>
+            <span class="text-faint">Priority fee</span>
+            <div class="mt-1 font-semibold mono">{{ ui::usd(wei=fee_breakdown.priority_wei) }}</div>
         </div>
     </div>
 </div>
