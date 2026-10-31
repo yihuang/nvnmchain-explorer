@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}Block {{ block.number }} ⋅ nvnmchain Explorer{% endblock %}
 {% block content %}
 
@@ -87,16 +88,11 @@
             </div>
             <div class="kv-row">
                 <div class="kv-label">Base Fee</div>
-                <div class="kv-value"><span class="mono">{{ base_fee_gwei }}</span> Gwei</div>
+                <div class="kv-value mono">{{ ui::gas_price(wei=block.base_fee) }}</div>
             </div>
             <div class="kv-row">
-                <div class="kv-label">Burnt Fees</div>
-                <div class="kv-value">
-                    {% if burnt_fees and burnt_fees != '0' %}
-                    <span class="mono">{{ format_token_amount(amount=burnt_fees, decimals=18) }}</span>
-                    <span class="text-dim">{{ native_symbol }}</span>
-                    {% else %}—{% endif %}
-                </div>
+                <div class="kv-label">Base Fees</div>
+                <div class="kv-value mono">{% if base_fees != '0' %}{{ ui::usd(wei=base_fees) }}{% else %}—{% endif %}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Size</div>

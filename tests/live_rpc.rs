@@ -302,7 +302,6 @@ async fn web_api_serves_indexed_data() {
         poll_seconds: 1.0,
         batch_size: 5,
         index_concurrency: 8,
-        native_symbol: "OM".into(),
         stats_interval_seconds: 5.0,
         // The test asserts what this chain says; a third-party directory has
         // no part in that, and would be a network call per page view.

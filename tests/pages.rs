@@ -75,7 +75,7 @@ fn transaction(hash: &str, status: i64, receipt: Value) -> Transaction {
         to_addr: Some(checksum_address(TOKEN)),
         status,
         gas_used: 21_000,
-        base_fee: "0x3b9aca00".into(),
+        base_fee: "0x4a817c800".into(),
         contract_address: None,
         fee_token: Some(checksum_address(TOKEN)),
         fee_amount: "2500".into(),
@@ -286,6 +286,22 @@ async fn a_block_links_only_to_neighbours_that_are_indexed() {
         .expect("block html");
     assert!(html.contains("href=\"/block/101\""), "a link forward");
     assert!(html.contains("step-off"), "and a dead end back");
+}
+
+/// Gas is priced in USD whichever token pays, so a block's fees are stated in USD.
+#[tokio::test]
+async fn a_block_states_its_fees_in_usd() {
+    let (_dir, base) = serve(Value::Null).await;
+    let html = reqwest::get(format!("{base}/block/100"))
+        .await
+        .expect("GET /block/100")
+        .text()
+        .await
+        .expect("block html");
+    // A base fee of 1 gwei, and 21,000 gas used at it.
+    assert!(html.contains("0.001 USD / 1M gas"), "{html}");
+    assert!(html.contains("0.000021 USD"), "{html}");
+    assert!(!html.contains("Gwei"), "{html}");
 }
 
 /// Newest first, and only the heights the index holds: the fixture has 100 and
@@ -778,12 +794,29 @@ async fn the_fee_breakdown_splits_the_gas_cost() {
     let page = get_json(&base, &format!("/tx/{TX_HASH}?")).await;
     let fee = &page["fee_breakdown"];
 
-    // 21,000 gas at 20 gwei, of which 1 gwei per gas was burnt as base fee.
+    // 21,000 gas at 20 gwei, of which the block's base fee is 1 gwei.
+    assert_eq!(page["base_fee"], json!("1000000000"));
     assert_eq!(fee["total_wei"], json!("420000000000000"));
-    assert_eq!(fee["burnt_wei"], json!("21000000000000"));
-    assert_eq!(fee["tip_wei"], json!("399000000000000"));
+    assert_eq!(fee["base_wei"], json!("21000000000000"));
+    assert_eq!(fee["priority_wei"], json!("399000000000000"));
     // What was actually charged is a TIP-20 amount, not wei.
     assert_eq!(fee["charged"], json!("0.0025 pathUSD"));
+}
+
+#[tokio::test]
+async fn a_transaction_states_its_fees_in_usd() {
+    let (_dir, base) = serve(Value::Null).await;
+    let html = reqwest::get(format!("{base}/tx/{TX_HASH}"))
+        .await
+        .expect("GET tx")
+        .text()
+        .await
+        .expect("tx html");
+    // 21,000 gas at 20 gwei, of which 1 gwei per gas is the base fee.
+    assert!(html.contains("0.02 USD / 1M gas"), "{html}");
+    assert!(html.contains("0.001 USD / 1M gas"), "{html}");
+    assert!(html.contains("0.00042 USD"), "{html}");
+    assert!(html.contains("0.000021 USD"), "{html}");
 }
 
 /// Every template the transaction page can render must render.

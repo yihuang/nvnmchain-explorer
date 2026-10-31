@@ -141,7 +141,6 @@ and never overrides variables already set in the environment.
 | `INDEX_POLL_SECONDS` | `1` | Poll interval when the WebSocket feed is unavailable |
 | `INDEX_BATCH` | `5` | Blocks indexed per cycle (forward + backfill) |
 | `INDEX_CONCURRENCY` | `32` | Blocks fetched in parallel |
-| `NATIVE_SYMBOL` | `OM` | Symbol shown for native (burnt/gas) amounts |
 | `STATS_INTERVAL_SECONDS` | `5` | How often the dashboard stats are recomputed |
 | `SIGNATURE_LOOKUP_URL` | OpenChain | Signature directory for selectors no built-in ABI declares; set empty to disable ([Decoding](#decoding)) |
 | `RUST_LOG` | `nvnmchain_explorer=info` | Log verbosity |
