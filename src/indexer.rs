@@ -22,9 +22,7 @@ use tracing::{info, warn};
 use crate::config::Settings;
 use crate::contracts::RESERVED_TOKENS;
 use crate::db::{self, Db};
-use crate::decoder::{
-    checksum_address, decode_event, DecodedEvent, TRANSFER_TOPIC, TRANSFER_WITH_MEMO_TOPIC,
-};
+use crate::decoder::{checksum_address, decode_event, DecodedEvent, TRANSFER_TOPIC};
 use crate::models::{AnchoringEvent, BlockBundle, Transaction, TransferEvent};
 use crate::parse::{parse_block, parse_transaction};
 use crate::rpc::{ChainRpc, RpcError};
@@ -426,8 +424,8 @@ fn index_log(
         .pointer("/topics/0")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let is_transfer = topic0.eq_ignore_ascii_case(TRANSFER_TOPIC.as_str())
-        || topic0.eq_ignore_ascii_case(TRANSFER_WITH_MEMO_TOPIC.as_str());
+    // Not `TransferWithMemo`: a memo transfer emits it beside its `Transfer`.
+    let is_transfer = topic0.eq_ignore_ascii_case(TRANSFER_TOPIC.as_str());
     // Only the contract's own logs: any contract may emit under the same signature.
     let is_anchoring = emitter.eq_ignore_ascii_case(crate::anchoring::ADDRESS);
     if !is_transfer && !is_anchoring {
@@ -1466,5 +1464,34 @@ mod tests {
         assert_eq!(bundle.transfers[0].to_addr, checksum_address(&to));
         assert_eq!(bundle.transfers[0].amount, "100");
         assert_eq!(bundle.transfers[0].token_addr, checksum_address(&token));
+    }
+
+    #[test]
+    fn a_memo_transfer_counts_once() {
+        let tx_hash = format!("0x{}", "ff".repeat(32));
+        let topic = |byte: &str| format!("0x{}{}", "00".repeat(12), byte.repeat(20));
+        let log = |index: &str, topics: Vec<String>| {
+            json!({
+                "address": format!("0x{}", "aa".repeat(20)),
+                "logIndex": index,
+                "topics": topics,
+                "data": format!("0x{:064x}", 100u64),
+            })
+        };
+        let raw = json!({"number": "0x10", "transactions": [{"hash": tx_hash}]});
+        let receipts = json!([{
+            "transactionHash": tx_hash,
+            "logs": [
+                log("0x0", vec![TRANSFER_TOPIC.clone(), topic("1a"), topic("2b")]),
+                log("0x1", vec![
+                    crate::decoder::TRANSFER_WITH_MEMO_TOPIC.clone(),
+                    topic("1a"),
+                    topic("2b"),
+                    format!("0x{}", "ee".repeat(32)),
+                ]),
+            ],
+        }]);
+        let bundle = assemble_bundle(&raw, Some(&receipts));
+        assert_eq!(bundle.transfers.len(), 1);
     }
 }

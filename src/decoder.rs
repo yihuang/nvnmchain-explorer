@@ -712,8 +712,7 @@ pub const APPROVAL_SIGNATURE: &str = "Approval(address,address,uint256)";
 /// chain reports `topic0` in.
 ///
 /// Derived, never written out: a mistyped hash does not fail loudly, it
-/// silently matches nothing. `TRANSFER_WITH_MEMO_TOPIC` was 63 hex digits, so
-/// no memo transfer was ever indexed.
+/// silently matches nothing, as `TRANSFER_WITH_MEMO_TOPIC` once did at 63 hex digits.
 pub static TRANSFER_TOPIC: LazyLock<String> =
     LazyLock::new(|| keccak_hex(TRANSFER_SIGNATURE.as_bytes()));
 pub static TRANSFER_WITH_MEMO_TOPIC: LazyLock<String> =

@@ -68,8 +68,6 @@ pub struct Settings {
     pub batch_size: u64,
     /// Max blocks fetched in parallel by the indexer.
     pub index_concurrency: usize,
-    /// Symbol shown for the native gas/currency token.
-    pub native_symbol: String,
     /// Seconds between background recomputes of the home-page stats blob.
     pub stats_interval_seconds: f64,
     /// Signature directory consulted for selectors no built-in ABI declares.
@@ -143,7 +141,6 @@ impl Settings {
             // A window is fetched whole before it is written, so this bounds memory too.
             batch_size: env_parse("INDEX_BATCH", 32).clamp(1, 1024),
             index_concurrency: env_parse("INDEX_CONCURRENCY", 32).clamp(1, 256),
-            native_symbol: env_or("NATIVE_SYMBOL", "NVNM"),
             stats_interval_seconds: env_f64("STATS_INTERVAL_SECONDS", 5.0).clamp(1.0, 3600.0),
             signature_lookup_url: signature_lookup_url(),
             rpc_api_key: rpc_api_key(env::var("NVNM_RPC_API_KEY").ok()),

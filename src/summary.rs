@@ -1272,6 +1272,17 @@ fn same_address(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// A memo transfer emits `Transfer` then `TransferWithMemo` for one send; whether
+/// `event` and `next` are that pair. The second carries the note, so it is the one kept.
+fn restated_by(event: &DecodedEvent, next: &DecodedEvent) -> bool {
+    event.name.as_deref() == Some("Transfer")
+        && next.name.as_deref() == Some("TransferWithMemo")
+        && event.contract == next.contract
+        && ["from", "to", "amount"]
+            .iter()
+            .all(|param| event.param(param) == next.param(param))
+}
+
 /// Say what every log in a receipt did, in receipt order.
 pub fn known_events(
     events: &[DecodedEvent],
@@ -1281,6 +1292,7 @@ pub fn known_events(
     events
         .iter()
         .enumerate()
+        .filter(|(i, e)| !events.get(i + 1).is_some_and(|next| restated_by(e, next)))
         .filter_map(|(i, e)| known_event(e, i, tokens, sender))
         .collect()
 }
@@ -1687,21 +1699,47 @@ mod tests {
         assert_eq!(revoked.kind, "revoke role");
     }
 
-    /// A memo rides along as a note, and a binary payload does not.
-    #[test]
-    fn a_memo_becomes_a_note() {
-        let mut memo_bytes = vec![0u8; 32];
-        memo_bytes[..7].copy_from_slice(b"invoice");
-        let log = json!({
+    /// The `TransferWithMemo` log a memo transfer emits after its `Transfer`.
+    fn memo_log(from: &str, to: &str, amount: u128, memo: &str) -> serde_json::Value {
+        let mut word = [0u8; 32];
+        word[..memo.len()].copy_from_slice(memo.as_bytes());
+        json!({
             "address": "0x20c0000000000000000000000000000000000000",
             "topics": [
                 crate::decoder::TRANSFER_WITH_MEMO_TOPIC.as_str(),
-                topic("0x2222222222222222222222222222222222222222"),
-                topic("0x1111111111111111111111111111111111111111"),
-                format!("0x{}", hex::encode(&memo_bytes)),
+                topic(from),
+                topic(to),
+                format!("0x{}", hex::encode(word)),
             ],
-            "data": format!("0x{:064x}", 1_000_000u128),
-        });
+            "data": format!("0x{amount:064x}"),
+        })
+    }
+
+    #[test]
+    fn a_memo_transfer_reads_once_with_its_note() {
+        let (from, to) = (
+            "0x2222222222222222222222222222222222222222",
+            "0x1111111111111111111111111111111111111111",
+        );
+        let logs = [
+            transfer_log(from, to, 1_000_000),
+            memo_log(from, to, 1_000_000, "invoice"),
+        ];
+        let events: Vec<_> = logs.iter().filter_map(decode_event).collect();
+        let known = known_events(&events, &token_map(), None);
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].note.as_deref(), Some("invoice"));
+    }
+
+    /// A memo rides along as a note, and a binary payload does not.
+    #[test]
+    fn a_memo_becomes_a_note() {
+        let log = memo_log(
+            "0x2222222222222222222222222222222222222222",
+            "0x1111111111111111111111111111111111111111",
+            1_000_000,
+            "invoice",
+        );
         assert_eq!(say(&log, None).note.as_deref(), Some("invoice"));
     }
 

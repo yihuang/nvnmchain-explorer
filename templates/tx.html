@@ -129,15 +129,15 @@
             </div>
             <div class="kv-row">
                 <div class="kv-label">Gas Price</div>
-                <div class="kv-value mono">{{ gas_price }}</div>
+                <div class="kv-value mono">{{ ui::gas_price(wei=gas_price) }}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Base Fee</div>
-                <div class="kv-value mono">{{ base_fee }}</div>
+                <div class="kv-value mono">{{ ui::gas_price(wei=base_fee) }}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Max Fee / Priority</div>
-                <div class="kv-value mono">{{ max_fee }} / {{ max_priority }}</div>
+                <div class="kv-value mono">{{ ui::gas_price(wei=max_fee) }} / {{ ui::gas_price(wei=max_priority) }}</div>
             </div>
             <div class="kv-row">
                 <div class="kv-label">Nonce Key</div>
@@ -186,9 +186,7 @@
                     <a href="{{ get_address_url(address=bc.address) }}" class="text-dim hover:text-blue-300">{{ bc.address }}</a>
                 </div>
                 <div class="w-40 px-3 py-3 truncate">
-                    {% if bc.native %}
-                    <span class="badge badge-info">{{ bc.symbol }}</span>
-                    {% elif bc.token %}
+                    {% if bc.token %}
                     <a href="{{ get_token_url(address=bc.token) }}" class="text-blue-400 hover:text-blue-300">{{ bc.symbol | fallback(value=truncate_hash(h=bc.token, prefix=8, suffix=4)) }}</a>
                     {% else %}
                     <span class="text-faint">—</span>
@@ -221,16 +219,16 @@
         </div>
         <div>
             <span class="text-faint">Gas × Price</span>
-            <div class="mt-1 font-semibold mono">{{ fee_breakdown.total_wei }}</div>
-            <div class="text-faint mt-0.5">{{ fee_breakdown.gas_used | comma }} × {{ fee_breakdown.gas_price | comma }}</div>
+            <div class="mt-1 font-semibold mono">{{ ui::usd(wei=fee_breakdown.total_wei) }}</div>
+            <div class="text-faint mt-0.5">{{ fee_breakdown.gas_used | comma }} gas × {{ ui::gas_price(wei=fee_breakdown.gas_price) }}</div>
         </div>
         <div>
-            <span class="text-faint">Burnt (base fee)</span>
-            <div class="mt-1 font-semibold mono">{{ fee_breakdown.burnt_wei }}</div>
+            <span class="text-faint">Base fee</span>
+            <div class="mt-1 font-semibold mono">{{ ui::usd(wei=fee_breakdown.base_wei) }}</div>
         </div>
         <div>
-            <span class="text-faint">Validator tip</span>
-            <div class="mt-1 font-semibold mono">{{ fee_breakdown.tip_wei }}</div>
+            <span class="text-faint">Priority fee</span>
+            <div class="mt-1 font-semibold mono">{{ ui::usd(wei=fee_breakdown.priority_wei) }}</div>
         </div>
     </div>
 </div>
