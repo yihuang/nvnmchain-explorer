@@ -158,7 +158,7 @@
                     {% if tx.fee_formatted %}
                     {{ tx.fee_formatted }}
                     {% elif tx.fee_token and tx.fee_amount and tx.fee_amount != '0' %}
-                    {{ format_token_amount(amount=tx.fee_amount, decimals=18) }}
+                    {{ tx.fee_amount }}
                     {% else %}
                     {{ tx.gas_used }} gas
                     {% endif %}
