@@ -414,7 +414,12 @@
         put('idx-indexed', num(s.total_blocks));
         put('idx-head', num(s.chain_head));
         if (typeof s.index_pct === 'number') {
-            put('idx-pct', s.index_pct.toFixed(1) + '%');
+            var pct = document.getElementById('idx-pct');
+            if (pct) {
+                // Fresh stats: the index is updating again.
+                pct.className = 'mono text-xs text-blue-400';
+                pct.textContent = s.index_pct.toFixed(1) + '%';
+            }
             var bar = document.getElementById('idx-bar');
             if (bar) bar.style.width = s.index_pct.toFixed(1) + '%';
         }
