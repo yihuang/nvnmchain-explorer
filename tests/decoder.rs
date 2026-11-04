@@ -704,6 +704,89 @@ fn a_rewrite_without_the_blobs_keeps_them() {
     assert_eq!(stored.receipt_data.as_deref(), Some("{}"));
 }
 
+/// Receipt and calldata are stored packed and read back as given, and the text
+/// an older build stored still reads.
+#[test]
+fn a_row_is_stored_packed() {
+    let (_dir, db) = temp_db("packed.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.input = format!("0xa9059cbb{}", "11".repeat(64));
+    let zeros = format!("0x{}", "00".repeat(64));
+    let logs = vec![json!({"data": zeros}); 4];
+    let receipt = json!({"status": "0x1", "logs": logs}).to_string();
+    tx.receipt_data = Some(receipt.clone());
+    db::save_transaction(&db, &tx).unwrap();
+
+    let (input_kind, input_len, receipt_kind, receipt_len): (String, usize, String, usize) =
+        db::lock(&db)
+            .query_row(
+                "SELECT typeof(input), length(input), typeof(receipt_data), length(receipt_data)
+                 FROM transactions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+    assert_eq!((input_kind.as_str(), input_len), ("blob", 68));
+    assert_eq!(receipt_kind, "blob");
+    assert!(receipt_len < receipt.len() / 4, "{receipt_len} bytes");
+    let read = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(
+        (&read.input, &read.receipt_data),
+        (&tx.input, &tx.receipt_data)
+    );
+
+    db::lock(&db)
+        .execute(
+            "UPDATE transactions SET input = ?1, receipt_data = ?2",
+            rusqlite::params![tx.input, receipt],
+        )
+        .unwrap();
+    let read = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(
+        (&read.input, &read.receipt_data),
+        (&tx.input, &tx.receipt_data)
+    );
+}
+
+/// Rows an older build wrote as text are rewritten in place, and a second run
+/// finds nothing to do.
+#[test]
+fn rows_older_builds_wrote_as_text_are_packed() {
+    let (_dir, db) = temp_db("pack.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.input = format!("0xa9059cbb{}", "22".repeat(64));
+    tx.receipt_data = Some(json!({"status": "0x1", "logs": []}).to_string());
+    db::save_transaction(&db, &tx).unwrap();
+    db::lock(&db)
+        .execute(
+            "UPDATE transactions SET input = ?1, receipt_data = ?2",
+            rusqlite::params![tx.input, tx.receipt_data],
+        )
+        .unwrap();
+    let kinds = |db: &Db| -> (String, String) {
+        db::lock(db)
+            .query_row(
+                "SELECT typeof(input), typeof(receipt_data) FROM transactions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(kinds(&db), ("text".into(), "text".into()));
+
+    db::pack_legacy_transactions(&db).unwrap();
+    assert_eq!(kinds(&db), ("blob".into(), "blob".into()));
+    let packed = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(packed.input, tx.input);
+    assert_eq!(packed.receipt_data, tx.receipt_data);
+    assert_eq!(db::get_kv(&db, db::PACKED_KEY).as_deref(), Some("1"));
+    db::pack_legacy_transactions(&db).unwrap();
+}
+
 /// A database from before the counters is counted once when it opens, and the
 /// writer carries on from there.
 #[test]
