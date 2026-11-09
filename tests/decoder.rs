@@ -784,7 +784,16 @@ fn rows_older_builds_wrote_as_text_are_packed() {
     assert_eq!(packed.input, tx.input);
     assert_eq!(packed.receipt_data, tx.receipt_data);
     assert_eq!(db::get_kv(&db, db::PACKED_KEY).as_deref(), Some("1"));
+
+    let mut later = tx.clone();
+    later.hash = format!("0x{}", "ee".repeat(32));
+    db::save_transaction(&db, &later).unwrap();
     db::pack_legacy_transactions(&db).unwrap();
+    assert_eq!(
+        db::get_kv(&db, db::PACKED_KEY).as_deref(),
+        Some("2"),
+        "a run that finds nothing moves the mark past the rows written packed"
+    );
 }
 
 /// A database from before the counters is counted once when it opens, and the

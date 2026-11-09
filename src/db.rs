@@ -815,6 +815,17 @@ pub fn pack_legacy_transactions(db: &Db) -> Result<()> {
             rows.collect::<rusqlite::Result<_>>()?
         };
         let Some(&(last, _, _)) = rows.last() else {
+            // Nothing left: the next run starts past the rows this build wrote packed,
+            // rather than reading them all again to find that out.
+            let end: i64 = txn.query_row(
+                "SELECT COALESCE(MAX(rowid), 0) FROM transactions",
+                [],
+                |r| r.get(0),
+            )?;
+            if end > from {
+                set_kv(&txn, PACKED_KEY, &end.to_string())?;
+                txn.commit().context("commit pack")?;
+            }
             break;
         };
         for (rowid, receipt, input) in &rows {
