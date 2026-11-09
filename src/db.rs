@@ -782,7 +782,7 @@ const TX_COLS: &str = "hash, block_number, position, from_addr, to_addr, status,
 const TX_LIST_COLS: &str = "hash, block_number, position, from_addr, to_addr, status, gas_used, base_fee, contract_address, fee_token, fee_amount, input, NULL, NULL, NULL, timestamp, created_at";
 
 /// Which columns a transaction read carries. A listing shows a handful and never
-/// the three blobs; the transaction page and any JSON answer show them all.
+/// the three blobs, as JSON too; the transaction page shows them all.
 #[derive(Clone, Copy)]
 pub enum TxColumns {
     List,
