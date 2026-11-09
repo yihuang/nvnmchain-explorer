@@ -988,11 +988,13 @@ pub async fn run_forever(
     let own_transfers = cfg.tidx.is_none();
     tokio::spawn(stats_loop(
         db.clone(),
-        cfg.tidx.clone(),
         stats_interval,
         chain_head.clone(),
         shutdown.clone(),
     ));
+    if let Some(tidx) = cfg.tidx.clone() {
+        tokio::spawn(holder_counts_loop(db.clone(), tidx, shutdown.clone()));
+    }
 
     if own_transfers {
         tokio::spawn(genesis_loop(
@@ -1091,11 +1093,25 @@ async fn add_genesis_balances(rpc: &ChainRpc, db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Each token's holder count as the tidx last counted it, written onto its
+/// metadata row. Its snapshots refresh every quarter hour, so a minute's lag
+/// shows nothing stale.
+async fn holder_counts_loop(db: Db, tidx: Tidx, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        let counts = tidx.clone().token_holder_counts().await;
+        if let Err(e) = counts.and_then(|counts| db::set_holder_counts(&db, &counts)) {
+            warn!("holder counts from tidx: {e:#}");
+        }
+        if sleep_or_shutdown(&mut shutdown, Duration::from_secs(60)).await {
+            break;
+        }
+    }
+}
+
 /// Recompute the home-page stats blob into the `kv` table every interval so
 /// the web layer never has to scan history at request time.
 async fn stats_loop(
     db: Db,
-    tidx: Option<Tidx>,
     interval: Duration,
     chain_head: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
@@ -1106,12 +1122,6 @@ async fn stats_loop(
         }
         if let Err(e) = compute_and_store_stats(&db, chain_head.load(Ordering::Relaxed)) {
             warn!("stats recompute failed: {e:#}");
-        }
-        if let Some(tidx) = &tidx {
-            let counts = tidx.clone().token_holder_counts().await;
-            if let Err(e) = counts.and_then(|counts| db::set_holder_counts(&db, &counts)) {
-                warn!("holder counts from tidx: {e:#}");
-            }
         }
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;
