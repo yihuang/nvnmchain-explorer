@@ -704,50 +704,64 @@ fn a_rewrite_without_the_blobs_keeps_them() {
     assert_eq!(stored.receipt_data.as_deref(), Some("{}"));
 }
 
-/// Receipt and calldata are stored packed and read back as given, and the text
-/// an older build stored still reads.
+/// A receipt is stored compressed and read back as its JSON, and one an older
+/// build stored as text still reads.
 #[test]
-fn a_row_is_stored_packed() {
-    let (_dir, db) = temp_db("packed.db");
+fn receipts_are_stored_compressed() {
+    let (_dir, db) = temp_db("receipts.db");
     let raw_block = sample_raw_block();
     let block = parse_block(&raw_block);
     let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
-    tx.input = format!("0xa9059cbb{}", "11".repeat(64));
     let zeros = format!("0x{}", "00".repeat(64));
     let logs = vec![json!({"data": zeros}); 4];
     let receipt = json!({"status": "0x1", "logs": logs}).to_string();
     tx.receipt_data = Some(receipt.clone());
     db::save_transaction(&db, &tx).unwrap();
 
-    let (input_kind, input_len, receipt_kind, receipt_len): (String, usize, String, usize) =
-        db::lock(&db)
-            .query_row(
-                "SELECT typeof(input), length(input), typeof(receipt_data), length(receipt_data)
-                 FROM transactions",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-    assert_eq!((input_kind.as_str(), input_len), ("blob", 68));
-    assert_eq!(receipt_kind, "blob");
-    assert!(receipt_len < receipt.len() / 4, "{receipt_len} bytes");
-    let read = db::get_transaction(&db, &tx.hash).unwrap();
-    assert_eq!(
-        (&read.input, &read.receipt_data),
-        (&tx.input, &tx.receipt_data)
-    );
-
-    db::lock(&db)
-        .execute(
-            "UPDATE transactions SET input = ?1, receipt_data = ?2",
-            rusqlite::params![tx.input, receipt],
+    let (kind, bytes): (String, usize) = db::lock(&db)
+        .query_row(
+            "SELECT typeof(receipt_data), length(receipt_data) FROM transactions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    let read = db::get_transaction(&db, &tx.hash).unwrap();
-    assert_eq!(
-        (&read.input, &read.receipt_data),
-        (&tx.input, &tx.receipt_data)
-    );
+    assert_eq!(kind, "blob");
+    assert!(bytes < receipt.len() / 4, "{bytes} bytes");
+    let stored = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(stored.receipt_data, tx.receipt_data);
+
+    db::lock(&db)
+        .execute("UPDATE transactions SET receipt_data = ?1", [&receipt])
+        .unwrap();
+    let legacy = db::get_transaction(&db, &tx.hash).unwrap();
+    assert_eq!(legacy.receipt_data, tx.receipt_data);
+}
+
+/// Calldata is stored as bytes and read back as its hex, and hex an older build
+/// stored as text still reads.
+#[test]
+fn calldata_is_stored_as_bytes() {
+    let (_dir, db) = temp_db("calldata.db");
+    let raw_block = sample_raw_block();
+    let block = parse_block(&raw_block);
+    let mut tx = parse_transaction(&raw_block["transactions"][0], &block);
+    tx.input = format!("0xa9059cbb{}", "11".repeat(64));
+    db::save_transaction(&db, &tx).unwrap();
+
+    let (kind, bytes): (String, i64) = db::lock(&db)
+        .query_row(
+            "SELECT typeof(input), length(input) FROM transactions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((kind.as_str(), bytes), ("blob", 68));
+    assert_eq!(db::get_transaction(&db, &tx.hash).unwrap().input, tx.input);
+
+    db::lock(&db)
+        .execute("UPDATE transactions SET input = ?1", [&tx.input])
+        .unwrap();
+    assert_eq!(db::get_transaction(&db, &tx.hash).unwrap().input, tx.input);
 }
 
 /// Rows an older build wrote as text are rewritten in place, and a second run

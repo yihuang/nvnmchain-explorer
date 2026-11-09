@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::types::{self, ValueRef};
+use rusqlite::types::{self, Type, ValueRef};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use zstd::bulk::Compressor;
@@ -711,7 +711,7 @@ pub fn get_recent_blocks(db: &Db, limit: usize) -> Vec<Block> {
 thread_local! {
     /// Receipts compress to about a quarter: every log repeats the block and
     /// transaction ids, and hex packs well. Building a context costs more than
-    /// compressing one receipt with it, so each writer thread keeps one.
+    /// compressing one receipt with it.
     static RECEIPT_COMPRESSOR: RefCell<Compressor<'static>> =
         RefCell::new(Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL).expect("zstd context"));
 }
@@ -861,7 +861,7 @@ const TX_COLS: &str = "hash, block_number, position, from_addr, to_addr, status,
 const TX_LIST_COLS: &str = "hash, block_number, position, from_addr, to_addr, status, gas_used, base_fee, contract_address, fee_token, fee_amount, input, NULL, NULL, NULL, timestamp, created_at";
 
 /// Which columns a transaction read carries. A listing shows a handful and never
-/// the three blobs; the transaction page and any JSON answer show them all.
+/// the three blobs, as JSON too; the transaction page shows them all.
 #[derive(Clone, Copy)]
 pub enum TxColumns {
     List,
@@ -911,9 +911,7 @@ fn receipt_col(row: &rusqlite::Row, i: usize) -> rusqlite::Result<Option<String>
     zstd::Decoder::new(bytes)
         .and_then(std::io::read_to_string)
         .map(Some)
-        .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Blob, Box::new(e))
-        })
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(i, Type::Blob, Box::new(e)))
 }
 
 pub fn get_transaction(db: &Db, hash: &str) -> Option<Transaction> {
