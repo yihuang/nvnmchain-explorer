@@ -73,16 +73,6 @@ fn wants_json(headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
     accept.contains("application/json") || query.get("format").map(|f| f == "json").unwrap_or(false)
 }
 
-/// The columns a listing reads. A JSON answer carries the rows whole; a page shows
-/// a few fields of each, and the blobs it never renders are three megabytes a page.
-fn columns_for(headers: &HeaderMap, query: &HashMap<String, String>) -> TxColumns {
-    if wants_json(headers, query) {
-        TxColumns::Full
-    } else {
-        TxColumns::List
-    }
-}
-
 fn render_html(tera: &Tera, template: &str, ctx: Value) -> Response {
     let rendered = tera::Context::from_value(ctx).and_then(|ctx| tera.render(template, &ctx));
     match rendered {
@@ -981,8 +971,7 @@ pub async fn block_page(
     let Some(block) = find_block(&state.db, &block_id) else {
         return not_found(&state, &headers, &query, "Block", &block_id);
     };
-    let transactions =
-        db::get_block_transactions(&state.db, block.number, columns_for(&headers, &query));
+    let transactions = db::get_block_transactions(&state.db, block.number, TxColumns::List);
     let gas_pct = block_pct(block.gas_used, block.gas_limit);
     let metas = token_metas(
         &state.db,
@@ -1561,8 +1550,7 @@ pub async fn address_page(
             let transfers = address_transfers(&state, &checksummed, page).await?;
             (transfers.clone(), transfers)
         } else {
-            let columns = columns_for(&headers, &query);
-            let txs = address_transactions(&state, &checksummed, page, columns).await?;
+            let txs = address_transactions(&state, &checksummed, page, TxColumns::List).await?;
             let html_txs: Vec<Value> = txs.iter().map(tx_row).collect();
             (
                 txs.into_iter()
