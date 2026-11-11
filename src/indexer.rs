@@ -544,13 +544,13 @@ fn fitting_end(message: &str) -> Option<(u64, u64)> {
 /// index), so overlap with the block path is free, and the watermark lets a
 /// stopped run resume at its last window.
 pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
-    let done: u64 = db::get_kv(db, BACKFILL_KEY)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
     let head = rpc.eth_block_number().await.context("head for backfill")?;
-    if done >= head {
-        return Ok(());
-    }
+    // A log makes a row only in a block the indexer holds, and it holds none below its first.
+    let first = db::get_min_block_number(db).map_or(head, |n| n as u64);
+    let done = db::get_kv(db, BACKFILL_KEY)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .max(first);
     info!("backfilling anchoring events from {done} to {head}");
     let (mut from, mut wrote, mut window) = (done, 0usize, WINDOW);
     let mut cap = None;

@@ -588,13 +588,15 @@ async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
     let dir = tempfile::tempdir().unwrap();
     let conn = db::init_db(dir.path().join("backfill.db").to_str().unwrap()).unwrap();
     let db = Arc::new(Mutex::new(conn));
-    let block = nvnmchain_explorer::parse::parse_block(&json!({
-        "number": "0x5dc",
-        "hash": format!("0x{}", "cd".repeat(32)),
-        "parentHash": format!("0x{}", "ef".repeat(32)),
-        "timestamp": "0x64",
-    }));
-    db::save_block(&db, &block).unwrap();
+    for number in [0u64, 1500] {
+        let block = nvnmchain_explorer::parse::parse_block(&json!({
+            "number": format!("0x{number:x}"),
+            "hash": format!("0x{number:064x}"),
+            "parentHash": format!("0x{}", "ef".repeat(32)),
+            "timestamp": "0x64",
+        }));
+        db::save_block(&db, &block).unwrap();
+    }
 
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let rpc =
@@ -636,6 +638,10 @@ async fn log_capped_node(calls: Arc<AtomicUsize>) -> String {
                     u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap()
                 };
                 let (from, to) = (int("fromBlock"), int("toBlock"));
+                assert!(
+                    from >= LOGGED[0].0,
+                    "{from} is below the first indexed block"
+                );
                 let mut logs = vec![];
                 for (block, n) in LOGGED.into_iter().filter(|(b, _)| (from..=to).contains(b)) {
                     if from != to && logs.len() + n > 4 {
@@ -661,7 +667,8 @@ async fn log_capped_node(calls: Arc<AtomicUsize>) -> String {
     listen(Router::new().route("/", post(handler)).with_state(calls)).await
 }
 
-/// The backfill takes the range a log-capped node names, and widens again where logs thin.
+/// The backfill starts at the first indexed block, takes the range a log-capped node names,
+/// and widens again where logs thin.
 #[tokio::test]
 async fn backfill_takes_the_named_range_and_widens_where_logs_thin() {
     let dir = tempfile::tempdir().unwrap();
@@ -695,10 +702,9 @@ async fn backfill_takes_the_named_range_and_widens_where_logs_thin() {
         db::get_kv(&db, "anchoring_backfilled_to").as_deref(),
         Some("2000")
     );
-    // Two refusals, each answered at the range it names (0-1000, then 1001 alone), 1002 and
-    // 1003 alone, then five windows growing fourfold: not the thousand calls of a window
-    // held at one block.
-    assert_eq!(calls.load(Ordering::SeqCst), 11);
+    // One refusal, 1000 to 1003 a block at a time, then five windows growing fourfold: not
+    // the thousand calls of a window held at one block.
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
 }
 
 async fn api(base: &str, path: &str) -> (u16, Value) {
