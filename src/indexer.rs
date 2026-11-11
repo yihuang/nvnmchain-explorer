@@ -527,8 +527,17 @@ pub async fn index_block(rpc: &ChainRpc, db: &Db, block_num: u64) -> Result<()> 
 /// The height the anchoring backfill has read the node's logs up to.
 const BACKFILL_KEY: &str = "anchoring_backfilled_to";
 
-/// Blocks per `eth_getLogs`; halved while the node refuses the range.
+/// Blocks per `eth_getLogs`, at most.
 const WINDOW: u64 = 50_000;
+
+/// The node's log cap and the last block that still fits under it, from reth's refusal:
+/// `query exceeds max results 20000, retry with the range 0-162`.
+fn fitting_end(message: &str) -> Option<(u64, u64)> {
+    let (_, rest) = message.split_once("max results ")?;
+    let (cap, range) = rest.split_once(", retry with the range ")?;
+    let (_, end) = range.rsplit_once('-')?;
+    Some((cap.parse().ok()?, end.trim().parse().ok()?))
+}
 
 /// Fill `anchoring_events` for blocks indexed before the table existed, from the
 /// node's logs rather than the blocks they sit in. Rows are keyed by (block, log
@@ -544,6 +553,7 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
     }
     info!("backfilling anchoring events from {done} to {head}");
     let (mut from, mut wrote, mut window) = (done, 0usize, WINDOW);
+    let mut cap = None;
     let mut backoff = Duration::from_secs(1);
     while from <= head {
         let to = (from + window - 1).min(head);
@@ -556,12 +566,19 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
             .await
         {
             Ok(logs) => logs,
-            // The node answered with an error: almost always its range cap.
+            // The node answered with an error: almost always one of its caps.
             Err(e) if e.is::<RpcError>() => {
-                if window == 1 {
-                    return Err(e).with_context(|| format!("anchoring logs {from}..{to}"));
+                let named = e
+                    .downcast_ref::<RpcError>()
+                    .and_then(|e| fitting_end(&e.message));
+                match named {
+                    Some((max, end)) if (from..to).contains(&end) => {
+                        cap = Some(max);
+                        window = end - from + 1;
+                    }
+                    _ if window > 1 => window /= 2,
+                    _ => return Err(e).with_context(|| format!("anchoring logs {from}..{to}")),
                 }
-                window /= 2;
                 warn!("anchoring logs {from}..{to} refused ({e}); window now {window}");
                 continue;
             }
@@ -586,6 +603,10 @@ pub async fn backfill_anchoring(rpc: &ChainRpc, db: &Db) -> Result<()> {
             }
             db::set_kv(&txn, BACKFILL_KEY, &to.to_string())?;
             txn.commit()?;
+        }
+        // As many blocks as fill the cap at this response's density.
+        if let Some(cap) = cap {
+            window = (window * cap / (logs.len() as u64).max(1)).clamp(1, WINDOW);
         }
         from = to + 1;
         // Leave the node to the indexer between windows.
