@@ -200,6 +200,14 @@ async fn stub_indexing_node(registries: u64) -> String {
     node(registries, true).await.0
 }
 
+/// Serves `app` on a free port and gives its URL.
+async fn listen(app: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    format!("http://{addr}")
+}
+
 /// The node's URL, and how many HTTP requests it has answered.
 async fn node(registries: u64, indexing: bool) -> (String, Arc<AtomicUsize>) {
     let requests = Arc::new(AtomicUsize::new(0));
@@ -219,10 +227,7 @@ async fn node(registries: u64, indexing: bool) -> (String, Arc<AtomicUsize>) {
     let app = Router::new()
         .route("/", post(handler))
         .with_state(registries);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    (format!("http://{addr}"), requests)
+    (listen(app).await, requests)
 }
 
 /// The explorer, reading `rpc_url`.
@@ -573,11 +578,7 @@ async fn capped_log_node(calls: Arc<std::sync::atomic::AtomicUsize>) -> String {
         };
         Json(json!({"jsonrpc": "2.0", "id": req["id"], "result": result})).into_response()
     };
-    let app = Router::new().route("/", post(handler)).with_state(calls);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    format!("http://{addr}")
+    listen(Router::new().route("/", post(handler)).with_state(calls)).await
 }
 
 /// The backfill waits out a dropped request, narrows its window to the node's cap, stores
@@ -587,13 +588,15 @@ async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
     let dir = tempfile::tempdir().unwrap();
     let conn = db::init_db(dir.path().join("backfill.db").to_str().unwrap()).unwrap();
     let db = Arc::new(Mutex::new(conn));
-    let block = nvnmchain_explorer::parse::parse_block(&json!({
-        "number": "0x5dc",
-        "hash": format!("0x{}", "cd".repeat(32)),
-        "parentHash": format!("0x{}", "ef".repeat(32)),
-        "timestamp": "0x64",
-    }));
-    db::save_block(&db, &block).unwrap();
+    for number in [0u64, 1500] {
+        let block = nvnmchain_explorer::parse::parse_block(&json!({
+            "number": format!("0x{number:x}"),
+            "hash": format!("0x{number:064x}"),
+            "parentHash": format!("0x{}", "ef".repeat(32)),
+            "timestamp": "0x64",
+        }));
+        db::save_block(&db, &block).unwrap();
+    }
 
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let rpc =
@@ -618,6 +621,90 @@ async fn backfill_narrows_to_the_node_cap_and_resumes_past_errors() {
     );
     // One dropped, six refused on the way down to 781 blocks, then three windows.
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 10);
+}
+
+/// Blocks holding `AddRegistry` logs, and how many each: dense, then sparse.
+const LOGGED: [(u64, usize); 5] = [(1000, 3), (1001, 3), (1002, 3), (1500, 1), (1900, 1)];
+
+/// A node capped at four logs a response, refusing as reth does.
+async fn log_capped_node(calls: Arc<AtomicUsize>) -> String {
+    let handler = move |State(calls): State<Arc<AtomicUsize>>, Json(req): Json<Value>| async move {
+        let result = match req["method"].as_str().unwrap() {
+            "eth_blockNumber" => json!("0x7d0"),
+            "eth_getLogs" => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let int = |k: &str| {
+                    let hex = req["params"][0][k].as_str().unwrap();
+                    u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap()
+                };
+                let (from, to) = (int("fromBlock"), int("toBlock"));
+                assert!(
+                    from >= LOGGED[0].0,
+                    "{from} is below the first indexed block"
+                );
+                let mut logs = vec![];
+                for (block, n) in LOGGED.into_iter().filter(|(b, _)| (from..=to).contains(b)) {
+                    if from != to && logs.len() + n > 4 {
+                        let end = if block == from { from } else { block - 1 };
+                        let message = format!(
+                            "query exceeds max results 4, retry with the range {from}-{end}"
+                        );
+                        let error = json!({"code": -32602, "message": message});
+                        return Json(json!({"jsonrpc": "2.0", "id": req["id"], "error": error}));
+                    }
+                    for i in 0..n {
+                        let mut log = add_registry_log(block, block);
+                        log["logIndex"] = json!(format!("0x{i:x}"));
+                        logs.push(log);
+                    }
+                }
+                json!(logs)
+            }
+            method => panic!("unexpected {method}"),
+        };
+        Json(json!({"jsonrpc": "2.0", "id": req["id"], "result": result}))
+    };
+    listen(Router::new().route("/", post(handler)).with_state(calls)).await
+}
+
+/// The backfill starts at the first indexed block, takes the range a log-capped node names,
+/// and widens again where logs thin.
+#[tokio::test]
+async fn backfill_takes_the_named_range_and_widens_where_logs_thin() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = db::init_db(dir.path().join("backfill.db").to_str().unwrap()).unwrap();
+    let db = Arc::new(Mutex::new(conn));
+    for (block, _) in LOGGED {
+        let block = nvnmchain_explorer::parse::parse_block(&json!({
+            "number": format!("0x{block:x}"),
+            "hash": format!("0x{block:064x}"),
+            "parentHash": format!("0x{:064x}", block - 1),
+            "timestamp": "0x64",
+        }));
+        db::save_block(&db, &block).unwrap();
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let rpc =
+        nvnmchain_explorer::rpc::ChainRpc::new(&log_capped_node(calls.clone()).await).unwrap();
+    nvnmchain_explorer::indexer::backfill_anchoring(&rpc, &db)
+        .await
+        .expect("backfill");
+
+    for (block, n) in LOGGED {
+        assert_eq!(
+            db::get_anchoring_events(&db, block as i64, 25).len(),
+            n,
+            "block {block}"
+        );
+    }
+    assert_eq!(
+        db::get_kv(&db, "anchoring_backfilled_to").as_deref(),
+        Some("2000")
+    );
+    // One refusal, 1000 to 1003 a block at a time, then five windows growing fourfold: not
+    // the thousand calls of a window held at one block.
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
 }
 
 async fn api(base: &str, path: &str) -> (u16, Value) {
