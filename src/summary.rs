@@ -361,6 +361,7 @@ static PHRASES: &[Phrase] = &[
     )
     .notes(&[("Originator", Slot::Account("originator"))]),
     // ---- Fee manager / fee AMM -----------------------------------------
+    // From N1, `claimFeeShares` emits it for the devshare and buyback wallets.
     phrase(
         "FeesDistributed(address,address,uint256)",
         "fees distributed",
@@ -370,7 +371,7 @@ static PHRASES: &[Phrase] = &[
                 value: "amount",
                 token: "token",
             },
-            Slot::Word("to validator"),
+            Slot::Word("to"),
             Slot::Account("validator"),
         ],
     ),
