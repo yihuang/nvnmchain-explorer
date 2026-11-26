@@ -530,11 +530,17 @@ pub fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> {
     if bundles.is_empty() {
         return Ok(());
     }
+    // Before the connection is taken: a backlog's batches follow one another,
+    // and this is when a page gets its turn.
+    let packed = bundles
+        .iter()
+        .map(|b| b.txs.iter().map(pack).collect::<Result<Vec<_>>>())
+        .collect::<Result<Vec<_>>>()?;
     let mut conn = lock(db);
     let txn = conn.transaction().context("begin block batch")?;
     let (mut blocks, mut txs) = (0, 0);
-    for bundle in bundles {
-        let (new_blocks, new_txs) = write_block(&txn, bundle)?;
+    for (bundle, packed) in bundles.iter().zip(&packed) {
+        let (new_blocks, new_txs) = write_block(&txn, bundle, packed)?;
         blocks += new_blocks;
         txs += new_txs;
     }
@@ -546,7 +552,7 @@ pub fn save_block_bundles(db: &Db, bundles: &[BlockBundle]) -> Result<()> {
 
 /// One block's writes, inside the caller's transaction. Returns the blocks and
 /// transactions it added: a rewrite counts neither the block nor what it held.
-fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<(i64, i64)> {
+fn write_block(txn: &Connection, bundle: &BlockBundle, packed: &[Packed]) -> Result<(i64, i64)> {
     let stored: i64 = txn
         .prepare_cached("SELECT EXISTS(SELECT 1 FROM blocks WHERE number=?1)")?
         .query_row(params![bundle.block.number], |r| r.get(0))?;
@@ -558,8 +564,8 @@ fn write_block(txn: &Connection, bundle: &BlockBundle) -> Result<(i64, i64)> {
             .query_row(params![bundle.block.number], |r| r.get(0))?
     };
     upsert_block(txn, &bundle.block)?;
-    for tx in &bundle.txs {
-        upsert_transaction(txn, tx)?;
+    for (tx, packed) in bundle.txs.iter().zip(packed) {
+        upsert_transaction(txn, tx, packed)?;
     }
     // Transfers are keyed by (block_number, log_index): re-writing an
     // already-indexed block inserts nothing the second time, and only
@@ -736,11 +742,19 @@ fn pack_input(hex: &str) -> types::Value {
     }
 }
 
+/// A transaction's receipt and signed bytes, compressed.
+type Packed = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+fn pack(tx: &Transaction) -> Result<Packed> {
+    Ok((
+        tx.receipt_data.as_deref().map(compress).transpose()?,
+        tx.raw.as_deref().map(hex_blob).map(compress).transpose()?,
+    ))
+}
+
 /// A rewrite that carries nothing for a blob keeps what is stored: the trace the
 /// transaction page cached, the raw bytes a failed decode left out.
-fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
-    let receipt = tx.receipt_data.as_deref().map(compress).transpose()?;
-    let raw = tx.raw.as_deref().map(hex_blob).map(compress).transpose()?;
+fn upsert_transaction(conn: &Connection, tx: &Transaction, (receipt, raw): &Packed) -> Result<()> {
     exec_cached(
         conn,
         r#"
@@ -785,8 +799,8 @@ fn upsert_transaction(conn: &Connection, tx: &Transaction) -> Result<()> {
 }
 
 pub fn save_transaction(db: &Db, tx: &Transaction) -> Result<()> {
-    let conn = lock(db);
-    upsert_transaction(&conn, tx)
+    let packed = pack(tx)?;
+    upsert_transaction(&lock(db), tx, &packed)
 }
 
 /// The rowid [`pack_legacy_transactions`] has reached. Renamed when the packer
